@@ -1,0 +1,17 @@
+{
+  "name": "atlas-centauri",
+  "version": "11.18.0",
+  "description": "ATLAS Centauri v11.18 \u2014 unified US-equity day-trading engine. One program, three subsystems: Venus (research AI: web + SEC 13F + news \u2192 watchlist), Jupiter (trading AI: win-probability model + Kelly sizing, learns every trade), and Terra (execution gate + risk pipeline). Both AIs reason via LLM with bounded, self-checking autonomy. Zero-latency in-process comms, regime-adaptive ATR/Kelly core, offline specialization training.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.17.0"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,26 @@
+# ── Secrets — never commit these, no exceptions ──────────────────────────────
+.env
+env.local
+env.txt
+*.env
+!.env.example
+
+# ── Runtime state — this is YOUR bot's learned data, not source code ────────
+# It's personal, grows unbounded, and shouldn't live in git history.
+atlas-solar-state.json
+atlas-solar-state.json.tmp
+atlas-solar-state.json.train-tmp
+*.state.json
+
+# ── Dependencies — reinstalled from package.json, never committed ───────────
+node_modules/
+
+# ── Logs / OS junk ────────────────────────────────────────────────────────────
+*.log
+.DS_Store
+Thumbs.db
+
+# ── Editor junk ───────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp

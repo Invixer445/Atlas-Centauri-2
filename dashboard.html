@@ -1,0 +1,839 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ATLAS Centauri · Luna</title>
+<style>
+  :root {
+    --bg: #0a0e17;
+    --panel: #121826;
+    --panel-2: #1a2236;
+    --border: #243049;
+    --text: #e4e9f2;
+    --text-dim: #8a96ac;
+    --green: #2ecc71;
+    --red: #e74c3c;
+    --amber: #f39c12;
+    --blue: #3da9fc;
+    --gold: #ffd166;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+    padding: 16px;
+    font-size: 14px;
+  }
+  .header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 16px; flex-wrap: wrap; gap: 12px;
+  }
+  .logo { display: flex; align-items: center; gap: 10px; }
+  .logo h1 { font-size: 22px; font-weight: 700; letter-spacing: 0.5px; }
+  .logo .sun { font-size: 26px; }
+  .logo .sub { color: var(--text-dim); font-size: 12px; }
+  .status-pills { display: flex; gap: 8px; flex-wrap: wrap; }
+  .pill {
+    padding: 5px 11px; border-radius: 20px; font-size: 12px; font-weight: 600;
+    background: var(--panel-2); border: 1px solid var(--border);
+  }
+  .pill.live { color: var(--green); }
+  .pill.off { color: var(--red); }
+  .pill.warn { color: var(--amber); }
+  .grid {
+    display: grid; gap: 14px;
+    grid-template-columns: repeat(12, 1fr);
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px;
+  }
+  .card h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--text-dim); margin-bottom: 12px; font-weight: 600;
+  }
+  .span-3 { grid-column: span 3; }
+  .span-4 { grid-column: span 4; }
+  .span-6 { grid-column: span 6; }
+  .span-8 { grid-column: span 8; }
+  .span-12 { grid-column: span 12; }
+  @media (max-width: 900px) {
+    .span-3, .span-4, .span-6, .span-8 { grid-column: span 12; }
+  }
+  .big-num { font-size: 30px; font-weight: 700; }
+  .sub-num { font-size: 13px; color: var(--text-dim); margin-top: 3px; }
+  .green { color: var(--green); }
+  .red { color: var(--red); }
+  .amber { color: var(--amber); }
+  .blue { color: var(--blue); }
+  .gold { color: var(--gold); }
+  .row {
+    display: flex; justify-content: space-between; padding: 6px 0;
+    border-bottom: 1px solid var(--border); font-size: 13px;
+  }
+  .row:last-child { border-bottom: none; }
+  .row .label { color: var(--text-dim); }
+  .row .val { font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left; font-size: 11px; text-transform: uppercase;
+    color: var(--text-dim); padding: 6px 8px; border-bottom: 1px solid var(--border);
+  }
+  td { padding: 7px 8px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  tr:last-child td { border-bottom: none; }
+  .tag {
+    padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700;
+  }
+  .tag.long { background: rgba(46,204,113,0.15); color: var(--green); }
+  .tag.short { background: rgba(231,76,60,0.15); color: var(--red); }
+  .tag.open { background: rgba(61,169,252,0.15); color: var(--blue); }
+  .tag.closed { background: rgba(138,150,172,0.15); color: var(--text-dim); }
+  .bar-track {
+    background: var(--panel-2); border-radius: 6px; height: 10px;
+    overflow: hidden; margin-top: 6px;
+  }
+  .bar-fill { height: 100%; border-radius: 6px; transition: width 0.4s; }
+  .capital-layers { display: flex; flex-direction: column; gap: 12px; }
+  .layer-label { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 2px; }
+  .reasoning-box {
+    background: var(--panel-2); border-radius: 8px; padding: 12px;
+    font-size: 13px; line-height: 1.6;
+  }
+  .empty { color: var(--text-dim); text-align: center; padding: 20px; font-size: 13px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
+  .dot.green { background: var(--green); }
+  .dot.red { background: var(--red); }
+  .dot.amber { background: var(--amber); }
+  .spark { display: flex; align-items: flex-end; gap: 2px; height: 40px; margin-top: 8px; }
+  .spark .b { flex: 1; background: var(--blue); border-radius: 2px 2px 0 0; min-height: 2px; }
+  .footer { text-align: center; color: var(--text-dim); font-size: 11px; margin-top: 16px; }
+  .pulse { animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">
+    <span class="sun">🌌</span>
+    <div>
+      <h1>ATLAS CENTAURI <span id="execBadge" style="font-size:12px;vertical-align:middle;padding:3px 10px;border-radius:12px;border:1px solid #3a3f5a;background:#1b1f33;color:#8f97c0">—</span></h1>
+      <div class="sub">Luna Dashboard · live window into Terra</div>
+    </div>
+  </div>
+  <div class="status-pills" id="statusPills">
+    <span class="pill" id="pillMarket">—</span>
+    <span class="pill" id="pillRegime">—</span>
+    <span class="pill" id="pillWs">—</span>
+    <span class="pill" id="pillUpdated">—</span>
+  </div>
+</div>
+
+<div class="grid">
+
+  <!-- Equity -->
+  <div class="card span-3">
+    <h2>Total Equity</h2>
+    <div class="big-num" id="totalValue">$—</div>
+      <div id="execMirrorLine" style="font-size:11px;color:#8f97c0;margin-top:2px"></div>
+    <div class="sub-num" id="totalPnL">—</div>
+  </div>
+
+  <!-- Return -->
+  <div class="card span-3">
+    <h2>Total Return</h2>
+    <div class="big-num" id="returnPct">—</div>
+    <div class="sub-num" id="cashLine">Cash: $—</div>
+  </div>
+
+  <!-- Win Rate -->
+  <div class="card span-3">
+    <h2>Win Rate</h2>
+    <div class="big-num" id="winRate">—</div>
+    <div class="sub-num" id="winLossLine">— W / — L</div>
+  </div>
+
+  <!-- Trades -->
+  <div class="card span-3">
+    <h2>Trades</h2>
+    <div class="big-num" id="totalTrades">—</div>
+    <div class="sub-num" id="openClosedLine">— open · — closed</div>
+  </div>
+
+  <!-- Capital Layers -->
+  <div class="card span-4">
+    <h2>Capital Layers</h2>
+    <div class="capital-layers">
+      <div>
+        <div class="layer-label"><span>🛡️ Reserve (protected)</span><span id="reserveVal" class="blue">$—</span></div>
+        <div class="bar-track"><div class="bar-fill" id="reserveBar" style="background:var(--blue);width:0%"></div></div>
+      </div>
+      <div>
+        <div class="layer-label"><span>⚡ Trading Capital (active)</span><span id="tradingVal" class="amber">$—</span></div>
+        <div class="bar-track"><div class="bar-fill" id="tradingBar" style="background:var(--amber);width:0%"></div></div>
+      </div>
+      <div>
+        <div class="layer-label"><span>🔒 Profit Vault (locked)</span><span id="vaultVal" class="gold">$—</span></div>
+        <div class="bar-track"><div class="bar-fill" id="vaultBar" style="background:var(--gold);width:0%"></div></div>
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <span class="label">Safe Mode</span><span class="val" id="safeMode">—</span>
+    </div>
+    <div class="row" style="justify-content:flex-end">
+      <button id="safemodeBtn" onclick="toggleSafeMode()" style="cursor:pointer;padding:6px 14px;border-radius:6px;border:1px solid #3a3f5a;background:#1b1f33;color:#cdd3f0;font-size:13px">—</button>
+    </div>
+    <div class="row">
+      <span class="label">Emergency Stop</span><span class="val" id="emergencyStop">—</span>
+    </div>
+    <div class="row" style="justify-content:flex-end;gap:8px;align-items:center">
+      <span class="val" id="emergencyMsg" style="font-size:12px;opacity:.8"></span>
+      <button id="emergencyBtn" onclick="toggleEmergency()" style="cursor:pointer;padding:6px 14px;border-radius:6px;border:1px solid #3a3f5a;background:#1b1f33;color:#cdd3f0;font-size:13px">—</button>
+    </div>
+    <div class="row" style="gap:8px;align-items:center">
+      <span class="label" style="font-size:11px;opacity:.7">Admin token (saved in this browser only)</span>
+      <input id="adminToken" type="password" placeholder="paste ADMIN_TOKEN if you set one"
+             style="flex:1;min-width:0;padding:5px 8px;border-radius:6px;border:1px solid #3a3f5a;background:#0f1220;color:#cdd3f0;font-size:12px"
+             onchange="localStorage.setItem('atlas_admin_token', this.value)">
+    </div>
+    <div class="row" style="margin-top:6px">
+      <span class="label">A+ Mode <span style="opacity:.6;font-size:11px">(top 10% signals only)</span></span><span class="val" id="aPlusMode">—</span>
+    </div>
+    <div class="row" style="justify-content:flex-end">
+      <button id="aplusBtn" onclick="toggleAPlus()" style="cursor:pointer;padding:6px 14px;border-radius:6px;border:1px solid #3a3f5a;background:#1b1f33;color:#cdd3f0;font-size:13px">—</button>
+    </div>
+  </div>
+
+  <!-- AI Brain -->
+  <div class="card span-4">
+    <h2>AI Strategy Engine</h2>
+    <div class="row"><span class="label">Strategy</span><span class="val blue" id="strategy">—</span></div>
+    <div class="row"><span class="label">Aggression</span><span class="val" id="aggression">—</span></div>
+    <div class="bar-track"><div class="bar-fill" id="aggrBar" style="background:var(--blue);width:0%"></div></div>
+    <div class="row" style="margin-top:8px"><span class="label">Win Streak</span><span class="val green" id="winStreak">—</span></div>
+    <div class="row"><span class="label">Loss Streak</span><span class="val red" id="lossStreak">—</span></div>
+    <div class="row"><span class="label">Smoothed Win Rate</span><span class="val" id="smoothedWR">—</span></div>
+  </div>
+
+  <!-- Risk -->
+  <div class="card span-4">
+    <h2>Risk Monitor</h2>
+    <div class="row"><span class="label">Risk Level</span><span class="val" id="riskLevel">—</span></div>
+    <div class="row"><span class="label">Drawdown</span><span class="val" id="drawdown">—</span></div>
+    <div class="row"><span class="label">Portfolio Heat</span><span class="val" id="heat">—</span></div>
+    <div class="bar-track"><div class="bar-fill" id="heatBar" style="background:var(--green);width:0%"></div></div>
+    <div class="row" style="margin-top:8px"><span class="label">Daily Loss</span><span class="val" id="dailyLoss">—</span></div>
+    <div class="row"><span class="label">Trades Today</span><span class="val" id="dailyTrades">—</span></div>
+    <div class="row"><span class="label">Checks Passing</span><span class="val" id="checks">—</span></div>
+  </div>
+
+  <!-- AI Reasoning -->
+  <div class="card span-4">
+    <h2>AI Reasoning</h2>
+    <div class="reasoning-box">
+      <div><strong>Trend:</strong> <span id="aiTrend">—</span></div>
+      <div><strong>Confidence:</strong> <span id="aiConfidence">—</span></div>
+      <div><strong>Win Rate (smoothed):</strong> <span id="aiWinRate">—</span></div>
+      <div><strong>Market Breadth:</strong> <span id="aiBreadth">—</span></div>
+      <div><strong>SPY Momentum:</strong> <span id="aiSpyMom">—</span></div>
+      <div><strong>Uptick Ratio:</strong> <span id="aiUptickRatio">—</span></div>
+      <div><strong>Last Signal Score:</strong> <span id="aiSignalScore">—</span></div>
+      <div><strong>Consecutive Losses:</strong> <span id="consecLosses">—</span></div>
+      <div style="margin-top:6px"><strong>Next action:</strong><br><span id="aiNextAction" class="blue">—</span></div>
+    </div>
+    <div class="spark" id="perfSpark"></div>
+    <div class="sub-num" style="text-align:center">performance history</div>
+  </div>
+
+  <!-- Open Positions -->
+  <div class="card span-8">
+    <h2>Open Positions</h2>
+    <div id="positionsWrap">
+      <div class="empty">No open positions</div>
+    </div>
+  </div>
+
+  <!-- Gap Alerts -->
+  <div class="card span-4" id="gapAlertsCard" style="display:none">
+    <h2>⚡ Gap Alerts</h2>
+    <div id="gapAlertsWrap">
+      <div class="empty">No overnight gaps</div>
+    </div>
+  </div>
+
+  <!-- Centauri AI Intel -->
+  <div class="card span-12" id="intelCard">
+    <h2>🧠 Centauri Intelligence — Venus ⇄ Jupiter</h2>
+    <div class="row"><span class="label">♀ Venus (research AI)</span><span class="val" id="venusStatus">—</span></div>
+    <div class="row"><span class="label">Venus market posture 🧭</span><span class="val" id="venusPosture">—</span></div>
+    <div class="row"><span class="label">Venus watchlist 🔬</span><span class="val" id="venusWatchlist">—</span></div>
+    <div class="row"><span class="label">Venus calibration accuracy</span><span class="val" id="venusAccuracy">—</span></div>
+    <div class="row"><span class="label">Venus learned calibration</span><span class="val" id="venusLearning">—</span></div>
+    <div class="row"><span class="label">🔭 Jupiter (trading AI)</span><span class="val" id="jupiterStatus">—</span></div>
+    <div class="row"><span class="label">Jupiter self-check 🧭</span><span class="val" id="jupiterSelfCheck">—</span></div>
+    <div class="row"><span class="label">Jupiter measured edge</span><span class="val" id="jupiterEdge">—</span></div>
+    <div class="row"><span class="label">Jupiter win-model 🧠</span><span class="val" id="jupiterModel">—</span></div>
+    <div class="row"><span class="label">Jupiter model top factors</span><span class="val" id="jupiterFactors">—</span></div>
+    <div class="row"><span class="label">Jupiter signal accuracy</span><span class="val" id="intelAccuracy">—</span></div>
+    <div class="row"><span class="label">🎓 Specialization training</span><span class="val" id="trainStatus">—</span></div>
+    <div class="row" style="justify-content:flex-end;gap:10px;align-items:center">
+      <span class="val" id="retrainMsg" style="font-size:12px;opacity:.8"></span>
+      <button id="retrainBtn" onclick="retrainModels()" style="cursor:pointer;padding:6px 14px;border-radius:6px;border:1px solid #3a3f5a;background:#1b1f33;color:#cdd3f0;font-size:13px">Retrain from experience</button>
+    </div>
+    <div class="row"><span class="label">Dynamic Watchlist</span><span class="val" id="intelDynamic">—</span></div>
+    <div class="row"><span class="label">🌍 Terra gate (rejections)</span><span class="val" id="terraGate">—</span></div>
+    <div id="intelSignalsWrap"><div class="empty">No live signals from Venus</div></div>
+  </div>
+
+  <div style="display:none">
+    <span id="intelStatus"></span>
+  </div>
+
+  <!-- Recent Trades -->
+  <div class="card span-12">
+    <h2>Live Trade Tracker</h2>
+    <div id="tradesWrap">
+      <div class="empty">No trades yet</div>
+    </div>
+  </div>
+
+</div>
+
+<div class="footer">
+  ATLAS CENTAURI · Terra engine + Luna dashboard + Centauri intelligence · paper-trading simulator · auto-refresh 2s
+</div>
+
+<script>
+const fmt = (n) => Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// Sign-correct currency: -12.34 → "-$12.34" (not "$-12.34"); guards NaN → "$0.00"
+const money = (n) => { const v = Number(n); if (!Number.isFinite(v)) return '$0.00';
+  return (v < 0 ? '-$' : '$') + fmt(Math.abs(v)); };
+const signClass = (n) => Number(n) > 0 ? 'green' : Number(n) < 0 ? 'red' : '';
+
+async function refresh() {
+  try {
+    const res = await fetch('/api/portfolio');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const d = await res.json();
+    try {
+      render(d);
+    } catch (renderErr) {
+      // Render crashed — show error in status bar so it's visible in Luna
+      console.error('[Luna] render error:', renderErr);
+      const pu = document.getElementById('pillUpdated');
+      if (pu) { pu.textContent = 'render error — check console'; pu.className = 'pill off'; }
+    }
+  } catch (e) {
+    const pu = document.getElementById('pillUpdated');
+    if (pu) { pu.textContent = 'connection lost'; pu.className = 'pill off'; }
+  }
+}
+
+function render(d) {
+  // Safe accessors — never throw on missing/null fields
+  const safe = (v, fallback = '—') => (v !== undefined && v !== null) ? v : fallback;
+  const safeNum = (v, fallback = '—') => Number.isFinite(Number(v)) ? v : fallback;
+
+  // Status pills
+  const pm = document.getElementById('pillMarket');
+  pm.textContent = d.marketStatus ? d.marketStatus.status : safe(d.currentMarket, 'CLOSED');
+  pm.className = 'pill ' + (d.currentMarket !== 'CLOSED' ? 'live' : 'off');
+
+  const pr = document.getElementById('pillRegime');
+  pr.textContent = 'Regime: ' + safe(d.regime);
+  pr.className = 'pill ' + (d.regime === 'bull' ? 'live' : d.regime === 'bear' ? 'off' : 'warn');
+
+  const pw2 = document.getElementById('pillWs');
+  pw2.textContent = d.wsConnected ? '● Feed Live' : '○ Feed Down';
+  pw2.className = 'pill ' + (d.wsConnected ? 'live' : 'off');
+
+  const pu = document.getElementById('pillUpdated');
+  pu.textContent = 'Updated ' + new Date().toLocaleTimeString();
+  pu.className = 'pill';
+
+  // Equity
+  // v11.18 — when the broker is authoritative, Luna's headline numbers ARE the
+  // broker's (Alpaca paper account equity), and the internal engine ledger is shown
+  // small with a drift indicator. In simulation mode nothing changes.
+  const ex = d.execution || {};
+  const badge = document.getElementById('execBadge');
+  if (badge) {
+    if (ex.mode === 'broker-authoritative') {
+      badge.textContent = '🔗 ' + (ex.broker || 'broker').toUpperCase() + ' — authoritative (paper)';
+      badge.style.color = '#ffd479'; badge.style.borderColor = '#8a6d2f';
+    } else {
+      badge.textContent = '🧪 SIMULATION';
+      badge.style.color = '#7fb2ff'; badge.style.borderColor = '#33507a';
+    }
+  }
+  const mirrorOk = ex.mode === 'broker-authoritative' && ex.mirror && ex.mirror.ok && Number.isFinite(ex.mirror.equity);
+  const headline = mirrorOk ? ex.mirror.equity : safeNum(d.totalValue, 0);
+  document.getElementById('totalValue').textContent = '$' + fmt(headline);
+  const ml = document.getElementById('execMirrorLine');
+  if (ml) {
+    if (mirrorOk) {
+      const drift = ex.driftPct != null ? (ex.driftPct * 100) : null;
+      const driftTxt = drift == null ? '' :
+        ' · drift ' + drift.toFixed(2) + '%';
+      const driftColor = drift == null ? '#8f97c0' : drift < 0.5 ? '#5fce7b' : drift < 2 ? '#ffd479' : '#ff6b6b';
+      ml.innerHTML = 'Alpaca paper (authoritative) · engine ledger $' + fmt(safeNum(d.totalValue, 0)) +
+        '<span style="color:' + driftColor + '">' + driftTxt + '</span>' +
+        (ex.pendingOrders ? ' · ⏳ ' + ex.pendingOrders + ' order(s) pending' : '');
+    } else if (ex.mode === 'broker-authoritative') {
+      ml.textContent = 'broker mirror unavailable — showing engine ledger' + (ex.pendingOrders ? ' · ⏳ ' + ex.pendingOrders + ' pending' : '');
+    } else { ml.textContent = ''; }
+  }
+  const pnlEl = document.getElementById('totalPnL');
+  const pnlNum = Number(d.totalPnL) || 0;
+  pnlEl.textContent = (pnlNum >= 0 ? '▲ +$' : '▼ -$') + fmt(Math.abs(pnlNum));
+  pnlEl.className = 'sub-num ' + signClass(pnlNum);
+
+  const retEl = document.getElementById('returnPct');
+  const retNum = Number(d.return) || 0;
+  retEl.textContent = (retNum >= 0 ? '+' : '') + safe(d.return, '0') + '%';
+  retEl.className = 'big-num ' + signClass(retNum);
+  document.getElementById('cashLine').textContent = 'Cash: $' + fmt(safeNum(d.cash, 0));
+
+  // Win rate
+  const stats = d.stats || {};
+  document.getElementById('winRate').textContent = safe(stats.winRatePercent, '—');
+  document.getElementById('winLossLine').textContent = safe(stats.wins, 0) + ' W / ' + safe(stats.losses, 0) + ' L';
+  document.getElementById('totalTrades').textContent = safe(stats.totalTrades, 0);
+  document.getElementById('openClosedLine').textContent =
+    safe(stats.openTrades, 0) + ' open · ' + safe(stats.closedTrades, 0) + ' closed';
+
+  // Capital layers
+  const cap = d.capital || {};
+  const totalCap = Number(cap.reserveCash || 0) + Number(cap.tradingCapital || 0) + Number(cap.profitVault || 0);
+  const pct = (v) => totalCap > 0 ? (Number(v || 0) / totalCap * 100) : 0;
+  document.getElementById('reserveVal').textContent = '$' + fmt(cap.reserveCash || 0);
+  document.getElementById('tradingVal').textContent = '$' + fmt(cap.tradingCapital || 0);
+  document.getElementById('vaultVal').textContent = '$' + fmt(cap.profitVault || 0);
+  document.getElementById('reserveBar').style.width = pct(cap.reserveCash) + '%';
+  document.getElementById('tradingBar').style.width = pct(cap.tradingCapital) + '%';
+  document.getElementById('vaultBar').style.width = pct(cap.profitVault) + '%';
+
+  const sm = document.getElementById('safeMode');
+  sm.textContent = cap.safeMode ? ('⚠️ ACTIVE' + (cap.safeModeManual ? ' (manual)' : '')) : 'Off';
+  sm.className = 'val ' + (cap.safeMode ? 'amber' : '');
+  const smBtn = document.getElementById('safemodeBtn');
+  if (smBtn && !smBtn.disabled) smBtn.textContent = cap.safeMode ? 'Deactivate Safe Mode' : '🛡 Activate Safe Mode';
+  const es = document.getElementById('emergencyStop');
+  es.textContent = cap.emergencyStop ? '🛑 HALTED' : 'Off';
+  es.className = 'val ' + (cap.emergencyStop ? 'red' : '');
+  const eBtn = document.getElementById('emergencyBtn');
+  if (eBtn && !eBtn.disabled) eBtn.textContent = cap.emergencyStop ? '▶ Resume Trading' : '🛑 Emergency Stop';
+
+  const apm = document.getElementById('aPlusMode');
+  apm.textContent = cap.aPlusMode ? '✅ ON — top 10% only' : 'Off';
+  apm.className = 'val ' + (cap.aPlusMode ? 'green' : '');
+  const aBtn = document.getElementById('aplusBtn');
+  if (aBtn && !aBtn.disabled) aBtn.textContent = cap.aPlusMode ? 'Disable A+ Mode' : 'Enable A+ Mode';
+
+  // AI engine
+  const ai = d.aiMetrics || {};
+  document.getElementById('strategy').textContent = safe(ai.strategy);
+  document.getElementById('aggression').textContent = safe(ai.aggressionLevel);
+  document.getElementById('aggrBar').style.width = safe(ai.aggressionLevel, '0%');
+  document.getElementById('winStreak').textContent = safe(ai.winningStreak, 0);
+  document.getElementById('lossStreak').textContent = safe(ai.losingStreak, 0);
+  document.getElementById('smoothedWR').textContent = safe(stats.smoothedWinRate, '—') +
+    (ai.strategySample != null ? ' (n=' + ai.strategySample + ')' : '');
+
+  // Risk
+  const risk = d.riskMetrics || {};
+  const rl = document.getElementById('riskLevel');
+  rl.textContent = safe(risk.riskLevel);
+  rl.className = 'val ' + (risk.riskLevel === 'normal' ? 'green' : 'amber');
+  document.getElementById('drawdown').textContent = safe(risk.currentDrawdown);
+  document.getElementById('heat').textContent = safe(risk.portfolioHeat);
+  const heatNum = parseFloat(risk.portfolioHeat) || 0;
+  const heatBar = document.getElementById('heatBar');
+  heatBar.style.width = Math.min(100, heatNum) + '%';
+  heatBar.style.background = heatNum > 40 ? 'var(--red)' : heatNum > 25 ? 'var(--amber)' : 'var(--green)';
+  document.getElementById('dailyLoss').textContent = '$' + safe(risk.dailyLoss, '0.00');
+  document.getElementById('dailyTrades').textContent =
+    safe(risk.dailyTradeCount, 0) + ' / ' + safe(risk.maxTradesPerDay, 8);
+  const checksArr = Array.isArray(risk.checksPassing) ? risk.checksPassing : [];
+  document.getElementById('checks').textContent = checksArr.length + '/3';
+
+  // AI reasoning
+  const air = d.aiReasoning || {};
+  document.getElementById('aiTrend').textContent = safe(air.trend);
+  document.getElementById('aiConfidence').textContent = safe(air.confidence);
+  document.getElementById('aiWinRate').textContent = safe(air.winRate);
+  document.getElementById('aiNextAction').textContent = safe(air.nextAction);
+  document.getElementById('aiBreadth').textContent = safe(air.breadth);
+  const spyEl = document.getElementById('aiSpyMom');
+  const spyVal = parseFloat(air.spyMomentum) || 0;
+  spyEl.textContent = safe(air.spyMomentum);
+  const uptickEl = document.getElementById('aiUptickRatio');
+  if (uptickEl) {
+    uptickEl.textContent = safe(air.uptickRatio);
+    const uptickVal = parseFloat(air.uptickRatio) || 0;
+    uptickEl.className = uptickVal > 60 ? 'green' : uptickVal < 40 ? 'red' : '';
+  }
+  spyEl.className = spyVal > 0 ? 'green' : spyVal < 0 ? 'red' : '';
+  document.getElementById('aiSignalScore').textContent = safe(air.signalScore, '—') + '/7';
+  const cl = risk.consecutiveLosses || 0;
+  const clEl = document.getElementById('consecLosses');
+  clEl.textContent = cl + ' / ' + (risk.maxConsecutiveLosses || 4);
+  clEl.className = 'val ' + (cl >= 3 ? 'red' : cl >= 2 ? 'amber' : '');
+
+  // Performance sparkline
+  const spark = document.getElementById('perfSpark');
+  const hist = ai.performanceHistory || [];
+  if (hist.length > 0) {
+    const max = Math.max(...hist.map(h => h.winRate || 0), 0.01);
+    spark.innerHTML = hist.map(h => {
+      const ht = ((h.winRate || 0) / max * 100);
+      return '<div class="b" style="height:' + ht + '%;background:' +
+        ((h.winRate || 0) >= 0.5 ? 'var(--green)' : 'var(--red)') + '"></div>';
+    }).join('');
+  } else {
+    spark.innerHTML = '';
+  }
+
+  // Open positions
+  const posWrap = document.getElementById('positionsWrap');
+  const positions = d.positions || [];
+  if (positions.length > 0) {
+    let html = '<table><thead><tr><th>Symbol</th><th>Side</th><th>Sector</th><th>Qty</th>' +
+      '<th>Entry</th><th>Current</th><th>P&L</th><th>Peak</th></tr></thead><tbody>';
+    positions.forEach(p => {
+      html += '<tr><td><strong>' + safe(p.ticker) + '</strong></td>' +
+        '<td><span class="tag ' + (p.type || '').toLowerCase() + '">' + safe(p.type) + '</span></td>' +
+        '<td style="color:var(--text-dim);font-size:12px">' + safe(p.sector) + '</td>' +
+        '<td>' + safe(p.qty, 0) + '</td>' +
+        '<td>$' + safe(p.entryPrice, '0.00') + '</td>' +
+        '<td>$' + safe(p.currentPrice, '0.00') + '</td>' +
+        '<td class="' + signClass(p.pnl) + '">' + money(p.pnl) + '</td>' +
+        '<td class="green">' + safe(p.peakPnL, '0%') + '</td></tr>';
+    });
+    html += '</tbody></table>';
+    posWrap.innerHTML = html;
+  } else {
+    posWrap.innerHTML = '<div class="empty">No open positions</div>';
+  }
+
+  // Gap alerts
+  const gapCard = document.getElementById('gapAlertsCard');
+  const gapWrap = document.getElementById('gapAlertsWrap');
+  if (gapCard && gapWrap) {
+    const gaps = d.gapAlerts || [];
+    if (gaps.length > 0) {
+      gapCard.style.display = '';
+      gapWrap.innerHTML = gaps.map(function (g) {
+        var arrow = g.direction === 'up' ? '↑' : g.direction === 'down' ? '↓' : '';
+        var stateTxt = g.blocked ? '🔴 BLOCKED' : '⚠️ REDUCED';
+        var stateCls = g.blocked ? 'red' : 'amber';
+        return '<div class="row"><span class="label">' + safe(g.symbol) +
+               ' ' + arrow + safe(g.gapPct) + '</span>' +
+               '<span class="val ' + stateCls + '">' + stateTxt + '</span></div>';
+      }).join('');
+    } else {
+      gapCard.style.display = 'none';
+      gapWrap.innerHTML = '<div class="empty">No overnight gaps</div>';
+    }
+  }
+
+  // Centauri Intelligence — Venus (analysis) + Jupiter (trading)
+  const intel   = d.intel   || {};
+  const venus = d.venus || {};
+  const jupiter   = d.jupiter   || {};
+  const terra   = d.terra   || {};
+
+  // 🌍 Terra gate — show how many trade plans Terra rejected + the latest reason
+  const terraEl = document.getElementById('terraGate');
+  if (terraEl) {
+    const rej = terra.recentRejections || [];
+    if (!terra.rejectionCount) {
+      terraEl.textContent = 'none — all plans passed';
+      terraEl.style.color = '#8a90b0';
+    } else {
+      const last = rej[0];
+      terraEl.textContent = terra.rejectionCount + ' rejected · last: ' +
+        (last ? (last.direction + ' ' + last.ticker + ' — ' + last.reason) : '—');
+      terraEl.style.color = '#d8a657';
+    }
+  }
+
+  // Venus status (research engine: web + 13F + news)
+  const venStatusEl = document.getElementById('venusStatus');
+  if (venStatusEl) {
+    var vCalls = (venus.callsThisHour != null) ? (' · ' + safe(venus.callsThisHour, 0) + '/' + safe(venus.callBudgetPerHour, 0) + ' analysis calls/h') : '';
+    venStatusEl.textContent = venus.enabled
+      ? ('ON — ' + safe(venus.provider) + ' / ' + safe(venus.model) + vCalls)
+      : 'OFF (no API key — technical mode)';
+    venStatusEl.className = 'val ' + (venus.enabled ? 'green' : '');
+  }
+  // Venus research watchlist (what serious money holds + where the action is)
+  const venWatchEl = document.getElementById('venusWatchlist');
+  if (venWatchEl) {
+    var rsch = venus.research || {};
+    var wl = venus.watchlist || (rsch.watchlist) || [];
+    if (wl.length) {
+      var names = wl.slice(0, 5).map(function (w) {
+        var tag = w.bias === 'bullish' ? '▲' : w.bias === 'bearish' ? '▼' : '•';
+        return tag + ' ' + w.symbol + (w.institutionalFilings ? ' (' + w.institutionalFilings + ' 13F)' : '');
+      }).join('  ');
+      venWatchEl.textContent = names + (rsch.institutions ? '  ·  ' + rsch.institutions + ' names w/ institutional interest' : '');
+      venWatchEl.className = 'val green';
+    } else {
+      venWatchEl.textContent = 'no research yet — first scan runs shortly after open';
+    }
+  }
+  const venAccEl = document.getElementById('venusAccuracy');
+  if (venAccEl) {
+    venAccEl.textContent = venus.accuracy
+      ? (venus.accuracy + ' over ' + safe(venus.resolvedRecommendations, 0) + ' resolved recommendations')
+      : 'no resolved recommendations yet';
+  }
+  // Venus's learned calibration model
+  const venLearnEl = document.getElementById('venusLearning');
+  if (venLearnEl && venus.learning) {
+    var jl = venus.learning;
+    if (jl.calibrationSamples > 0) {
+      var shift = Number(jl.globalConfidenceShift) || 0;
+      var dir = shift < -0.005 ? 'discounting overconfidence' : (shift > 0.005 ? 'boosting underconfidence' : 'well-calibrated');
+      venLearnEl.textContent = jl.calibrationSamples + ' samples · ' + dir + ' (shift ' + (shift >= 0 ? '+' : '') + shift.toFixed(2) + ')';
+    } else {
+      venLearnEl.textContent = 'learning starts after first resolved trade';
+    }
+  }
+
+  // Venus market posture (its own reasoning: risk-on / neutral / risk-off)
+  const venPostEl = document.getElementById('venusPosture');
+  if (venPostEl) {
+    var pos = (venus.research && venus.research.posture) || null;
+    if (pos && pos.stance) {
+      var pcolor = pos.stance === 'risk_on' ? '#7ee787' : pos.stance === 'risk_off' ? '#d8a657' : '#8a90b0';
+      var vAge = (pos.ageMin != null) ? ('  · ' + pos.ageMin + 'm ago' + (pos.stale ? ' (stale — reverted)' : '')) : '';
+      venPostEl.textContent = pos.stance.replace('_', '-') + (pos.reasoning ? ' — ' + pos.reasoning : '') +
+        (pos.avoid && pos.avoid.length ? '  · avoid: ' + pos.avoid.join(', ') : '') + vAge;
+      venPostEl.style.color = pos.stale ? '#8a90b0' : pcolor;
+    } else {
+      venPostEl.textContent = 'forms after first research scan (needs LLM key)';
+      venPostEl.style.color = '#8a90b0';
+    }
+  }
+  // Jupiter self-check (its own discipline: size multiplier, hold, concerns)
+  const jSelfEl = document.getElementById('jupiterSelfCheck');
+  if (jSelfEl) {
+    var sc = jupiter.selfCheck || null;
+    if (sc && sc.ageMin != null) {
+      var bits = 'size ×' + safe(sc.sizeMultiplier, 0);
+      if (sc.hold) bits += ' · ⏸ HOLD (new entries paused)';
+      if (sc.note) bits += ' — ' + sc.note;
+      if (sc.concerns && sc.concerns.length) bits += '  · concerns: ' + sc.concerns.join('; ');
+      if (sc.ageMin != null) bits += '  · ' + sc.ageMin + 'm ago' + (sc.stale ? ' (stale — neutral)' : '');
+      jSelfEl.textContent = bits;
+      jSelfEl.style.color = sc.hold ? '#d8a657' : (sc.sizeMultiplier < 1 ? '#d8a657' : '#7ee787');
+    } else {
+      jSelfEl.textContent = 'forms after first self-check (needs LLM key)';
+      jSelfEl.style.color = '#8a90b0';
+    }
+  }
+  // Jupiter status (trading engine: sizes, decides, learns)
+  const jupStatusEl = document.getElementById('jupiterStatus');
+  if (jupStatusEl) {
+    jupStatusEl.textContent = 'ON — consumes Venus research · signal weight ±' + safe(jupiter.signalWeight, 0);
+    jupStatusEl.className = 'val green';
+  }
+  const jupEdgeEl = document.getElementById('jupiterEdge');
+  if (jupEdgeEl && jupiter.edge) {
+    jupEdgeEl.textContent = 'win ' + safe(jupiter.edge.winRate) + ' · PF ' + safe(jupiter.edge.profitFactor) +
+      ' · risk/trade ' + safe(jupiter.edge.riskPerTradePct) + ' · ' + safe(jupiter.edge.sample, 0) + ' trades';
+  } else if (jupEdgeEl) {
+    jupEdgeEl.textContent = 'building edge…';
+  }
+  // Jupiter's win-probability learning model
+  const jupModelEl = document.getElementById('jupiterModel');
+  if (jupModelEl && jupiter.model) {
+    var vm = jupiter.model;
+    if (!vm.enabled) {
+      jupModelEl.textContent = 'disabled';
+    } else if (vm.samples > 0) {
+      var infl = Math.round((Number(vm.influence) || 0) * 200);   // 0→0% .. 0.5→100%
+      jupModelEl.textContent = vm.samples + ' trades learned · log-loss ' + safe(vm.logLoss) +
+        ' (lower=better) · influence ' + infl + '%';
+      jupModelEl.className = 'val green';
+    } else {
+      jupModelEl.textContent = 'untrained — learns from every closed trade';
+    }
+  }
+  const jupFactorsEl = document.getElementById('jupiterFactors');
+  if (jupFactorsEl && jupiter.model && jupiter.model.topFactors && jupiter.model.samples > 5) {
+    jupFactorsEl.textContent = jupiter.model.topFactors.map(function (f) {
+      return f.name + ' ' + (f.weight >= 0 ? '+' : '') + f.weight;
+    }).join(', ');
+  } else if (jupFactorsEl) {
+    jupFactorsEl.textContent = 'discovering which factors predict wins…';
+  }
+
+  // Jupiter signal accuracy (headline)
+  const accEl = document.getElementById('intelAccuracy');
+  if (accEl) {
+    accEl.textContent = intel.accuracy
+      ? (intel.accuracy + ' over ' + safe(intel.resolvedSignals, 0) + ' resolved trades')
+      : 'no resolved trades yet';
+  }
+
+  // Specialization training status (accumulated experience + last training run)
+  const trainEl = document.getElementById('trainStatus');
+  if (trainEl) {
+    var vSamples = (jupiter.model && jupiter.model.trainingSamples != null) ? jupiter.model.trainingSamples : 0;
+    var jSamples = (venus.learning && venus.learning.trainingSamples != null) ? venus.learning.trainingSamples : 0;
+    var lt = jupiter.model && jupiter.model.lastTraining;
+    var base = 'Jupiter ' + vSamples + ' · Venus ' + jSamples + ' samples buffered';
+    if (lt) {
+      base += ' · last: val-acc ' + (lt.valAccuracy != null ? lt.valAccuracy + '%' : '—') +
+              (lt.overfitWarning ? ' ⚠' : '');
+    } else {
+      base += ' · not trained yet';
+    }
+    trainEl.textContent = base;
+  }
+  const dynEl = document.getElementById('intelDynamic');
+  if (dynEl) {
+    const dyn = intel.dynamicWatchlist || jupiter.dynamicWatchlist || [];
+    dynEl.textContent = dyn.length ? dyn.join(', ') : 'none';
+  }
+
+  // Live signals (Jupiter holds them, sourced from Venus)
+  const sigWrap = document.getElementById('intelSignalsWrap');
+  if (sigWrap) {
+    const sigs = (jupiter.activeSignals && jupiter.activeSignals.length ? jupiter.activeSignals : intel.signals) || [];
+    if (sigs.length > 0) {
+      sigWrap.innerHTML = sigs.map(function (s) {
+        var arrow = s.direction === 'long' ? '🟢▲' : '🔴▼';
+        var traded = s.traded ? ' ✓traded' : '';
+        return '<div class="row"><span class="label">' + arrow + ' ' + safe(s.symbol) +
+               ' ' + safe(s.conviction) + ' [' + safe(s.catalyst) + ']' + traded + '</span>' +
+               '<span class="val">' + safe(s.reasoning) + ' · ' + safe(s.expiresInMin, 0) + 'min left</span></div>';
+      }).join('');
+    } else {
+      sigWrap.innerHTML = '<div class="empty">No live signals from Venus</div>';
+    }
+  }
+
+  // Recent trades
+  const trWrap = document.getElementById('tradesWrap');
+  const trades = d.recentTrades || [];
+  if (trades.length > 0) {
+    let html = '<table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th>' +
+      '<th>Entry</th><th>Current</th><th>P&L</th><th>Status</th><th>Reason</th></tr></thead><tbody>';
+    trades.forEach(t => {
+      const pnl = t.status === 'open' ? (t.unrealizedPnL || 0) : (t.realizedPnL || 0);
+      const time = t.timestamp ? new Date(t.timestamp).toLocaleTimeString() : '—';
+      html += '<tr><td>' + time + '</td>' +
+        '<td><strong>' + safe(t.ticker) + '</strong></td>' +
+        '<td><span class="tag ' + (t.direction || '').toLowerCase() + '">' + safe(t.direction) + '</span></td>' +
+        '<td>' + safe(t.size, 0) + '</td>' +
+        '<td>$' + safe(t.entryPrice, '0.00') + '</td>' +
+        '<td>$' + safe(t.currentPrice, '0.00') + '</td>' +
+        '<td class="' + signClass(pnl) + '">' + money(pnl) + '</td>' +
+        '<td><span class="tag ' + safe(t.status, 'open') + '">' + safe(t.status) + '</span></td>' +
+        '<td style="color:var(--text-dim);font-size:12px">' + safe(t.reason, '') + '</td></tr>';
+    });
+    html += '</tbody></table>';
+    trWrap.innerHTML = html;
+  } else {
+    trWrap.innerHTML = '<div class="empty">No trades yet — Terra is scanning for signals</div>';
+  }
+}
+
+// Admin token — persisted in THIS browser's localStorage only, never sent anywhere
+// except as a query param on the three admin-gated endpoints below. If ADMIN_TOKEN
+// isn't set on the server, these buttons work fine without ever needing a token.
+function adminToken() { return localStorage.getItem('atlas_admin_token') || ''; }
+(function restoreAdminTokenField() {
+  var el = document.getElementById('adminToken');
+  if (el) el.value = adminToken();
+})();
+function withToken(url) {
+  var t = adminToken();
+  return t ? (url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(t)) : url;
+}
+
+async function toggleEmergency() {
+  var btn = document.getElementById('emergencyBtn');
+  var msg = document.getElementById('emergencyMsg');
+  var currentlyHalted = btn.textContent.indexOf('Resume') !== -1;
+  if (!currentlyHalted && !confirm('Halt all NEW trade entries? Existing open positions keep being managed normally — this only stops new ones.')) return;
+  btn.disabled = true;
+  if (msg) msg.textContent = '';
+  try {
+    var r = await fetch(withToken('/api/emergency?stop=' + (!currentlyHalted)), { method: 'POST' });
+    var d = await r.json();
+    if (r.status === 401) { if (msg) msg.textContent = '401 — check your admin token above'; }
+    else if (!d.ok) { if (msg) msg.textContent = 'failed'; }
+  } catch (e) {
+    if (msg) msg.textContent = 'failed: ' + e.message;
+  }
+  btn.disabled = false;
+  refresh();
+}
+
+async function toggleSafeMode() {
+  var btn = document.getElementById('safemodeBtn');
+  var currentlyOn = btn.textContent.indexOf('Deactivate') !== -1;
+  btn.disabled = true;
+  try {
+    var r = await fetch(withToken('/api/safemode?on=' + (!currentlyOn)), { method: 'POST' });
+    var d = await r.json();
+    if (r.status === 401) alert('401 — check your admin token above');
+    else if (!d.ok) alert('failed to toggle Safe Mode');
+  } catch (e) {
+    alert('failed: ' + e.message);
+  }
+  btn.disabled = false;
+  refresh();
+}
+
+async function toggleAPlus() {
+  var btn = document.getElementById('aplusBtn');
+  var currentlyOn = btn.textContent.indexOf('Disable') !== -1;
+  btn.disabled = true;
+  try {
+    var r = await fetch(withToken('/api/aplus?enable=' + (!currentlyOn)), { method: 'POST' });
+    var d = await r.json();
+    if (r.status === 401) alert('401 — check your admin token above');
+    else if (!d.ok) alert('failed to toggle A+ mode');
+  } catch (e) {
+    alert('failed: ' + e.message);
+  }
+  btn.disabled = false;
+  refresh();
+}
+
+async function retrainModels() {
+  var btn = document.getElementById('retrainBtn');
+  var msg = document.getElementById('retrainMsg');
+  if (btn) { btn.disabled = true; btn.textContent = 'Training…'; }
+  if (msg) msg.textContent = '';
+  try {
+    var r = await fetch(withToken('/api/retrain?epochs=20'), { method: 'POST' });
+    if (r.status === 401) { if (msg) msg.textContent = '401 — check your admin token above'; if (btn) { btn.disabled = false; btn.textContent = 'Retrain from experience'; } return; }
+    var d = await r.json();
+    var v = d && d.jupiter, j = d && d.venus;
+    var parts = [];
+    if (v && v.ok) parts.push('Jupiter: val-acc ' + (v.valAccuracy != null ? v.valAccuracy + '%' : '—') + (v.overfitWarning ? ' ⚠overfit' : ''));
+    else if (v) parts.push('Jupiter: ' + (v.reason || 'not trained'));
+    if (j && j.ok) parts.push('Venus: Brier ' + j.brierBefore + '→' + j.brierAfter);
+    else if (j) parts.push('Venus: ' + (j.reason || 'not trained'));
+    if (msg) msg.textContent = parts.join('  ·  ');
+  } catch (e) {
+    if (msg) msg.textContent = 'retrain failed: ' + e.message;
+  }
+  if (btn) { btn.disabled = false; btn.textContent = 'Retrain from experience'; }
+  refresh();
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
