@@ -1489,12 +1489,16 @@ const EARNINGS_CALENDAR = {
 };
 
 // ✅ NEW: Market volatility thresholds
+// v11.19: dropped HIGH_VOL_THRESHOLD, NORMAL_VOL_BASELINE and DYNAMIC_SPREAD_BUFFER —
+// all three had ZERO references anywhere in the codebase. Their comments described
+// behaviour that does not exist ("1.5% = reduce position size" etc.), so reading this
+// block gave a false picture of what the engine enforces. The real equivalents live
+// elsewhere and are actually wired: volatility-based size reduction is Jupiter's
+// isHighVolatility/stress/gap adjustments in computeSize(), and spread estimation is
+// estimateDynamicSpread(). Only the two constants below are used.
 const VOLATILITY_FILTERS = {
-  EXTREME_VOL_THRESHOLD:    0.025,   // 2.5% average intraday move = halt
-  HIGH_VOL_THRESHOLD:       0.015,   // 1.5% = reduce position size
-  NORMAL_VOL_BASELINE:      0.008,   // 0.8% = normal market
-  DYNAMIC_SPREAD_BUFFER:    0.002,   // Add 0.2% for spread estimation
-  MIN_VOLUME_THRESHOLD:     500000,  // Stocks < 500k vol get halved position size
+  EXTREME_VOL_THRESHOLD:    0.025,   // median intraday move (from the open) → halt entries
+  MIN_VOLUME_THRESHOLD:     500000,  // RVOL fallback floor when candle data is unavailable
 };
 
 // Sector map — used for concentration limits so the bot can't stack 5 correlated
@@ -1549,10 +1553,17 @@ function logTrade(entry) {
   tradeLogger.push(`${new Date().toISOString()} ${entry}`);
   if (tradeLogger.length > 200) tradeLogger = tradeLogger.slice(-200);
 }
+// Drop the oldest closed trades beyond the cap, PRESERVING chronological order.
+// The previous form rebuilt the array as [...open, ...closed] — which reorders it so
+// every open trade sits at the front. `/api/portfolio` builds its Live Trade Tracker
+// from `portfolio.trades.slice(-12)`, i.e. it assumes chronological order, so after the
+// first trim (>200 closed) the tail was ALL closed trades and open positions silently
+// vanished from Luna. Filtering in place keeps insertion order intact.
 function trimTrades() {
-  const open   = portfolio.trades.filter(t => t.status === 'open');
   const closed = portfolio.trades.filter(t => t.status === 'closed');
-  if (closed.length > 200) portfolio.trades = [...open, ...closed.slice(-200)];
+  if (closed.length <= 200) return;
+  const drop = new Set(closed.slice(0, closed.length - 200));   // oldest closed, by identity
+  portfolio.trades = portfolio.trades.filter(t => !drop.has(t));
 }
 
 // ─── AI / LEARNING SYSTEM ─────────────────────────────────────────────────
@@ -4331,6 +4342,16 @@ function queueSaveState() {
   _saveTimeout = setTimeout(() => { _saveTimeout = null; saveState(); }, 5000);
 }
 
+// Cancel a debounced save that hasn't fired yet. Used by test.js: the suite books fake
+// positions into the real module state, which arms queueSaveState()'s 5s timer — and
+// relying on process.exit() to WIN that race is fragile (a slow run, or any future
+// async teardown, would let it fire and overwrite the live atlas-solar-state.json with
+// test fixtures). Cancelling deterministically removes the race instead of outrunning it.
+function cancelPendingSave() {
+  if (_saveTimeout) { clearTimeout(_saveTimeout); _saveTimeout = null; return true; }
+  return false;
+}
+
 function buildStateObject() {
   return {
     cash: portfolio.cash,
@@ -5735,5 +5756,6 @@ module.exports = {
     getTotalValue, getNotionalExposure, calculateTradeExpectancy,
     ema, rsi, calculateATR, atrPct, SENTIMENT_EMA_REF_MS, sentimentAlpha,
     computeDrawdown, isEarningsBlackout, EARNINGS_BLACKOUT_ENABLED, START_CAPITAL,
+    trimTrades, cancelPendingSave,
     setPendingOrders: (o) => { pendingOrders = o; } }
 };

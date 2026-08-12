@@ -302,6 +302,44 @@ check('open SHORT equity counts locked margin (not a phantom drawdown)', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+group('TRADE LOG TRIMMING — must stay chronological');
+check('open trades survive a trim and stay visible in the recent-trades tail', () => {
+  resetBook();
+  // 250 closed trades (over the 200 cap) followed by a live open position.
+  for (let i = 0; i < 250; i++) {
+    I.portfolio.trades.push({ ticker: 'OLD', direction: 'LONG', status: 'closed',
+                              timestamp: new Date(Date.now() - (300 - i) * 60000).toISOString(),
+                              qty: 1, entryPrice: 10, realizedPnL: 1 });
+  }
+  I.portfolio.trades.push({ ticker: 'LIVE', direction: 'LONG', status: 'open',
+                            timestamp: new Date().toISOString(), qty: 5, entryPrice: 20, realizedPnL: 0 });
+  I.trimTrades();
+  const tail = I.portfolio.trades.slice(-12);          // exactly what /api/portfolio renders
+  ok(tail.some(t => t.ticker === 'LIVE'),
+     'the open position fell out of the recent-trades tail — trim reordered the array');
+  eq(I.portfolio.trades.filter(t => t.status === 'closed').length, 200, 'closed cap');
+  eq(I.portfolio.trades.filter(t => t.status === 'open').length, 1, 'open preserved');
+});
+check('trim is a no-op below the cap', () => {
+  resetBook();
+  for (let i = 0; i < 50; i++) {
+    I.portfolio.trades.push({ ticker: 'X', status: 'closed', timestamp: new Date().toISOString(), qty: 1 });
+  }
+  I.trimTrades();
+  eq(I.portfolio.trades.length, 50);
+});
+check('trim keeps the NEWEST closed trades, not the oldest', () => {
+  resetBook();
+  for (let i = 0; i < 260; i++) {
+    I.portfolio.trades.push({ ticker: 'T' + i, status: 'closed',
+                              timestamp: new Date(Date.now() - (300 - i) * 60000).toISOString(), qty: 1 });
+  }
+  I.trimTrades();
+  ok(I.portfolio.trades.some(t => t.ticker === 'T259'), 'newest closed trade was dropped');
+  ok(!I.portfolio.trades.some(t => t.ticker === 'T0'),  'oldest closed trade should be gone');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 group('INDICATORS — bounds and non-finite safety');
 check('RSI stays within [0, 100]', () => {
   const flat = new Array(40).fill(10);
@@ -433,13 +471,18 @@ check('a NaN equity cannot produce a NaN drawdown', () => {
   const r = I.computeDrawdown(1000, NaN);
   ok(Number.isFinite(r.drawdown), `got ${r.drawdown}`);
 });
-check('drawdown stays comparable so risk gates actually fire', () => {
-  // The whole point: these comparisons must be meaningful, not NaN-poisoned.
+check('a wiped account on corrupt state ARMS safe mode and the emergency stop', () => {
+  // This replaces an earlier tautological assertion (`x === false || x === true`, true
+  // for any boolean, so it tested nothing). The real requirement is not "the comparison
+  // returns a boolean" — it's that the gates actually FIRE. With a corrupt peak of 0 and
+  // zero equity, drawdown must resolve to a real 100%, which trips both thresholds. If
+  // the divisor guard regresses, drawdown becomes NaN, both comparisons silently go
+  // false, and this test fails — which is exactly the failure mode worth catching.
   const r = I.computeDrawdown(0, 0);
-  ok((r.drawdown >= I.capitalSystem.safeModeDrawdown) === false ||
-     (r.drawdown >= I.capitalSystem.safeModeDrawdown) === true,
-     'comparison produced neither true nor false');
-  ok(!Number.isNaN(r.drawdown), 'NaN would make every gate silently pass');
+  near(r.drawdown, 1, 1e-9, 'a zero-equity account is a 100% drawdown');
+  ok(r.drawdown >= I.capitalSystem.safeModeDrawdown,  'safe mode must arm');
+  ok(r.drawdown >= I.capitalSystem.emergencyDrawdown, 'emergency stop must arm');
+  ok(r.drawdown >= I.riskSystem.maxDrawdown,          'max-drawdown gate must trip');
 });
 check('peak ratchets up to current equity when equity exceeds it', () => {
   eq(I.computeDrawdown(1000, 1500).peak, 1500);
@@ -507,6 +550,10 @@ if (failed) {
 }
 console.log('');
 
-// Exit immediately so the 5s debounced queueSaveState() can never fire and
-// overwrite the real atlas-solar-state.json with this suite's fake positions.
+// The suite books fake positions into the real module state, which arms the 5s
+// debounced queueSaveState(). Cancel it DETERMINISTICALLY rather than relying on
+// process.exit() to win that race — a slow run or any future async teardown would
+// otherwise let it fire and overwrite the live atlas-solar-state.json with fixtures.
+const wasArmed = I.cancelPendingSave();
+if (wasArmed) console.log('(cancelled a pending state save — live state file untouched)\n');
 process.exit(failed ? 1 : 0);
