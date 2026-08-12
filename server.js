@@ -1,5 +1,5 @@
 // ════════════════════════════════════════════════════════════════════════════
-//  ATLAS CENTAURI — Unified Engine  v11.18   (US Markets Only: NASDAQ + NYSE)
+//  ATLAS CENTAURI — Unified Engine  v11.19   (US Markets Only: NASDAQ + NYSE)
 //
 //  ONE engine, three named subsystems:
 //
@@ -682,10 +682,25 @@ async function analyze(articles) {
 const SEC_UA = process.env.SEC_USER_AGENT || 'ATLAS-Centauri-research';
 // SEC 13F lists holdings by company name/CUSIP, not ticker, so map the core universe.
 // Unknown (dynamic) symbols fall back to querying the ticker itself.
+// v11.19: the original map only covered mega-caps that AREN'T in WATCHLISTS below —
+// only JPM actually overlapped. Every other core-watchlist symbol was falling back to
+// `symbol` itself as the SEC full-text search query (e.g. searching literally "PLTR"
+// instead of "Palantir Technologies"), which is a weak/noisy match against 13F filing
+// text — Venus's institutional-interest signal was effectively broken for the stocks
+// this bot actually trades. Filled in the real issuer names for the whole watchlist.
 const COMPANY_NAMES = {
+  // core NASDAQ watchlist
+  PLTR:'Palantir Technologies', SOFI:'SoFi Technologies', MARA:'MARA Holdings',
+  HOOD:'Robinhood Markets', SOUN:'SoundHound AI', IONQ:'IonQ',
+  RKLB:'Rocket Lab USA', BBAI:'BigBear.ai Holdings', HIMS:'Hims & Hers Health', CIFR:'Cipher Mining',
+  // core NYSE watchlist
+  F:'Ford Motor', BAC:'Bank of America', JPM:'JPMorgan Chase', WFC:'Wells Fargo',
+  GE:'General Electric', XOM:'Exxon Mobil', MRK:'Merck', JNJ:'Johnson & Johnson',
+  PFE:'Pfizer', KO:'Coca-Cola',
+  // extra mega-caps, kept for when a dynamic (Venus-discovered) symbol lands on one
   AAPL:'Apple Inc', MSFT:'Microsoft Corp', NVDA:'NVIDIA Corp', AMZN:'Amazon.com',
   GOOGL:'Alphabet Inc', META:'Meta Platforms', TSLA:'Tesla Inc', AMD:'Advanced Micro Devices',
-  NFLX:'Netflix Inc', JPM:'JPMorgan Chase', V:'Visa Inc', AVGO:'Broadcom Inc'
+  NFLX:'Netflix Inc', V:'Visa Inc', AVGO:'Broadcom Inc'
 };
 const _instCache = {};   // symbol → { filings, score, at } ; 13F is quarterly so cache 12h
 
@@ -1076,8 +1091,8 @@ function createJupiter(config = {}) {
 
   // ── Position sizing (HOT PATH — pure sync): dollar-risk × Kelly × MODEL ──
   function kellyRiskFraction() {
-    const base = STRATEGY.RISK_PER_TRADE_BASE ?? 0.01;
-    const cap  = STRATEGY.RISK_PER_TRADE_MAX  ?? 0.02;
+    const base = STRATEGY.RISK_PER_TRADE_BASE ?? 0.015;
+    const cap  = STRATEGY.RISK_PER_TRADE_MAX  ?? 0.03;
     const kf   = STRATEGY.KELLY_FRACTION      ?? 0.25;
     const e = T.helpers.calculateTradeExpectancy();
     const sample = T.helpers.closedTradeCount();
@@ -1095,7 +1110,7 @@ function createJupiter(config = {}) {
   function computeSize(symbol, price, direction) {
     if (!T) return 0;
     if (!Number.isFinite(price) || price <= 0) return 0;
-    const cap = STRATEGY.RISK_PER_TRADE_MAX ?? 0.02;
+    const cap = STRATEGY.RISK_PER_TRADE_MAX ?? 0.03;
 
     const a = T.helpers.atrPct(symbol);
     const stopFrac = Math.max(0.004, (STRATEGY.ATR_STOP_MULT ?? 2.2) * a);
@@ -1350,7 +1365,7 @@ right now is discipline and survival. Review the system honestly:
 ${trackLine}
   • profit factor: ${ctx.profitFactor != null && sample > 0 ? ctx.profitFactor.toFixed(2) : 'n/a'}
   • current drawdown: ${((ctx.drawdown ?? 0)*100).toFixed(1)}%   consecutive losses: ${ctx.consecutiveLosses ?? 0}
-  • open positions: ${ctx.openPositions ?? 0} / ${ctx.maxPositions ?? 6}   capital deployed: ${((ctx.deployed ?? 0)*100).toFixed(0)}%
+  • open positions: ${ctx.openPositions ?? 0} / ${ctx.maxPositions ?? 8}   capital deployed: ${((ctx.deployed ?? 0)*100).toFixed(0)}%
   • Venus market posture: ${ctx.venusPosture || 'n/a'}
 
 Decide how Jupiter should carry itself for the next stretch. Bias toward caution: a small account
@@ -1406,12 +1421,16 @@ Output ONLY JSON:
 // ║  it executes, manages positions, and enforces the risk pipeline.           ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 const AI_ENABLED            = venus.isConfigured();
-const NEWS_POLL_MS          = Math.max(60000, parseInt(process.env.NEWS_POLL_MS || '300000', 10));        // default 5 min
-const AI_MAX_CALLS_PER_HOUR = Math.max(1, parseInt(process.env.AI_MAX_CALLS_PER_HOUR || '40', 10));   // both engines now reason via LLM each cycle; Groq free-tier handles this comfortably
-const AI_CONVICTION_MIN     = Math.min(0.9, Math.max(0.5, parseFloat(process.env.AI_CONVICTION_MIN || '0.65')));
+// v11.19 aggression tune: faster news cycle (5min→3min) needs a higher call budget to
+// avoid starving assess()/deliberate() of budget every cycle (analyze+assess+deliberate
+// can be up to 3 LLM calls/cycle). Still env-overridable; still fails safe — over-budget
+// or provider-429 calls just skip gracefully (llmReason returns null), never crash/hang.
+const NEWS_POLL_MS          = Math.max(60000, parseInt(process.env.NEWS_POLL_MS || '180000', 10));        // default 3 min
+const AI_MAX_CALLS_PER_HOUR = Math.max(1, parseInt(process.env.AI_MAX_CALLS_PER_HOUR || '60', 10));   // both engines now reason via LLM each cycle
+const AI_CONVICTION_MIN     = Math.min(0.9, Math.max(0.5, parseFloat(process.env.AI_CONVICTION_MIN || '0.60')));
 const AI_SIGNAL_WEIGHT      = Math.min(0.20, Math.max(0, parseFloat(process.env.AI_SIGNAL_WEIGHT || '0.12'))); // max score boost
 const DYNAMIC_WATCHLIST_ON  = (process.env.DYNAMIC_WATCHLIST || 'on').toLowerCase() !== 'off';
-const DYNAMIC_MAX_SYMBOLS   = Math.max(0, Math.min(15, parseInt(process.env.DYNAMIC_MAX_SYMBOLS || '8', 10)));
+const DYNAMIC_MAX_SYMBOLS   = Math.max(0, Math.min(15, parseInt(process.env.DYNAMIC_MAX_SYMBOLS || '10', 10)));
 const DYNAMIC_MIN_PRICE     = 2.0;       // avoid sub-$2 names (manipulation, wide spreads)
 const DYNAMIC_MAX_PRICE     = 1000;      // sizing sanity on a small account
 const DYNAMIC_MIN_DAY_VOL   = 750000;    // need real liquidity for fills
@@ -1447,8 +1466,23 @@ const WATCHLISTS = {
 };
 const HIGH_VOLATILITY = new Set(['MARA','SOUN','IONQ','RKLB','BBAI','CIFR','HIMS']);
 
-// ✅ NEW: Earnings calendar blackout (prevent trading 2 days before earnings)
-// Format: { SYMBOL: dayOfMonth, ... }
+// ── EARNINGS BLACKOUT ────────────────────────────────────────────────────────
+// ⚠️ DEFAULT OFF (v11.19). These are PLACEHOLDER day-of-month values, not real
+// earnings dates, and the structure cannot represent real ones: it stores only a
+// day-of-month, so it repeats EVERY MONTH — while earnings are QUARTERLY. Left
+// enabled it blacked out ~4 days/month for each of the 10 symbols (the window is
+// diff 0/1/2 plus the day after) on essentially arbitrary dates: it blocked real
+// tradeable days ~13% of the time while giving ZERO protection on the actual
+// earnings days it's supposed to guard. A gate driven by false data is worse than
+// no gate — it costs opportunity and buys no safety.
+//
+// The genuine earnings risk (a big overnight move) is already covered by the
+// OVERNIGHT GAP system, which is measured from real prices: ≥3% gap blocks entries
+// 30 min, ≥1.5% halves size. That protection is unaffected by this flag.
+//
+// To turn this on: populate REAL upcoming earnings days below, then set
+// EARNINGS_BLACKOUT=on. Values are days-of-month in Eastern time.
+const EARNINGS_BLACKOUT_ENABLED = (process.env.EARNINGS_BLACKOUT || 'off').toLowerCase() === 'on';
 const EARNINGS_CALENDAR = {
   PLTR: [15], SOFI: [22], MARA: [18], HOOD: [25], SOUN: [10],
   IONQ: [12], RKLB: [8], BBAI: [20], HIMS: [14], CIFR: [5]
@@ -1555,7 +1589,11 @@ let riskSystem = {
   maxDrawdown:      0.20,
   maxPortfolioHeat: 0.50,
   dailyLossLimit:   0.05,
-  maxTradesPerDay:  12,         // allows ~2 full position cycles per session at max concurrency
+  // v11.19 aggression tune: raised from 12 — this is a PACING cap, not a capital-
+  // protection cap. dailyLossLimit/maxDrawdown/emergencyStop above (untouched) are
+  // what actually bound how much the account can lose in a day; this just lets more
+  // trades happen within that same protected budget.
+  maxTradesPerDay:  18,
   currentDrawdown:  0,
   portfolioHeat:    0,
   riskLevel:        'normal',
@@ -1578,6 +1616,20 @@ let sentimentData = {
   spyMomentum:  0,            // daily move of SPY (fetched alongside quotes)
   uptickRatio:  0.5,          // fraction of last-N 1m candles closing higher than open
 };
+// Reference cadence the sentiment EMA's 0.2 step was originally tuned against (~31s
+// half-life). computeMarketBreadth derives its real alpha from elapsed time against
+// this, so the filter behaves identically no matter how fast the main loop ticks.
+const SENTIMENT_EMA_REF_MS = 10000;
+// Elapsed-time → EMA weight. Pure and exported so the cadence-independence property
+// is directly regression-testable (see test.js) rather than re-derived in the test.
+// dt === SENTIMENT_EMA_REF_MS reproduces the original 0.2 step exactly.
+// dt is capped at 60s so a long gap (overnight, restart) refreshes hard toward the
+// current reading without pinning alpha at exactly 1.0 — a stale EMA shouldn't drag,
+// but shouldn't teleport either.
+function sentimentAlpha(dtMs) {
+  const dt = Math.min(Math.max(Number(dtMs) || 0, 0), 60000);
+  return 1 - Math.pow(0.8, dt / SENTIMENT_EMA_REF_MS);
+}
 
 // Track SPY separately for regime confirmation
 let spyData = { price: null, prevClose: null };
@@ -1588,8 +1640,18 @@ let marketTransitionData = { lastMarket: null };
 // ─── COOLDOWNS ────────────────────────────────────────────────────────────
 let symbolCooldowns  = {};
 let symbolLossCount  = {};
-const STOP_LOSS_COOLDOWN_MS    = 20 * 60 * 1000;
+// v11.19 aggression tune: shortened from 20min so a stopped-out symbol can be
+// re-evaluated sooner if the setup is still there. REPEAT_LOSS_MULTIPLIER (below,
+// unchanged) still escalates this on repeat losses on the same symbol, so genuine
+// revenge-trading is still throttled — this only speeds up the FIRST retry.
+const STOP_LOSS_COOLDOWN_MS    = 12 * 60 * 1000;
 const REPEAT_LOSS_MULTIPLIER   = 2;
+
+// v11.19 aggression tune: raised from 6 (was hardcoded in three separate places —
+// centralized here). More concurrent slots to deploy capital into, still bounded by
+// MAX_SECTOR_EXPOSURE (unchanged, 2/sector) so it can't stack into one correlated bet,
+// and by portfolioHeat/dailyLossLimit/drawdown (unchanged) for total account risk.
+const MAX_OPEN_POSITIONS = 8;
 
 // ─── EXECUTION CONSTANTS ─────────────────────────────────────────────────
 const SLIPPAGE_RATE     = 0.0015;    // ✅ FIX Bug #3: Realistic 0.15% slippage
@@ -1743,8 +1805,8 @@ const GAP_BLOCK_MS       = 30 * 60 * 1000;
 //
 //  RISK (enforced by computePositionSize() + kill switches):
 //    • Risk per trade:   BASE_RISK of trading capital, capped at MAX_RISK
-//    • Daily loss limit: 5% of start capital halts new entries
-//    • Max positions:    6 concurrent; max 2 per sector
+//    • Daily loss limit: 5% of CURRENT equity (not frozen start capital) halts entries
+//    • Max positions:    8 concurrent; max 2 per sector
 //    • Portfolio heat:   ≤ 50% notional exposure
 //    • Kill switches:    WS down, stale data, 4-loss streak, 20% drawdown, extreme vol
 // ════════════════════════════════════════════════════════════════════════════
@@ -1792,8 +1854,12 @@ const STRATEGY = {
   ADX_RANGE:       18,    // ≤ → ranging: prefer mean-reversion, block fresh breakouts
 
   // Risk budget (fraction of TRADING pool risked per trade — dollar-risk, not notional)
-  RISK_PER_TRADE_BASE: 0.010,  // 1.0% baseline (research: 2% caps drawdown; we sit under it)
-  RISK_PER_TRADE_MAX:  0.020,  // 2.0% hard ceiling, ever
+  // v11.19 aggression tune: raised from 1.0%/2.0% so a real edge sizes up faster.
+  // Still hard-capped — this is NOT unlimited risk, it's a higher ceiling. The daily
+  // loss limit, drawdown halt, and emergency stop (riskSystem/capitalSystem, untouched
+  // by this tune) are what actually bound total account risk regardless of this number.
+  RISK_PER_TRADE_BASE: 0.015,  // 1.5% baseline
+  RISK_PER_TRADE_MAX:  0.030,  // 3.0% hard ceiling, ever
   KELLY_FRACTION:      0.25,   // ¼-Kelly overlay on measured edge
 };
 const STRATEGY_GATE_ENABLED = (process.env.STRATEGY_GATE || 'on').toLowerCase() !== 'off';
@@ -2565,7 +2631,7 @@ async function runIntelCycle() {
       drawdown:          riskSystem.currentDrawdown,
       consecutiveLosses: riskSystem.consecutiveLosses,
       openPositions:     Object.keys(portfolio.longPositions).length + Object.keys(portfolio.shortPositions).length,
-      maxPositions:      6,
+      maxPositions:      MAX_OPEN_POSITIONS,
       deployed:          _tv > 0 ? getNotionalExposure() / _tv : 0,
       venusPosture:      venusPosture ? venusPosture.stance : (_posFresh ? _storedPosture.stance : null)
     });
@@ -2835,8 +2901,23 @@ function computeMarketBreadth() {
   const raw = breadth * 0.7 + spySignal * 0.3;
   const clamped = Math.max(0.2, Math.min(0.8, raw));
 
-  // Smooth 20% toward new value per update (resists single-tick spikes).
-  sentimentData.general = sentimentData.general * 0.8 + clamped * 0.2;
+  // Smooth toward the new value — TIME-NORMALIZED (v11.19).
+  // This was a flat `general*0.8 + clamped*0.2` per call, which silently couples the
+  // filter's real-world responsiveness to the MAIN LOOP'S TICK RATE. When the loop went
+  // 10s→2s this same line started running 5x more often, cutting the EMA's half-life
+  // from ~31s to ~6s — sentiment began whipsawing on short-lived breadth flickers, and
+  // sentimentFactor is 10% of every entry score, so that noise fed straight into entry
+  // quality. (Same failure class as the v11.17 win-rate bug: an EMA step must correspond
+  // to a fixed unit — here, of TIME, since each call carries genuinely new prices.)
+  // Deriving alpha from elapsed ms against the 10s cadence the 0.2 was tuned for keeps
+  // the intended ~31s half-life at ANY tick rate, and makes future cadence changes safe.
+  // Irregular spacing is handled correctly too (fetchInitialPrices/diag also call this).
+  const _sNow = Date.now();
+  const _sDt  = computeMarketBreadth._lastAt ? Math.max(0, _sNow - computeMarketBreadth._lastAt)
+                                             : SENTIMENT_EMA_REF_MS;
+  computeMarketBreadth._lastAt = _sNow;
+  const _sAlpha = sentimentAlpha(_sDt);
+  sentimentData.general = sentimentData.general * (1 - _sAlpha) + clamped * _sAlpha;
 
   // Per-market sentiment: both NASDAQ and NYSE trade together in the US session
   if (market === 'nasdaq') {
@@ -3123,6 +3204,7 @@ function isEarningsBlackout(symbol) {
   //   e.g. today=30, earnings=2: (2-30+31)%31 = 3  → inside window
   //        today=29, earnings=2: (2-29+31)%31 = 4  → outside (earnings not yet close)
   //   Window: 2 days before, day-of, and 1 day after earnings.
+  if (!EARNINGS_BLACKOUT_ENABLED) return false;   // see EARNINGS_CALENDAR — placeholder data, off by default
   const earningsDays = EARNINGS_CALENDAR[symbol];
   if (!earningsDays) return false;
   const nowET      = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
@@ -3404,6 +3486,19 @@ function computePositionSize(symbol, price, direction) {
   return jupiter.computeSize(symbol, price, direction);
 }
 
+// Drawdown + peak, with the divisor guarded. A peakValue of 0 (corrupt or hand-edited
+// state — `?? START_CAPITAL` on load does NOT catch 0, only null/undefined) makes this
+// 0/0 = NaN when equity is also 0. That matters because EVERY downstream risk check is
+// a `<=`/`>=` comparison against this number, and every comparison with NaN is false —
+// safe mode and the emergency stop would silently never arm on a corrupt state file.
+// Pure + exported so the degenerate cases are regression-tested (see test.js).
+function computeDrawdown(peakValue, totalValue) {
+  const peak = (Number.isFinite(peakValue) && peakValue > 0) ? peakValue : START_CAPITAL;
+  const tv   = Number.isFinite(totalValue) ? totalValue : 0;
+  const dd   = Math.max(0, (peak - tv) / peak);
+  return { peak: Math.max(peak, tv), drawdown: Number.isFinite(dd) ? dd : 0 };
+}
+
 function wouldExceedHeat(price, qty) {
   const tv = getTotalValue();
   if (tv <= 0) return true;
@@ -3469,6 +3564,17 @@ function recordLiveOrder(entry) {
 let pendingOrders = {};                    // id → {kind, ...meta, submittedAt} (persisted)
 let brokerMirror  = { at: 0, ok: false };  // latest broker account+positions snapshot
 const ORDER_TIMEOUT_MS = 45 * 1000;        // market orders should fill ~instantly on paper
+// A pending order older than this is STUCK: poll keeps erroring with something other
+// than 404 (sustained 5xx / network outage / missing keys, which returns no .status at
+// all), so it never reaches a terminal state and never gets released. This matters most
+// for EXIT orders — their lots stay marked `_exiting`, and closeLong/closeShort return
+// early on that mark, so a stop-loss silently cannot fire while it persists.
+// DELIBERATELY ALERT-ONLY, NOT AUTO-RELEASED: blind resubmission risks a DUPLICATE exit
+// (the original order may still be live at the broker and fill later), which turns a
+// flat position into an unintended opposite-side one — a worse failure than the stall.
+// Recovery is operator-driven: POST /api/reconcile to see real broker state, then
+// cancel/flatten at the broker. Surfaced in logs and /api/portfolio → execution.stuck.
+const STALE_ORDER_ALERT_MS = 5 * 60 * 1000;
 
 function pendingEntryFor(ticker) {
   return Object.values(pendingOrders).some(p => p.kind === 'entry' && p.plan && p.plan.ticker === ticker);
@@ -3521,6 +3627,21 @@ async function pollPendingOrders() {
     for (const id of ids) {
       const p = pendingOrders[id];
       if (!p) continue;
+
+      // Stuck-order alarm (see STALE_ORDER_ALERT_MS). Checked BEFORE the poll so it
+      // still fires when getOrder is the thing that's failing.
+      const ageMs = Date.now() - (p.submittedAt || 0);
+      if (ageMs > STALE_ORDER_ALERT_MS) {
+        p.stuck = true;
+        if (!p._lastStuckLog || Date.now() - p._lastStuckLog > 60000) {
+          p._lastStuckLog = Date.now();
+          const blocking = p.kind !== 'entry'
+            ? ` — ⛔ ${p.direction} ${p.ticker} EXITS ARE BLOCKED (stop-loss cannot fire) while this persists`
+            : ' — new entries on this symbol are paused';
+          console.error(`[BROKER] ⚠️ STUCK ${p.kind} order ${id} (${p.ticker}) unresolved for ${Math.round(ageMs / 60000)}min${blocking}. Check the broker directly, then POST /api/reconcile.`);
+        }
+      }
+
       let o;
       try { o = await broker.getOrder(id); } catch (e) { o = { ok: false, error: e.message }; }
       if (!o.ok) {
@@ -4298,6 +4419,45 @@ function saveStateSync() {
   catch (e) { console.error('[SAVE_SYNC]', e.message); }
 }
 
+// ── ORPHANED IN-FLIGHT MARKS (v11.19 fix) ──────────────────────────────────────
+// closeLong/closeShort set `_exiting` (and partialClose sets `_pendingRung`) on a lot
+// SYNCHRONOUSLY, but the order id only lands in pendingOrders after an async round-trip
+// to the broker. Any save inside that window — most realistically the SIGTERM
+// saveStateSync that a Railway deploy or Ctrl-C triggers — persists lots marked
+// in-flight with NO pending order that could ever release them. On restart the guards
+// `if (positions.some(p => p._exiting)) return;` then short-circuit every exit attempt
+// forever: the position becomes permanently unexitable and its STOP-LOSS SILENTLY
+// CANNOT FIRE. Clearing marks with no matching live pending order self-heals this.
+//
+// Safe by construction: a mark WITH a live pending order is preserved (the poller still
+// owns it), so this can't race the normal lifecycle. Only provably-orphaned marks are
+// cleared, and clearing one merely re-arms the exit engine to re-evaluate normally. In
+// broker-authoritative mode syncFromBroker() + reconcileWithBroker() run right after
+// load and surface any real position drift for the operator.
+function clearOrphanedInFlightMarks() {
+  const liveMarks = new Set();      // "TICKER|DIRECTION|full" or "TICKER|DIRECTION|<rung>"
+  Object.values(pendingOrders).forEach(p => {
+    if (!p || !p.ticker) return;
+    if (p.kind === 'exitLong' || p.kind === 'exitShort') liveMarks.add(`${p.ticker}|${p.direction}|full`);
+    else if (p.kind === 'partial')                       liveMarks.add(`${p.ticker}|${p.direction}|${p.rung}`);
+  });
+  let cleared = 0;
+  for (const [book, dir] of [[portfolio.longPositions, 'LONG'], [portfolio.shortPositions, 'SHORT']]) {
+    Object.entries(book || {}).forEach(([ticker, lots]) => {
+      (lots || []).forEach(p => {
+        if (p._exiting && !liveMarks.has(`${ticker}|${dir}|full`)) { delete p._exiting; cleared++; }
+        if (p._pendingRung != null && !liveMarks.has(`${ticker}|${dir}|${p._pendingRung}`)) {
+          delete p._pendingRung; cleared++;
+        }
+      });
+    });
+  }
+  if (cleared > 0) {
+    console.warn(`[LOAD] ⚠️ Cleared ${cleared} orphaned in-flight mark(s) — an exit/partial was interrupted mid-submit (likely a restart). Exits are re-armed; verify real positions with POST /api/reconcile.`);
+  }
+  return cleared;
+}
+
 function loadState() {
   const candidates = [BACKUP_FILE, BACKUP_FILE + '.tmp'];
   let state = null;
@@ -4330,6 +4490,8 @@ function loadState() {
     if (state.capitalSystem)  Object.assign(capitalSystem, state.capitalSystem);
     if (state.pendingOrders)  pendingOrders = state.pendingOrders;
     if (state.spyData)        Object.assign(spyData, state.spyData);
+
+    clearOrphanedInFlightMarks();   // see the function — prevents permanently-dead stop-losses
     if (state.aiSystem) {
       const a = state.aiSystem;
       aiSystem.aggressionLevel          = a.aggressionLevel          ?? 0.5;
@@ -4749,7 +4911,9 @@ function evaluateAndTrade() {
 
   // ── 2. RISK GATES ─────────────────────────────────────────────────────────
   const totalValue = getTotalValue();
-  riskSystem.currentDrawdown = Math.max(0, (riskSystem.peakValue - totalValue) / riskSystem.peakValue);
+  const _dd = computeDrawdown(riskSystem.peakValue, totalValue);
+  riskSystem.peakValue       = _dd.peak;
+  riskSystem.currentDrawdown = _dd.drawdown;
   riskSystem.peakValue       = Math.max(riskSystem.peakValue, totalValue);
   riskSystem.portfolioHeat   = totalValue > 0 ? Math.max(0, getNotionalExposure() / totalValue) : 0;
 
@@ -4826,7 +4990,7 @@ function evaluateAndTrade() {
   // ── 4. POSITION COUNT + CAPITAL CHECK ─────────────────────────────────────
   const openCount = Object.keys(portfolio.longPositions).length
                   + Object.keys(portfolio.shortPositions).length;
-  if (openCount >= 6) return;
+  if (openCount >= MAX_OPEN_POSITIONS) return;
   if (capitalSystem.tradingCapital < 50) return;
 
   // ── 5. TIME-OF-DAY FILTER ─────────────────────────────────────────────────
@@ -4881,6 +5045,13 @@ function evaluateAndTrade() {
   for (const symbol of rankedSymbols) {
     const q = marketData[symbol];
     if (!q || !q.price || !q.prevClose) continue;
+    // Per-symbol staleness guard: the kill switch above only halts NEW entries
+    // market-wide once a MAJORITY of the watchlist goes stale (getKillSwitchReason).
+    // A single frozen feed — most likely a just-added dynamic/Venus symbol whose WS
+    // subscribe silently failed — never trips that aggregate check and was otherwise
+    // tradeable on a frozen price with no freshness check at all. Trading a stale
+    // number is exactly the failure mode "make sure all numbers are true" rules out.
+    if (q.lastUpdate && (Date.now() - q.lastUpdate) > MAX_PRICE_AGE_MS) continue;
     // ✅ FIX Bug #2: Empty arrays are truthy, check length explicitly
     const hasLong = portfolio.longPositions[symbol]?.length > 0;
     const hasShort = portfolio.shortPositions[symbol]?.length > 0;
@@ -4943,15 +5114,16 @@ function evaluateAndTrade() {
     const aiAdj = aiScoreAdjustment(symbol);
     longScore = Math.max(0, Math.min(1, longScore + aiAdj.long));
     
-    // Threshold: 0.72 A+ (top signals), 0.50 normal.
-    // Old normal was 0.55. volumeFactor baseline=0.3 drag = ~0.03 off every score,
-    // making 0.55 effectively 0.58. Lowering to 0.50 restores the intended quality bar.
-    const A_PLUS_SETUP_THRESHOLD = 0.72;
-    const NORMAL_SETUP_THRESHOLD = 0.50;
+    // Threshold: 0.70 A+ (top signals), 0.46 normal.
+    // v11.19 aggression tune: lowered from 0.72/0.50 so more real setups clear the
+    // bar and get taken — this changes trade FREQUENCY, not the stop-loss/R:R/kill-
+    // switch rules a trade still has to pass once it's proposed (terraValidateTrade).
+    const A_PLUS_SETUP_THRESHOLD = 0.70;
+    const NORMAL_SETUP_THRESHOLD = 0.46;
     // Apply regime micro-adjustment: bull regime makes threshold slightly easier,
     // bear/choppy makes it slightly harder. Clamped to a safe range.
     const baseThreshold = aiSystem.a_plus_mode ? A_PLUS_SETUP_THRESHOLD : NORMAL_SETUP_THRESHOLD;
-    const minThreshold  = Math.max(0.40, Math.min(0.80, baseThreshold + regimeThreshAdj));
+    const minThreshold  = Math.max(0.36, Math.min(0.80, baseThreshold + regimeThreshAdj));
 
     // Formal EMA-crossover + RSI gate (hard filter on top of the weighted score)
     const gate = evaluateStrategyGate(symbol, q);
@@ -4996,7 +5168,7 @@ function evaluateAndTrade() {
     const spy     = (sentimentData.spyMomentum  * 100).toFixed(2);
     const stress = (calculateMarketStress() * 100).toFixed(0);
     const expectancy = calculateTradeExpectancy();
-    console.log(`[SCAN] ${market} ${regime} | breadth ${breadth}% | SPY ${spy}% | stress ${stress}% | expect ${expectancy.expectancy.toFixed(2)} | open ${openCount}/6 | trades ${riskSystem.dailyTradeCount}/${riskSystem.maxTradesPerDay}`);
+    console.log(`[SCAN] ${market} ${regime} | breadth ${breadth}% | SPY ${spy}% | stress ${stress}% | expect ${expectancy.expectancy.toFixed(2)} | open ${openCount}/${MAX_OPEN_POSITIONS} | trades ${riskSystem.dailyTradeCount}/${riskSystem.maxTradesPerDay}`);
   }
 }
 evaluateAndTrade._lastScanLog     = 0;
@@ -5107,7 +5279,16 @@ app.get('/api/portfolio', (req, res) => {
       authoritative: EXEC_BROKER_AUTH ? broker.name : 'internal-simulator',
       pendingOrders: Object.keys(pendingOrders).length,
       mirror:        EXEC_BROKER_AUTH ? brokerMirror : null,
-      driftPct:      EXEC_BROKER_AUTH ? executionDriftPct() : null
+      driftPct:      EXEC_BROKER_AUTH ? executionDriftPct() : null,
+      // Stuck orders (see STALE_ORDER_ALERT_MS). `exitsBlocked` is the one that needs
+      // immediate operator attention — it means a stop-loss cannot fire on that symbol.
+      stuck: Object.entries(pendingOrders)
+        .filter(([, p]) => p && p.stuck)
+        .map(([id, p]) => ({
+          id, kind: p.kind, ticker: p.ticker, direction: p.direction || null,
+          ageMin: Math.round((Date.now() - (p.submittedAt || 0)) / 60000),
+          exitsBlocked: p.kind !== 'entry'
+        }))
     },
     aiMetrics: {
       strategy:         aiSystem.strategy,
@@ -5241,7 +5422,7 @@ app.get('/api/health', (req, res) => res.json({
   dynamic_watchlist: DYNAMIC_WATCHLIST_ON,
   dynamic_symbols: Object.keys(dynamicSymbols).length,
   live_ai_signals: jupiter.activeSymbols().length,
-  version: 'v11.18-centauri'
+  version: 'v11.19-centauri'
 }));
 
 // Toggle A+ mode via POST /api/aplus?enable=true|false
@@ -5402,7 +5583,7 @@ app.post('/api/tradingview-webhook', (req, res) => {
 // Boot the execution engine only when run directly (`node server.js`). When
 // imported as a module, the engine stays dormant and only its brain is exposed.
 if (require.main === module) app.listen(PORT, async () => {
-  console.log(`\n🌌  ATLAS CENTAURI — Unified Engine v11.18 on port ${PORT}`);
+  console.log(`\n🌌  ATLAS CENTAURI — Unified Engine v11.19 on port ${PORT}`);
   console.log(`   ♀ Venus (research AI: web + 13F + news) + 🔭 Jupiter (trading AI: sizes/decides/learns) + 🌍 Terra (execution gate)`);
   console.log(`[STARTUP] Alpaca data feed (${ALPACA_DATA_FEED}) — US markets (NASDAQ/NYSE) only`);
 
@@ -5477,13 +5658,22 @@ if (require.main === module) app.listen(PORT, async () => {
     if (pend) console.log(`[EXEC] Resuming ${pend} pending order(s) from saved state`);
   }
 
-  // 5. Main 10s loop
+  // 5. Main loop — v11.19: sped up from 10s to 2s (matches Luna's own 2s poll cadence).
+  // This is a pure reaction-speed change, not a risk change: it doesn't touch position
+  // size, stop distance, or any cap — it just checks live WS prices against the SAME
+  // stop/target/entry rules more often. That cuts both ways correctly: entries can catch
+  // a setup sooner, AND open-position stops/trailing-stops/targets (evaluateAndTrade's
+  // step 1, which always runs first, every tick, unconditionally) get checked 5x more
+  // often too — the safeguards get MORE responsive, not less. Safe to run this often:
+  // everything in the loop reads already-cached data (WS ticks / candle cache), no new
+  // network calls are made here, and updateLearning() (v11.17) only advances state once
+  // per NEW closed trade regardless of tick rate, so faster ticking can't corrupt it.
   setInterval(() => {
     computeMarketBreadth();
     updateSymbolMetrics();
     updateLearning();
     evaluateAndTrade();
-  }, 10000);
+  }, 2000);
 
   // 6. Profit vault — every 5 min
   setInterval(processProfitVault, 300000);
@@ -5524,7 +5714,7 @@ if (require.main === module) app.listen(PORT, async () => {
     console.log(`[DIAG] Market: ${m || 'CLOSED'} | Regime: ${detectMarketRegime()} | Breadth: ${(sentimentData.breadthScore*100).toFixed(0)}% | SPY: ${(sentimentData.spyMomentum*100).toFixed(2)}% | Prices: ${Object.keys(marketData).length} | Candles: ${Object.keys(candleData).length} | Jupiter signals: ${jupiter.activeSymbols().length}`);
   }, 40000);
 
-  console.log("[STARTUP] Centauri online — unified engine v11.18 (Venus + Jupiter + Terra) ready\n");
+  console.log("[STARTUP] Centauri online — unified engine v11.19 (Venus + Jupiter + Terra) ready\n");
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -5538,5 +5728,12 @@ module.exports = {
   OnlineLogistic, PlattCalibrator, sigmoid, logit, clip, blendWithPrior,
   trainLogisticBatch, meanLogLoss, accuracyOf,
   // Test-only handles for the execution pipeline (unused by the running engine).
-  _internals: { buildTradePlan, terraValidateTrade, terraExecutePlan, portfolio, capitalSystem, riskSystem, marketData, dynamicSymbols, STRATEGY, gapData, getGapSizeAdjust, isGapBlocked, detectOvernightGaps, marketIntradayVolMedian, candleData, rebalanceCapital, updateLearning, aiSystem, pendingOrders, pollPendingOrders, refreshBrokerMirror, brokerMirror: () => brokerMirror, executionDriftPct, applyEntryFill, closeLong, closeShort, partialClose }
+  _internals: { buildTradePlan, terraValidateTrade, terraExecutePlan, portfolio, capitalSystem, riskSystem, marketData, dynamicSymbols, STRATEGY, gapData, getGapSizeAdjust, isGapBlocked, detectOvernightGaps, marketIntradayVolMedian, candleData, rebalanceCapital, updateLearning, aiSystem, pendingOrders, pollPendingOrders, refreshBrokerMirror, brokerMirror: () => brokerMirror, executionDriftPct, applyEntryFill, closeLong, closeShort, partialClose,
+    // v11.19: additional read-only/pure handles so test.js can regression-test the
+    // invariants that were previously only ever checked by hand.
+    clearOrphanedInFlightMarks, computeMarketBreadth, sentimentData, spyData,
+    getTotalValue, getNotionalExposure, calculateTradeExpectancy,
+    ema, rsi, calculateATR, atrPct, SENTIMENT_EMA_REF_MS, sentimentAlpha,
+    computeDrawdown, isEarningsBlackout, EARNINGS_BLACKOUT_ENABLED, START_CAPITAL,
+    setPendingOrders: (o) => { pendingOrders = o; } }
 };

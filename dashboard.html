@@ -384,6 +384,21 @@ function render(d) {
     } else if (ex.mode === 'broker-authoritative') {
       ml.textContent = 'broker mirror unavailable — showing engine ledger' + (ex.pendingOrders ? ' · ⏳ ' + ex.pendingOrders + ' pending' : '');
     } else { ml.textContent = ''; }
+
+    // STUCK ORDERS — an unresolved exit order means that symbol's stop-loss cannot
+    // fire until it clears. This is the highest-urgency thing Luna can show, so it
+    // gets its own red line rather than being buried in the mirror text.
+    var stuck = ex.stuck || [];
+    if (stuck.length) {
+      var blocked = stuck.filter(function (s) { return s.exitsBlocked; });
+      var txt = stuck.map(function (s) {
+        return (s.exitsBlocked ? '⛔ ' : '⏳ ') + s.kind + ' ' + s.ticker + ' (' + s.ageMin + 'm)';
+      }).join(' · ');
+      ml.innerHTML += '<br><span style="color:#ff6b6b;font-weight:600">STUCK ORDER' +
+        (stuck.length > 1 ? 'S' : '') + ': ' + txt +
+        (blocked.length ? ' — EXITS BLOCKED, stop-loss cannot fire. Check the broker, then POST /api/reconcile.' : '') +
+        '</span>';
+    }
   }
   const pnlEl = document.getElementById('totalPnL');
   const pnlNum = Number(d.totalPnL) || 0;
@@ -455,7 +470,7 @@ function render(d) {
   heatBar.style.background = heatNum > 40 ? 'var(--red)' : heatNum > 25 ? 'var(--amber)' : 'var(--green)';
   document.getElementById('dailyLoss').textContent = '$' + safe(risk.dailyLoss, '0.00');
   document.getElementById('dailyTrades').textContent =
-    safe(risk.dailyTradeCount, 0) + ' / ' + safe(risk.maxTradesPerDay, 8);
+    safe(risk.dailyTradeCount, 0) + ' / ' + safe(risk.maxTradesPerDay, '—');
   const checksArr = Array.isArray(risk.checksPassing) ? risk.checksPassing : [];
   document.getElementById('checks').textContent = checksArr.length + '/3';
 

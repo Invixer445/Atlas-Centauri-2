@@ -30,7 +30,7 @@ each position with its validated stop. No trade opens without a stop loss.
 | Layer | What it does |
 |-------|--------------|
 | **Capital management** | Splits equity into a protected reserve (30%), an active trading pool (70%), and a locked profit vault |
-| **Constant dollar-risk sizing** | Each trade risks **1% of the trading pool (2% hard cap)** as true dollar-risk — shares = (equity × risk%) ÷ (ATR stop distance) — with a ¼-Kelly overlay from measured edge |
+| **Constant dollar-risk sizing** | Each trade risks **1.5% of the trading pool (3% hard cap)** as true dollar-risk — shares = (equity × risk%) ÷ (ATR stop distance) — with a ¼-Kelly overlay from measured edge |
 | **EMA + RSI strategy gate** | Explicit EMA(9/21) crossover + RSI(14) entry rules, layered as a hard filter on a 7-factor weighted score |
 | **Projected-heat gate** | Rejects a trade if it would push total exposure past 50% |
 | **Regime detection** | Adapts aggression to bull / bear / choppy / high-volatility markets (breadth + SPY momentum + candle uptick ratio) |
@@ -78,7 +78,7 @@ the logs — no real orders are possible in this mode.
 | `BROKER` | `paper` | `alpaca` for real execution (paper or live by `ALPACA_PAPER`) |
 | `STRATEGY_GATE` | `on` | EMA(9/21)+RSI(14)+ADX hard entry filter |
 | `MEAN_REVERSION` | `on` | Fade extremes when ADX says the market is ranging |
-| `CANDLE_FETCH_GAP_MS` | `2500` | Delay between candle calls (free-tier safe) |
+| `EARNINGS_BLACKOUT` | `off` | Blackout around earnings. Off by default — the built-in calendar holds placeholder dates; populate real ones first |
 
 See `.env.example` for the full list.
 
