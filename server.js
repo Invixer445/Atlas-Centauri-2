@@ -1739,13 +1739,19 @@ const EXECUTION_COST    = SLIPPAGE_RATE + SPREAD_RATE;  // Total ~0.25% per side
 //    name is moving fast. We scale the execution cost by a volatility
 //    multiplier (1.0× in calm conditions, up to ~3× in extreme volatility)
 //    and optionally take a symbol's measured intraday range into account.
-function simulateFillPrice(marketPrice, direction, symbol = null, qty = 1) {
-  let executionCost = EXECUTION_COST;
+function simulateFillPrice(marketPrice, direction, symbol = null, qty = 1, opts = {}) {
+  // v11.20: a LIMIT entry does not cross the spread, so the simulator must not charge
+  // for crossing it — otherwise sim results would understate live profitability and we
+  // would tune against the wrong economics. Slippage is still charged (halved), and
+  // market impact still applies. Exits pass no flag and are costed as before.
+  const isLimit = opts.limit === true;
+  const baseCost = isLimit ? (SLIPPAGE_RATE * 0.5) : EXECUTION_COST;
+  let executionCost = baseCost;
 
   if (symbol) {
     const vol = calculateVolatility(symbol);
     const volMultiplier = Math.max(1.0, Math.min(3.0, 1 + (vol - 0.01) * 40));
-    executionCost = EXECUTION_COST * volMultiplier;
+    executionCost = baseCost * volMultiplier;
 
     // Add market impact — scales with sqrt(qty / avg5minVol)
     const impact = getMarketImpactCost(symbol, qty);
@@ -1758,6 +1764,41 @@ function simulateFillPrice(marketPrice, direction, symbol = null, qty = 1) {
   } else {
     return marketPrice * (1 - executionCost + randomSlippage);
   }
+}
+
+// ── EXECUTION COST MODEL (v11.20) ────────────────────────────────────────────
+// One shared estimate of what a round trip actually costs, used by BOTH the entry gate
+// and the simulator so they can never disagree about the economics.
+//
+// LIMIT ENTRIES are the single biggest lever on profitability here. A market order
+// crosses the spread every time; a limit order resting at our price does not. Cutting
+// the round trip from ~0.55% to ~0.34% drops the minimum viable ATR from ~0.79% to
+// ~0.49%, which roughly doubles the set of symbols that can be traded profitably.
+// The trade-off is non-fill — which is fine: a missed entry costs nothing, and the
+// scan re-evaluates seconds later. EXITS stay market orders, always: getting out is
+// not optional and must never hinge on a resting order.
+const LIMIT_ENTRIES = (process.env.LIMIT_ENTRIES || 'on').toLowerCase() !== 'off';
+
+// Fraction-of-price cost for ONE side.
+//   entry+limit  : no spread crossed; a quarter-spread allowance for queue position
+//                  and adverse selection, plus half the usual slippage
+//   market side  : half the spread + full slippage
+function sideCost(symbol, { limit = false } = {}) {
+  const spread = estimateDynamicSpread(symbol);          // vol/RVOL-aware, already a fraction
+  return limit ? (spread * 0.25 + SLIPPAGE_RATE * 0.5)
+               : (spread * 0.50 + SLIPPAGE_RATE);
+}
+// Round trip = entry (limit or market) + exit (always market).
+function estimateRoundTripCost(symbol) {
+  const c = sideCost(symbol, { limit: LIMIT_ENTRIES }) + sideCost(symbol, { limit: false });
+  return Number.isFinite(c) ? Math.max(0.0005, Math.min(0.05, c)) : 0.0055;
+}
+
+// Reward:risk AFTER execution costs — the number that actually decides profitability.
+// gross target/stop are fractions of price; cost is the full round trip.
+function netRewardRisk(tgtFrac, stopFrac, cost) {
+  const net = (tgtFrac - cost) / (stopFrac + cost);
+  return Number.isFinite(net) ? net : 0;
 }
 
 // ─── SHORT BORROW RATE ────────────────────────────────────────────────────
@@ -1927,6 +1968,21 @@ const STRATEGY = {
   ADX_PERIOD:      14,
   ADX_TREND:       23,    // ≥ → trending: momentum entries allowed
   ADX_RANGE:       18,    // ≤ → ranging: prefer mean-reversion, block fresh breakouts
+
+  // ── NET-OF-COST REWARD:RISK (v11.20) ──────────────────────────────────────
+  // MIN_RR above is checked on GROSS prices, which quietly approves losing trades:
+  // subtract a ~0.55% round trip and a "2.09 reward:risk" becomes 0.76 at 0.3% ATR
+  // (the average loss 30% BIGGER than the average win) and only ~1.5 at 1% ATR. The
+  // geometry looked healthy the whole time; the economics never were.
+  // MIN_RR_NET is the real bar, applied AFTER costs. 1.35 is deliberately lower than
+  // the gross 1.8 because it has to be achievable: at 1.35 net with a 45% win rate the
+  // expectancy is +0.13 per unit risked, which is a genuinely profitable system, while
+  // demanding 1.8 NET would require ~2.4% ATR and exclude nearly everything.
+  MIN_RR_NET:      1.35,
+  // Backstop: the target must clear round-trip friction by this multiple, so a trade is
+  // never taken for a move that barely pays the fee. This is the "only trade when there
+  // is real money in it" rule, stated in cost units instead of price units.
+  MIN_TARGET_COST_RATIO: 2.5,
 
   // Risk budget (fraction of TRADING pool risked per trade — dollar-risk, not notional)
   // v11.19 aggression tune: raised from 1.0%/2.0% so a real edge sizes up faster.
@@ -3332,23 +3388,33 @@ function isEarningsBlackout(symbol) {
 // Returns a fraction (e.g. 0.005 = 0.5%).
 function estimateDynamicSpread(symbol) {
   const d = marketData[symbol];
-  if (!d || !d.price) return 0.005;
+  if (!d || !d.price || d.price <= 0) return 0.002;
 
-  // Base spread: 0.25%
-  let spread = 0.0025;
-
-  // Volatility premium — session H-L range
-  const vol = calculateVolatility(symbol);
-  spread += vol * 0.5;
+  // v11.20 REWRITE. This previously started at a flat 25bp and then added
+  // `sessionRange × 0.5`, which conflates VOLATILITY with SPREAD — economically the
+  // wrong quantity. A stock that ranged 3% intraday was modelled as having a 1.5%
+  // bid-ask; the real spread on PLTR/JPM/KO is 1–5bp. Backtesting measured a median
+  // round-trip cost of 1.73%, roughly 5x reality, which (once costs entered the entry
+  // gate) rejected essentially every trade. It also inflated simulated slippage, so
+  // every historical sim result was pessimistic by the same factor.
+  //
+  // Correct anchor is MICROSTRUCTURE, not range:
+  //   • US equities quote in $0.01, so one tick is the hard floor on spread.
+  //   • Spread widens with per-minute volatility, but weakly (a small coefficient on
+  //     1-minute ATR), not with the whole session's range.
+  //   • Thin participation and hard-to-borrow names carry a modest premium.
+  const tick = 0.01 / d.price;                    // one cent as a fraction of price
+  let spread = Math.max(tick, 0.0002);            // floor: 1 tick, min 2bp
+  spread += atrPct(symbol) * 0.08;                // per-minute vol premium (weak, correct sign)
 
   // BUG B FIX: Use RVOL instead of static dailyVolume for the liquidity penalty.
   // dailyVolume is a stale daily snapshot; RVOL reflects current 5-min participation.
   const rvol = calculateRVOL(symbol);
-  if (rvol < 0.5) spread += 0.003;       // very thin market: +0.3%
-  else if (rvol < 0.8) spread += 0.001;  // below-avg volume: +0.1%
+  if (rvol < 0.5) spread += 0.0015;      // very thin market
+  else if (rvol < 0.8) spread += 0.0005; // below-average participation
 
-  // Hard-to-borrow names have structurally wider spreads
-  if (HIGH_VOLATILITY.has(symbol)) spread += 0.002;
+  // Hard-to-borrow / small-cap names quote a little wider
+  if (HIGH_VOLATILITY.has(symbol)) spread += 0.0005;
 
   // ATR spike detection: if the current 1m bar range > 2× ATR, spread widens.
   // This catches real-time volatility spikes that the session H-L misses.
@@ -3358,11 +3424,11 @@ function estimateDynamicSpread(symbol) {
     const barRange = lastBar.h - lastBar.l;
     const atr = calculateATR(symbol);
     if (atr > 0 && barRange > atr * 2) {
-      spread += 0.003;  // spike: +0.3%
+      spread += 0.001;  // momentary spike — quotes do widen, but not by 30bp
     }
   }
 
-  return Math.min(spread, 0.020);  // cap at 2% (extreme market conditions)
+  return Math.min(spread, 0.010);  // 1% cap — beyond this a name is untradeable anyway
 }
 
 // ✅ NEW: Calculate market-wide stress level (0.0 = calm, 1.0 = extreme)
@@ -3732,7 +3798,15 @@ function unmarkLots(ticker, direction, kind, rung) {
 
 function submitBrokerOrder(meta) {
   const { ticker, side, qty, refPrice } = meta;
-  broker.submitOrder({ symbol: ticker, side, qty, type: 'market', tif: 'day', refPrice })
+  // ENTRIES use a limit order at our reference price so we do not cross the spread
+  // (v11.20 — the largest single cost saving available). A non-fill is harmless: the
+  // order is cancelled after ORDER_TIMEOUT_MS and the scan re-evaluates.
+  // EVERY OTHER kind — exits, stops, partials — stays a MARKET order. Getting out must
+  // never depend on a resting limit being reached.
+  const useLimit = LIMIT_ENTRIES && meta.kind === 'entry' && Number(refPrice) > 0;
+  const orderType = useLimit ? 'limit' : 'market';
+  const limitPrice = useLimit ? +Number(refPrice).toFixed(2) : null;
+  broker.submitOrder({ symbol: ticker, side, qty, type: orderType, limitPrice, tif: 'day', refPrice })
     .then(r => {
       if (r.ok) {
         pendingOrders[r.id] = { ...meta, id: r.id, submittedAt: Date.now() };
@@ -3946,11 +4020,16 @@ function buildTradePlan(symbol, direction, entryPrice, signalScore, reason) {
   const stopPrice = direction === 'LONG' ? entryPrice * (1 - stopFrac) : entryPrice * (1 + stopFrac);
   const tgtPrice  = direction === 'LONG' ? entryPrice * (1 + tgtFrac)  : entryPrice * (1 - tgtFrac);
   const sig = jupiter.getSignal(symbol);                               // ♀ Venus's catalyst, if any
+  const cost = estimateRoundTripCost(symbol);                          // what this trade must beat
   return {
     ticker: symbol, direction, entryPrice, shares, atrFrac: a,
     stop:   { price: stopPrice, frac: stopFrac },                    // ← the rule each trade MUST carry
     target: { price: tgtPrice,  frac: tgtFrac },
     rewardRisk: stopFrac > 0 ? tgtFrac / stopFrac : 0,
+    // The economics, carried on the plan so the gate and the logs agree.
+    cost,
+    netRewardRisk:  netRewardRisk(tgtFrac, stopFrac, cost),
+    targetCostRatio: cost > 0 ? tgtFrac / cost : 0,
     conviction: sig ? sig.conviction : null,
     catalyst:   sig ? sig.catalyst   : null,
     signalScore, reason
@@ -3969,6 +4048,14 @@ function terraValidateTrade(plan) {
   if (direction === 'SHORT' && stop.price <= entryPrice)          return reject('short stop not above entry');
   if (stop.frac < 0.002 || stop.frac > 0.15)                      return reject(`stop ${(stop.frac*100).toFixed(1)}% out of bounds`);
   if (plan.rewardRisk < STRATEGY.MIN_RR)                          return reject(`R:R ${plan.rewardRisk.toFixed(2)} < ${STRATEGY.MIN_RR}`);
+  // THE ECONOMIC GATE (v11.20). Gross R:R above is geometry; these two are money.
+  // Without them the engine happily took setups whose net reward:risk was BELOW 1.0 —
+  // i.e. the average loss exceeded the average win before win rate even entered the
+  // picture. This is where "only trade if it can actually pay" is enforced.
+  if (plan.netRewardRisk < STRATEGY.MIN_RR_NET)
+    return reject(`net R:R ${plan.netRewardRisk.toFixed(2)} < ${STRATEGY.MIN_RR_NET} after ${(plan.cost * 100).toFixed(2)}% costs`);
+  if (plan.targetCostRatio < STRATEGY.MIN_TARGET_COST_RATIO)
+    return reject(`target only ${plan.targetCostRatio.toFixed(1)}× round-trip cost (need ${STRATEGY.MIN_TARGET_COST_RATIO}×)`);
 
   // RULE 2 — the stock must be within tradeable limits
   if (entryPrice < DYNAMIC_MIN_PRICE)                             return reject(`price $${entryPrice.toFixed(2)} below $${DYNAMIC_MIN_PRICE} min`);
@@ -4010,7 +4097,8 @@ function terraExecutePlan(plan) {
   const side = direction === 'LONG' ? 'buy' : 'sell';
   const filledSize = simulatePartialFill(ticker, plan.shares, direction);
   if (filledSize < 1) { console.log(`[TERRA] ${direction} ${ticker} not filled (thin market)`); return false; }
-  const fillPrice = simulateFillPrice(entryPrice, side, ticker, filledSize);
+  // Entries are limit orders (see LIMIT_ENTRIES) — model them as not crossing the spread.
+  const fillPrice = simulateFillPrice(entryPrice, side, ticker, filledSize, { limit: LIMIT_ENTRIES });
   return applyEntryFill(plan, fillPrice, filledSize, false);
 }
 
@@ -5920,5 +6008,7 @@ module.exports = {
     atrQuality, hasReliableVolatility, MIN_CANDLES_FOR_ATR,
     releaseExpiredLossHalt, LOSS_HALT_MS, getKillSwitchReason, lossHaltReason,
     institutionalScore, ideaDirection, EFFECTIVE_MIN_DAY_VOL, FEED_VOLUME_FACTOR, DYNAMIC_MIN_DAY_VOL,
+    estimateRoundTripCost, netRewardRisk, sideCost, LIMIT_ENTRIES, estimateDynamicSpread,
+    evaluateStrategyGate, calculateADX, calculateRVOL, getCandleTrend, priceMidpoint, detectMarketRegime,
     setPendingOrders: (o) => { pendingOrders = o; } }
 };

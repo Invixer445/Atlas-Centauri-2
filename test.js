@@ -240,13 +240,93 @@ check('rejects size below 1 share', () => {
   eq(v.approved, false);
   ok(/1 share/i.test(v.reason), `reason was: ${v.reason}`);
 });
-check('rejects out-of-bounds price', () => {
+check('rejects a price above the max', () => {
+  // Uses a HIGH price rather than a penny stock: on a $0.50 name the one-cent tick is
+  // a 2% spread, so the v11.20 economic gate legitimately rejects it first and the
+  // price rule never gets exercised. A $5,000 name has negligible tick spread, so this
+  // isolates the bound under test.
+  seedSymbol('PRICEY', 5000);
+  const p = I.buildTradePlan('PRICEY', 'LONG', 5000, 0.7, 'test');
+  p.shares = 1;
+  const v = I.terraValidateTrade(p);
+  eq(v.approved, false);
+  ok(/above/i.test(v.reason), `reason was: ${v.reason}`);
+});
+check('a sub-$2 stock is rejected (economics or the price rule — either is correct)', () => {
   seedSymbol('PENNY', 0.5);
   const p = I.buildTradePlan('PENNY', 'LONG', 0.5, 0.7, 'test');
   p.shares = 10;
   const v = I.terraValidateTrade(p);
+  eq(v.approved, false, 'a 2%-tick-spread penny stock must never be tradeable');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+group('TRADE ECONOMICS — costs must be in the gate, not just the geometry');
+check('spread model is microstructure-realistic, not session-range-driven', () => {
+  // Was `0.25% + sessionRange*0.5`, which modelled a 3%-range day as a 1.5% bid-ask.
+  // Backtesting measured a 1.73% median round trip — ~5x reality — which once costs
+  // entered the gate rejected essentially every trade.
+  seedSymbol('LIQ', 20);
+  const sp = I.estimateDynamicSpread('LIQ');
+  ok(sp > 0 && sp < 0.006, `spread ${(sp * 100).toFixed(3)}% is not realistic for a $20 liquid name`);
+  ok(sp >= 0.01 / 20 * 0.9, 'spread must never fall below one tick');
+});
+check('a cheaper stock has a wider tick-relative spread', () => {
+  seedSymbol('CHEAP', 3); seedSymbol('DEAR', 300);
+  ok(I.estimateDynamicSpread('CHEAP') > I.estimateDynamicSpread('DEAR'),
+     'a $3 stock must quote wider in percentage terms than a $300 one');
+});
+check('round-trip cost is bounded and finite', () => {
+  seedSymbol('LIQ', 20);
+  const c = I.estimateRoundTripCost('LIQ');
+  ok(Number.isFinite(c) && c > 0 && c < 0.05, `round trip ${c} out of range`);
+});
+check('net R:R is always below gross R:R when costs are real', () => {
+  const gross = 0.046 / 0.022;
+  const net = I.netRewardRisk(0.046, 0.022, 0.003);
+  ok(net < gross, 'costs must reduce reward:risk');
+  ok(net > 0, 'should still be positive here');
+});
+check('net R:R goes BELOW 1 exactly where the live bot was losing', () => {
+  // 0.3% ATR: target 1.38%, stop 0.66%, ~0.55% round trip -> the average loss is
+  // bigger than the average win. Gross R:R still reads a healthy 2.09.
+  const a = 0.003, cost = 0.0055;
+  const net = I.netRewardRisk(4.6 * a, 2.2 * a, cost);
+  ok(net < 1, `net R:R ${net.toFixed(2)} should be under 1 — this is the losing case`);
+  ok((4.6 * a) / (2.2 * a) > 2, 'gross R:R still looks fine, which is why it went unnoticed');
+});
+// Each economic gate is tested where it is the ONLY one that can fire — otherwise they
+// mask each other and removing either one still "passes" (mutation testing caught this).
+const planWith = (o) => ({ ticker: 'X', direction: 'LONG', entryPrice: 20, shares: 10,
+  stop: { price: 19.87, frac: 0.0066 }, target: { price: 20.24, frac: 0.012 },
+  rewardRisk: 0.012 / 0.0066, cost: 0.004,
+  netRewardRisk: I.netRewardRisk(0.012, 0.0066, 0.004),
+  targetCostRatio: 0.012 / 0.004, ...o });
+
+check('net-R:R gate fires on its own (target/cost ratio is fine)', () => {
+  const p = planWith({});
+  ok(p.targetCostRatio >= I.STRATEGY.MIN_TARGET_COST_RATIO, 'setup: cost-ratio gate must NOT be the one firing');
+  ok(p.rewardRisk >= I.STRATEGY.MIN_RR, 'setup: gross R:R must pass');
+  ok(p.netRewardRisk < I.STRATEGY.MIN_RR_NET, 'setup: net R:R must be the failing condition');
+  const v = I.terraValidateTrade(p);
   eq(v.approved, false);
-  ok(/below|price/i.test(v.reason), `reason was: ${v.reason}`);
+  ok(/net R:R/i.test(v.reason), `reason was: ${v.reason}`);
+});
+check('target-vs-cost gate fires on its own', () => {
+  // Mathematically the net-R:R gate subsumes most of this one (net >= 1.35 already
+  // implies target >= ~2.35x cost), so it is exercised with the net gate relaxed.
+  // It is kept as a backstop and for a clearer rejection message.
+  const saved = I.STRATEGY.MIN_RR_NET;
+  try {
+    I.STRATEGY.MIN_RR_NET = 0.1;
+    const p = planWith({ cost: 0.006, targetCostRatio: 0.012 / 0.006,
+                         netRewardRisk: I.netRewardRisk(0.012, 0.0066, 0.006) });
+    ok(p.netRewardRisk >= 0.1, 'setup: net gate must NOT be the one firing');
+    ok(p.targetCostRatio < I.STRATEGY.MIN_TARGET_COST_RATIO, 'setup: cost ratio must be the failing condition');
+    const v = I.terraValidateTrade(p);
+    eq(v.approved, false);
+    ok(/round-trip cost/i.test(v.reason), `reason was: ${v.reason}`);
+  } finally { I.STRATEGY.MIN_RR_NET = saved; }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
