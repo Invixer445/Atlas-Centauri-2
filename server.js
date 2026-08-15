@@ -1,5 +1,5 @@
 // ════════════════════════════════════════════════════════════════════════════
-//  ATLAS CENTAURI — Unified Engine  v11.19   (US Markets Only: NASDAQ + NYSE)
+//  ATLAS CENTAURI — Unified Engine  v11.20   (US Markets Only: NASDAQ + NYSE)
 //
 //  ONE engine, three named subsystems:
 //
@@ -2033,10 +2033,74 @@ function getEasternTimeParts() {
   return { hours: hour + minute / 60, day: dayMap[weekday] ?? 0, dateStr: `${y}-${m}-${d}`, minute };
 }
 
-function getCurrentMarket() {
-  const { hours, day } = getEasternTimeParts();
-  if (day === 0 || day === 6) return null;  // weekend
+// ─── MARKET CALENDAR (v11.20) ────────────────────────────────────────────────
+// Weekday-only hours treat every Mon–Fri as a trading day, so market HOLIDAYS
+// (Thanksgiving, Christmas, Juneteenth, Good Friday…) read as OPEN and the engine
+// scans, logs and tries to trade against a dead tape — and it misses 1:00pm early
+// closes entirely, holding positions past the real close. Alpaca publishes the
+// official NYSE/NASDAQ calendar; this caches it and consults it synchronously.
+// Degrades to the old weekday rules if the calendar is unavailable, so a failed
+// fetch can never halt trading.
+let marketCalendar = { byDate: new Map(), fetchedAt: 0, ok: false };
+
+async function refreshMarketCalendar() {
+  if (typeof broker.getCalendar !== 'function') return false;
+  try {
+    const now = Date.now();
+    const iso = (ms) => new Date(ms).toISOString().slice(0, 10);
+    const r = await broker.getCalendar(iso(now - 3 * 86400000), iso(now + 45 * 86400000));
+    if (!r || !r.ok || !Array.isArray(r.days) || !r.days.length) {
+      if (!marketCalendar.ok) console.log('[CALENDAR] Not available — falling back to standard weekday hours.');
+      return false;
+    }
+    const byDate = new Map();
+    for (const d of r.days) {
+      if (!d || !d.date) continue;
+      const hm = (s, dflt) => {
+        const [h, m] = String(s || dflt).split(':').map(Number);
+        return (Number.isFinite(h) ? h : 0) + (Number.isFinite(m) ? m : 0) / 60;
+      };
+      byDate.set(d.date, { open: hm(d.open, '09:30'), close: hm(d.close, '16:00') });
+    }
+    marketCalendar = { byDate, fetchedAt: now, ok: true };
+    const today = getEasternTimeParts().dateStr;
+    const t = byDate.get(today);
+    console.log(`[CALENDAR] ${byDate.size} trading days loaded — today (${today}) is ${t ? `a trading day ${t.open.toFixed(2)}–${t.close.toFixed(2)} ET` : 'NOT a trading day (weekend/holiday)'}`);
+    return true;
+  } catch (e) {
+    console.warn('[CALENDAR] refresh failed:', e.message);
+    return false;
+  }
+}
+
+// Pure session resolution. Split out of getCurrentMarket so the calendar branch can be
+// tested on a controlled weekday: the real function short-circuits on the weekend check
+// first, so on a Saturday a holiday test would pass without ever running this code
+// (mutation testing caught exactly that).
+function resolveSession(hours, day, dateStr, cal) {
+  if (day === 0 || day === 6) return null;                       // weekend — never a trading day
+  if (cal && cal.ok) {
+    const session = cal.byDate.get(dateStr);
+    if (!session) return null;                                   // holiday
+    return (hours >= session.open && hours < session.close) ? 'nasdaq' : null;
+  }
   if (hours >= NASDAQ_NYSE_HOURS.start && hours < NASDAQ_NYSE_HOURS.end) return 'nasdaq';
+  return null;
+}
+
+function getCurrentMarket() {
+  const { hours, day, dateStr } = getEasternTimeParts();
+  return resolveSession(hours, day, dateStr, marketCalendar);
+}
+
+// Why the market is closed, in words — so a "Market: CLOSED" line is never a mystery.
+function marketClosedReason() {
+  const { hours, day, dateStr } = getEasternTimeParts();
+  if (day === 0 || day === 6) return `weekend (${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][day]})`;
+  if (marketCalendar.ok && !marketCalendar.byDate.get(dateStr)) return `market holiday (${dateStr})`;
+  const session = (marketCalendar.ok && marketCalendar.byDate.get(dateStr)) || { open: NASDAQ_NYSE_HOURS.start, close: NASDAQ_NYSE_HOURS.end };
+  if (hours < session.open)  return `pre-market — opens at ${session.open.toFixed(2)} ET (now ${hours.toFixed(2)})`;
+  if (hours >= session.close) return `after-hours — closed at ${session.close.toFixed(2)} ET (now ${hours.toFixed(2)})`;
   return null;
 }
 
@@ -5529,6 +5593,7 @@ app.get('/api/portfolio', (req, res) => {
       smoothedWinRate: (aiSystem.smoothedWinRate * 100).toFixed(1) + '%'
     },
     currentMarket: market || 'CLOSED',
+    marketClosedReason: market ? null : marketClosedReason(),
     marketStatus:  getMarketStatus(),
     regime:        detectMarketRegime(),
     wsConnected,
@@ -5672,7 +5737,9 @@ app.post('/api/retrain', async (req, res) => {
 
 app.get('/api/logs',   (req, res) => res.json(tradeLogger));
 app.get('/api/health', (req, res) => res.json({
-  ok: true, wsConnected, market: getCurrentMarket() || 'CLOSED', uptime: process.uptime(),
+  ok: true, wsConnected, market: getCurrentMarket() || 'CLOSED',
+  market_closed_reason: getCurrentMarket() ? null : marketClosedReason(),
+  calendar_loaded: marketCalendar.ok, uptime: process.uptime(),
   a_plus_mode: aiSystem.a_plus_mode,
   live_trading: LIVE_TRADING,
   autonomous_trading: AUTONOMOUS_TRADING,
@@ -5691,7 +5758,7 @@ app.get('/api/health', (req, res) => res.json({
   dynamic_watchlist: DYNAMIC_WATCHLIST_ON,
   dynamic_symbols: Object.keys(dynamicSymbols).length,
   live_ai_signals: jupiter.activeSymbols().length,
-  version: 'v11.19-centauri'
+  version: 'v11.20-centauri'
 }));
 
 // Toggle A+ mode via POST /api/aplus?enable=true|false
@@ -5852,7 +5919,7 @@ app.post('/api/tradingview-webhook', (req, res) => {
 // Boot the execution engine only when run directly (`node server.js`). When
 // imported as a module, the engine stays dormant and only its brain is exposed.
 if (require.main === module) app.listen(PORT, async () => {
-  console.log(`\n🌌  ATLAS CENTAURI — Unified Engine v11.19 on port ${PORT}`);
+  console.log(`\n🌌  ATLAS CENTAURI — Unified Engine v11.20 on port ${PORT}`);
   console.log(`   ♀ Venus (research AI: web + 13F + news) + 🔭 Jupiter (trading AI: sizes/decides/learns) + 🌍 Terra (execution gate)`);
   console.log(`[STARTUP] Alpaca data feed (${ALPACA_DATA_FEED}) — US markets (NASDAQ/NYSE) only`);
 
@@ -5909,6 +5976,11 @@ if (require.main === module) app.listen(PORT, async () => {
 
   // 3. Real-time WS feed
   connectWebSocket();
+
+  // 3b. Official trading calendar (holidays + early closes). Best-effort: on failure
+  //     the engine falls back to standard weekday hours, exactly as before.
+  await refreshMarketCalendar();
+  setInterval(refreshMarketCalendar, 12 * 3600 * 1000);
 
   // 4. Capital split
   rebalanceCapital();
@@ -5980,10 +6052,10 @@ if (require.main === module) app.listen(PORT, async () => {
   setTimeout(() => {
     const m = getCurrentMarket();
     computeMarketBreadth();
-    console.log(`[DIAG] Market: ${m || 'CLOSED'} | Regime: ${detectMarketRegime()} | Breadth: ${(sentimentData.breadthScore*100).toFixed(0)}% | SPY: ${(sentimentData.spyMomentum*100).toFixed(2)}% | Prices: ${Object.keys(marketData).length} | Candles: ${Object.keys(candleData).length} | Jupiter signals: ${jupiter.activeSymbols().length}`);
+    console.log(`[DIAG] Market: ${m || ('CLOSED — ' + (marketClosedReason() || 'unknown'))} | Regime: ${detectMarketRegime()} | Breadth: ${(sentimentData.breadthScore*100).toFixed(0)}% | SPY: ${(sentimentData.spyMomentum*100).toFixed(2)}% | Prices: ${Object.keys(marketData).length} | Candles: ${Object.keys(candleData).length} | Jupiter signals: ${jupiter.activeSymbols().length}`);
   }, 40000);
 
-  console.log("[STARTUP] Centauri online — unified engine v11.19 (Venus + Jupiter + Terra) ready\n");
+  console.log("[STARTUP] Centauri online — unified engine v11.20 (Venus + Jupiter + Terra) ready\n");
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -6004,7 +6076,8 @@ module.exports = {
     getTotalValue, getNotionalExposure, calculateTradeExpectancy,
     ema, rsi, calculateATR, atrPct, SENTIMENT_EMA_REF_MS, sentimentAlpha,
     computeDrawdown, isEarningsBlackout, EARNINGS_BLACKOUT_ENABLED, START_CAPITAL,
-    trimTrades, cancelPendingSave,
+    trimTrades, cancelPendingSave, refreshMarketCalendar, marketClosedReason,
+    marketCalendar: () => marketCalendar, getCurrentMarket, getEasternTimeParts, resolveSession,
     atrQuality, hasReliableVolatility, MIN_CANDLES_FOR_ATR,
     releaseExpiredLossHalt, LOSS_HALT_MS, getKillSwitchReason, lossHaltReason,
     institutionalScore, ideaDirection, EFFECTIVE_MIN_DAY_VOL, FEED_VOLUME_FACTOR, DYNAMIC_MIN_DAY_VOL,

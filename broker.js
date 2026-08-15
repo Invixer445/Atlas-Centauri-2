@@ -99,6 +99,8 @@ function makePaperBroker() {
                note: 'paper broker has no real account; ATLAS tracks sim cash internally' };
     },
     async getPositions() { return { ok: true, positions: [] }; },
+    // No real account, so no calendar — callers fall back to weekday hours.
+    async getCalendar() { return { ok: false, error: 'paper-broker-has-no-calendar' }; },
     async closePosition(symbol) { return { ok: true, symbol, status: 'close-acknowledged' }; },
     async cancelAll() { return { ok: true, status: 'cancel-all-acknowledged' }; },
   };
@@ -159,6 +161,18 @@ function makeAlpacaBroker() {
       return { ok: true, cash: parseFloat(a.cash), equity: parseFloat(a.equity),
                buying_power: parseFloat(a.buying_power), status: a.status,
                pattern_day_trader: a.pattern_day_trader };
+    },
+    // Official NYSE/NASDAQ trading calendar — real holidays and early closes.
+    // Weekday-only logic silently treats Thanksgiving, Christmas, Juneteenth etc. as
+    // normal sessions, and misses 1pm early closes.
+    async getCalendar(startISO, endISO) {
+      const g = guard(); if (g) return g;
+      const r = await httpsJson('GET', `${base}/v2/calendar?start=${startISO}&end=${endISO}`, headers, null);
+      if (!r.ok) return { ok: false, error: r.error, status: r.status };
+      const days = (Array.isArray(r.data) ? r.data : []).map(d => ({
+        date: d.date, open: d.open, close: d.close
+      }));
+      return { ok: true, days };
     },
     async getPositions() {
       const g = guard(); if (g) return g;

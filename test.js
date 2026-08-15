@@ -261,6 +261,65 @@ check('a sub-$2 stock is rejected (economics or the price rule — either is cor
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+group('MARKET CALENDAR — weekends, holidays, early closes');
+check('weekends are never a trading day', () => {
+  // The engine reported "Market: CLOSED" on Sat 2026-08-15 and that was CORRECT —
+  // Alpaca's own calendar confirms Aug 15/16 are not trading days.
+  const HOURS = { start: 9.5, end: 16 };
+  const mkt = (h, d) => (d === 0 || d === 6) ? null : (h >= HOURS.start && h < HOURS.end ? 'nasdaq' : null);
+  for (const h of [9.5, 10, 12, 15.9]) {
+    eq(mkt(h, 6), null, `Saturday ${h}:00 must be closed`);
+    eq(mkt(h, 0), null, `Sunday ${h}:00 must be closed`);
+  }
+});
+check('regular weekday session opens 9:30 and closes 16:00 ET', () => {
+  const HOURS = { start: 9.5, end: 16 };
+  const mkt = (h, d) => (d === 0 || d === 6) ? null : (h >= HOURS.start && h < HOURS.end ? 'nasdaq' : null);
+  for (let d = 1; d <= 5; d++) {
+    eq(mkt(9.49, d), null, 'pre-open must be closed');
+    eq(mkt(9.5,  d), 'nasdaq', 'must open exactly at 9:30');
+    eq(mkt(15.99,d), 'nasdaq', 'must still be open just before 16:00');
+    eq(mkt(16.0, d), null, 'must close exactly at 16:00');
+  }
+});
+check('marketClosedReason always explains a closure', () => {
+  // A bare "Market: CLOSED" is what made this look like a bug. It must say why.
+  const r = I.marketClosedReason();
+  const open = I.getCurrentMarket();
+  if (open) ok(r === null, `market is open but a closed-reason was given: ${r}`);
+  else ok(typeof r === 'string' && r.length > 0, 'closed with no explanation');
+});
+check('calendar degrades safely when unavailable', () => {
+  // A failed calendar fetch must fall back to weekday hours, never halt trading.
+  const cal = I.marketCalendar();
+  ok(typeof cal.ok === 'boolean', 'calendar state malformed');
+  ok(cal.byDate instanceof Map, 'byDate should be a Map');
+  ok(Number.isFinite(I.getEasternTimeParts().hours), 'ET clock must still work without a calendar');
+});
+check('a holiday is closed even on a WEEKDAY once the calendar is loaded', () => {
+  // Driven through resolveSession with a controlled Wednesday, because the live
+  // getCurrentMarket() short-circuits on the weekend check and this suite may run on a
+  // Saturday — which made an earlier version of this test pass vacuously.
+  const cal = { ok: true, byDate: new Map([['2026-11-25', { open: 9.5, close: 16 }]]) };
+  eq(I.resolveSession(12, 3, '2026-11-26', cal), null, 'Thanksgiving must be closed');
+  eq(I.resolveSession(12, 3, '2026-11-25', cal), 'nasdaq', 'the day before must be open');
+});
+check('early closes are honoured', () => {
+  // e.g. the 1:00pm close on Christmas Eve / day after Thanksgiving.
+  const cal = { ok: true, byDate: new Map([['2026-11-27', { open: 9.5, close: 13 }]]) };
+  eq(I.resolveSession(12.5, 5, '2026-11-27', cal), 'nasdaq', 'open before 13:00');
+  eq(I.resolveSession(13.5, 5, '2026-11-27', cal), null, 'must be CLOSED after the 13:00 early close');
+  // Without the calendar the old weekday rule would wrongly keep trading until 16:00.
+  eq(I.resolveSession(13.5, 5, '2026-11-27', { ok: false, byDate: new Map() }), 'nasdaq',
+     'control: the fallback path does not know about early closes');
+});
+check('calendar failure falls back to weekday hours (never halts trading)', () => {
+  const none = { ok: false, byDate: new Map() };
+  eq(I.resolveSession(10, 3, '2026-08-19', none), 'nasdaq', 'weekday mid-session must still trade');
+  eq(I.resolveSession(10, 6, '2026-08-15', none), null, 'weekend still closed on the fallback path');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 group('TRADE ECONOMICS — costs must be in the gate, not just the geometry');
 check('spread model is microstructure-realistic, not session-range-driven', () => {
   // Was `0.25% + sessionRange*0.5`, which modelled a 3%-range day as a 1.5% bid-ask.
