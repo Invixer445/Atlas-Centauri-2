@@ -45,7 +45,10 @@ const VERBOSE  = flag('--verbose');
 const COSTS_ON = arg('--costs', '1') !== '0';
 const TF       = Math.max(1, parseInt(arg('--tf', '1'), 10));        // aggregate to N-minute bars
 const MIN_ATR  = parseFloat(arg('--minatr', '0'));                   // require this much volatility
+const MAX_ATR  = parseFloat(arg('--maxatr', '0'));                   // diagnostic: ONLY the quiet names
 const NEED_ADX = flag('--adx');                                      // trending regimes only
+const END_DATE = arg('--end', null);   // YYYY-MM-DD — test a window the rule never saw
+const WF_WINDOWS = Math.max(2, parseInt(arg('--windows', '5'), 10));
 const SYMBOLS  = arg('--symbols', 'PLTR,SOFI,MARA,HOOD,SOUN,IONQ,RKLB,BBAI,HIMS,CIFR,F,BAC,JPM,WFC,GE,XOM,MRK,JNJ,PFE,KO')
                   .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
 
@@ -138,17 +141,38 @@ function report(trades, equityCurve, startCap) {
 }
 
 // ── one replay pass ──────────────────────────────────────────────────────────
-// cfg: { stopMult, targetMult, trailMult, trailArmR, costsOn }
-//   trailArmR = how much profit (in R, i.e. multiples of the stop) must be banked
-//               before the trailing stop is allowed to arm at all.
+// cfg: { stopMult, targetMult, trailMult, trailArmR, costsOn, realistic }
+//
+// EXECUTION REALISM (v11.21). The earlier version had two flaws that both flattered
+// the results, and a backtest that flatters is worse than none:
+//
+//   1. LOOKAHEAD. It decided using a bar that included its own close, then filled at
+//      that same close — a price it could not have known when deciding. Now every
+//      decision uses bars strictly BEFORE the current one, and fills at the current
+//      bar's OPEN, which is the first price actually reachable after the signal.
+//
+//   2. CLOSE-ONLY EXITS. Stops and targets were only checked against the close, so a
+//      trade that traded through its stop mid-bar and recovered was never stopped out.
+//      Real stops trigger intrabar. Now checked against the bar's LOW (long stop) and
+//      HIGH (long target). When both are touched in one bar the STOP is assumed first —
+//      the pessimistic tie-break, since we cannot know the intrabar order.
+//
+// Costs are modelled as explicit price adjustments rather than an abstract percentage:
+//   entry : pay half the spread PLUS an adverse-selection allowance. A resting limit
+//           order fills preferentially when the market is moving against you — you get
+//           filled on the trades you would rather skip and miss the ones that run your
+//           way. This is the single largest unmodelled cost in retail backtests.
+//   stop  : pay half the spread PLUS gap slippage — stops fill THROUGH their trigger
+//           in fast markets, which is exactly when they fire.
+//   target: fills at the limit price (favourable — this is the one that works for you).
 function replay(hist, usable, cfg, capital, verbose = false) {
   const S = I.STRATEGY;
   const savedStop = S.ATR_STOP_MULT, savedTgt = S.ATR_TARGET_MULT;
-  S.ATR_STOP_MULT = cfg.stopMult; S.ATR_TARGET_MULT = cfg.targetMult;   // buildTradePlan reads these
+  S.ATR_STOP_MULT = cfg.stopMult; S.ATR_TARGET_MULT = cfg.targetMult;
 
   let cash = capital;
   const open = {}, trades = [], equity = [capital];
-  const rej = { strategyGate:0, sizeBelow1:0, notionalCap:0, netRR:0, targetCost:0, grossRR:0, maxPositions:0, accepted:0 };
+  const rej = { strategyGate:0, sizeBelow1:0, notionalCap:0, netRR:0, targetCost:0, grossRR:0, maxPositions:0, minAtrGate:0, accepted:0 };
   const netRRSamples = [], costSamples = [], atrSamples = [];
 
   const times = [...new Set(usable.flatMap(s => hist[s].map(b => b.t)))].sort((a, b) => a - b);
@@ -159,42 +183,57 @@ function replay(hist, usable, cfg, capital, verbose = false) {
       const bars = hist[sym];
       while (idx[sym] < bars.length && bars[idx[sym]].t <= t) idx[sym]++;
       const upto = idx[sym];
-      if (upto < 30) continue;
+      if (upto < 32) continue;
       const bar = bars[upto - 1];
       if (bar.t !== t) continue;
 
-      const window = bars.slice(Math.max(0, upto - 60), upto);
+      // Decision data EXCLUDES the current bar — no lookahead.
+      const window = bars.slice(Math.max(0, upto - 61), upto - 1);
+      if (window.length < 30) continue;
       I.candleData[sym] = { m1: window, m5: [] };
       I.marketData[sym] = {
-        price: bar.c, prevClose: window[0].o, dayOpen: window[0].o,
+        price: window[window.length - 1].c, prevClose: window[0].o, dayOpen: window[0].o,
         high: Math.max(...window.map(b => b.h)), low: Math.min(...window.map(b => b.l)),
         dailyVolume: window.reduce((s, b) => s + (b.v || 0), 0),
         lastUpdate: Date.now(), lastTradeTime: Date.now(),
         history: window.map(b => b.c).slice(-60)
       };
 
+      const halfSpread = I.estimateDynamicSpread(sym) / 2;
+      // Adverse selection: with `realistic` on, a limit entry is assumed to give back
+      // roughly the spread it hoped to save. Off = the optimistic assumption.
+      const adverse   = cfg.realistic ? halfSpread : 0;
+      const gapSlip   = cfg.realistic ? 0.10 * I.atrPct(sym) : 0;   // stops fill through
+
       const pos = open[sym];
       if (pos) {
-        const pnlPct = pos.dir === 'LONG' ? (bar.c - pos.entry) / pos.entry
-                                          : (pos.entry - bar.c) / pos.entry;
-        pos.peak = Math.max(pos.peak, pnlPct);
         const a = pos.atrFrac;
-        const stopPct = cfg.stopMult * a;
-        const armAt   = cfg.trailArmR * stopPct;          // profit needed before trailing starts
-        const giveBack= cfg.trailMult * a;
-        const tgtPct  = cfg.targetMult * a;
-        let exit = null;
-        if (pnlPct <= -stopPct)                                        exit = 'stop';
-        else if (pnlPct >= tgtPct)                                     exit = 'target';
-        else if (pos.peak >= armAt && pnlPct <= pos.peak - giveBack)   exit = 'trail';
+        const stopPx = pos.dir === 'LONG' ? pos.entry * (1 - cfg.stopMult * a) : pos.entry * (1 + cfg.stopMult * a);
+        const tgtPx  = pos.dir === 'LONG' ? pos.entry * (1 + cfg.targetMult * a) : pos.entry * (1 - cfg.targetMult * a);
+        let exit = null, fill = null;
+
+        // INTRABAR, stop checked first (pessimistic tie-break).
+        if (pos.dir === 'LONG'  && bar.l <= stopPx) { exit = 'stop'; fill = stopPx * (1 - (cfg.costsOn ? halfSpread + gapSlip : 0)); }
+        else if (pos.dir === 'SHORT' && bar.h >= stopPx) { exit = 'stop'; fill = stopPx * (1 + (cfg.costsOn ? halfSpread + gapSlip : 0)); }
+        else if (pos.dir === 'LONG'  && bar.h >= tgtPx) { exit = 'target'; fill = tgtPx; }
+        else if (pos.dir === 'SHORT' && bar.l <= tgtPx) { exit = 'target'; fill = tgtPx; }
+        else {
+          const pnlPct = pos.dir === 'LONG' ? (bar.c - pos.entry) / pos.entry : (pos.entry - bar.c) / pos.entry;
+          pos.peak = Math.max(pos.peak, pnlPct);
+          const armAt = cfg.trailArmR * cfg.stopMult * a, giveBack = cfg.trailMult * a;
+          if (pos.peak >= armAt && pnlPct <= pos.peak - giveBack) {
+            exit = 'trail';
+            fill = pos.dir === 'LONG' ? bar.c * (1 - (cfg.costsOn ? halfSpread : 0))
+                                      : bar.c * (1 + (cfg.costsOn ? halfSpread : 0));
+          }
+        }
+
         if (exit) {
-          const costPct = cfg.costsOn ? pos.cost : 0;
-          const netPct  = pnlPct - costPct;
-          const pnl     = netPct * pos.entry * pos.qty;
+          const pnl = pos.dir === 'LONG' ? (fill - pos.entry) * pos.qty : (pos.entry - fill) * pos.qty;
           cash += pnl;
-          trades.push({ sym, dir: pos.dir, exit, pnl, netPct, cost: costPct * pos.entry * pos.qty });
+          trades.push({ sym, dir: pos.dir, exit, pnl, cost: pos.entryCost * pos.qty });
           equity.push(cash);
-          if (verbose) console.log(`    ${exit.padEnd(6)} ${pos.dir} ${sym.padEnd(5)} ${(netPct*100).toFixed(2).padStart(7)}%  ${pnl>=0?'+':''}${pnl.toFixed(2)}`);
+          if (verbose) console.log(`    ${exit.padEnd(6)} ${pos.dir} ${sym.padEnd(5)} ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}`);
           delete open[sym];
         }
         continue;
@@ -205,19 +244,20 @@ function replay(hist, usable, cfg, capital, verbose = false) {
       if (!gate.longGate && !gate.shortGate) { rej.strategyGate++; continue; }
       if (NEED_ADX && gate.mode !== 'momentum-strong') { rej.adxFilter = (rej.adxFilter||0)+1; continue; }
       if (MIN_ATR > 0 && I.atrPct(sym) < MIN_ATR) { rej.minAtr = (rej.minAtr||0)+1; continue; }
+      if (MAX_ATR > 0 && I.atrPct(sym) >= MAX_ATR) { rej.maxAtr = (rej.maxAtr||0)+1; continue; }
       const dir = gate.longGate ? 'LONG' : 'SHORT';
 
-      const plan = I.buildTradePlan(sym, dir, bar.c, 5, 'backtest');
-      const stopDist = plan.stop.frac * bar.c;
+      // Signal fires on the previous close; the first reachable price is THIS bar's open.
+      const refPx = bar.o;
+      const plan = I.buildTradePlan(sym, dir, refPx, 5, 'backtest');
+      const stopDist = plan.stop.frac * refPx;
       let qty = Math.max(0, Math.floor((cash * S.RISK_PER_TRADE_BASE) / (stopDist || 1e9)));
-      const maxShares = Math.floor((cash * 0.60) / bar.c);
+      const maxShares = Math.floor((cash * 0.60) / refPx);
       if (qty > maxShares) { rej.notionalCap++; qty = maxShares; }
       if (qty < 1) { rej.sizeBelow1++; continue; }
 
-      // Mirror the engine's economic gates (terraValidateTrade rule 3.5). Kept in sync
-      // deliberately: a harness that skips a live gate measures a different bot.
       if (cfg.costsOn) {
-        if (plan.atrFrac < S.MIN_ATR_ENTRY) { rej.minAtrGate = (rej.minAtrGate||0)+1; continue; }
+        if (plan.atrFrac < S.MIN_ATR_ENTRY) { rej.minAtrGate++; continue; }
         if (plan.netRewardRisk < S.MIN_RR_NET) {
           rej.netRR++; netRRSamples.push(plan.netRewardRisk); costSamples.push(plan.cost); atrSamples.push(plan.atrFrac); continue;
         }
@@ -225,11 +265,14 @@ function replay(hist, usable, cfg, capital, verbose = false) {
       }
       if (plan.rewardRisk < S.MIN_RR) { rej.grossRR++; continue; }
       rej.accepted++;
-      open[sym] = { dir, entry: bar.c, qty, atrFrac: plan.atrFrac, peak: 0, cost: plan.cost };
+
+      const entryCostPct = cfg.costsOn ? (halfSpread + adverse) : 0;
+      const entry = dir === 'LONG' ? refPx * (1 + entryCostPct) : refPx * (1 - entryCostPct);
+      open[sym] = { dir, entry, qty, atrFrac: plan.atrFrac, peak: 0, entryCost: entry * entryCostPct };
     }
   }
 
-  S.ATR_STOP_MULT = savedStop; S.ATR_TARGET_MULT = savedTgt;   // restore
+  S.ATR_STOP_MULT = savedStop; S.ATR_TARGET_MULT = savedTgt;
   return { trades, equity, rej, netRRSamples, costSamples, atrSamples };
 }
 
@@ -249,7 +292,7 @@ function metrics(trades, equity, startCap) {
 
 // ── main ─────────────────────────────────────────────────────────────────────
 (async function main() {
-  const end = new Date();
+  const end = END_DATE ? new Date(END_DATE + 'T20:00:00Z') : new Date();
   const start = new Date(end.getTime() - DAYS * 24 * 3600 * 1000 * 1.6);
   console.log(`\n🔬  ATLAS backtest — ${SYMBOLS.length} symbols, ~${DAYS} trading days, feed=${FEED}, costs ${COSTS_ON?'ON':'OFF'}`);
   console.log(`    ${start.toISOString().slice(0,10)} → ${end.toISOString().slice(0,10)}`);
@@ -272,7 +315,9 @@ function metrics(trades, equity, startCap) {
   if (arg('--minrr', null)) S.MIN_RR_NET = parseFloat(arg('--minrr'));
   if (arg('--tcr', null))   S.MIN_TARGET_COST_RATIO = parseFloat(arg('--tcr'));
   const base = { stopMult: S.ATR_STOP_MULT, targetMult: S.ATR_TARGET_MULT,
-                 trailMult: S.ATR_TRAIL_MULT, trailArmR: 1.0, costsOn: COSTS_ON };
+                 trailMult: S.ATR_TRAIL_MULT, trailArmR: 1.0, costsOn: COSTS_ON,
+                 realistic: !flag('--optimistic') };
+  console.log(`    execution model: ${base.realistic ? 'REALISTIC (adverse selection + gap slippage + intrabar stops)' : 'OPTIMISTIC'}`);
 
   if (flag('--sweep')) {
     // Search the exit geometry. The live default arms the trail at 1R and gives back
@@ -304,6 +349,50 @@ function metrics(trades, equity, startCap) {
     console.log(best.expectancy > 0
       ? `\n  Best on this sample: target ${best.targetMult}xATR, trail ${best.trailMult}xATR armed at ${best.trailArmR===99?'never':best.trailArmR+'R'}\n  → expectancy $${best.expectancy.toFixed(2)}/trade, PF ${best.pf.toFixed(2)}, ${(best.net/CAPITAL*100).toFixed(1)}% over the window.\n  This is ONE sample. Re-run on a different window before believing it.\n`
       : '\n  ❌ No configuration in this grid is profitable on this sample.\n');
+    process.exit(0);
+  }
+
+  // ── WALK-FORWARD VALIDATION ────────────────────────────────────────────────
+  // A single window is how you fool yourself. Testing one 60-day period showed
+  // +10.6% and the same filter on the NEXT window back showed -37.4%. This runs
+  // every window and reports the POOLED result, so a lucky period cannot be
+  // mistaken for an edge.
+  if (flag('--walkforward')) {
+    const chunk = Math.max(10, Math.floor(DAYS / WF_WINDOWS));
+    const rows = [];
+    for (let k = WF_WINDOWS - 1; k >= 0; k--) {
+      const wEnd = new Date(end.getTime() - k * chunk * 24 * 3600 * 1000 * 1.45);
+      const sub = {};
+      for (const sym of usable) {
+        const hi = Math.floor(wEnd.getTime() / 1000);
+        const lo = hi - chunk * 24 * 3600 * 1.45;
+        sub[sym] = hist[sym].filter(b => b.t > lo && b.t <= hi);
+      }
+      const use = usable.filter(sym => sub[sym].length >= 60);
+      if (!use.length) continue;
+      const r = replay(sub, use, base, CAPITAL);
+      const m = metrics(r.trades, r.equity, CAPITAL);
+      rows.push({ end: wEnd.toISOString().slice(0, 10), ...m });
+    }
+    console.log('\n' + '═'.repeat(70));
+    console.log('  WALK-FORWARD — every window, not just a flattering one');
+    console.log('═'.repeat(70));
+    console.log('  window end   trades   win%    expectancy      PF      net%');
+    console.log('  ' + '─'.repeat(66));
+    let N = 0, NET = 0, profitable = 0;
+    for (const r of rows) {
+      N += r.n; NET += r.net; if (r.net > 0) profitable++;
+      console.log('  ' + r.end.padEnd(13) + String(r.n).padStart(5) + (r.wr * 100).toFixed(0).padStart(7) + '%' +
+        ('$' + r.expectancy.toFixed(2)).padStart(14) + (r.pf === Infinity ? '∞' : r.pf.toFixed(2)).padStart(8) +
+        ((r.net / CAPITAL * 100).toFixed(1) + '%').padStart(10) + (r.net > 0 ? '' : '   LOSS'));
+    }
+    console.log('  ' + '─'.repeat(66));
+    console.log(`  POOLED: ${N} trades, net $${NET.toFixed(2)}, expectancy $${(N ? NET / N : 0).toFixed(2)}/trade`);
+    console.log(`  Profitable in ${profitable} of ${rows.length} windows`);
+    console.log('═'.repeat(70));
+    console.log(NET > 0 && profitable > rows.length / 2
+      ? '  Edge persists across windows. Still not proof — but not a single-window fluke.\n'
+      : '  ❌ NO PERSISTENT EDGE. Profitable windows do not outweigh losing ones.\n     A configuration that wins in some regimes and loses badly in others is not\n     an edge — it is exposure to whichever regime happens to arrive.\n');
     process.exit(0);
   }
 

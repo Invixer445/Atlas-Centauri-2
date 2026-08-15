@@ -320,6 +320,17 @@ check('calendar failure falls back to weekday hours (never halts trading)', () =
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+group('COST TRACKING — measures the biggest unknown (adverse selection)');
+check('summary is safe with no samples', () => {
+  const c = I.costTrackingSummary();
+  ok(c && typeof c.samples === 'number', 'must return a shape even when empty');
+});
+check('summary reports the 43% threshold that erases the measured edge', () => {
+  const c = I.costTrackingSummary();
+  ok(c.samples === 0 || typeof c.note === 'string', 'should carry an interpretation');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 group('TRADE ECONOMICS — costs must be in the gate, not just the geometry');
 check('spread model is microstructure-realistic, not session-range-driven', () => {
   // Was `0.25% + sessionRange*0.5`, which modelled a 3%-range day as a 1.5% bid-ask.

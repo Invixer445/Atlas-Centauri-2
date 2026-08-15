@@ -3846,6 +3846,25 @@ function recordLiveOrder(entry) {
 // ║  truth; the internal ledger mirrors it by construction.                     ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
+// Realized-vs-modelled entry cost, so paper trading answers the adverse-selection
+// question empirically instead of by assumption.
+let costTracking = { samples: [] };
+function costTrackingSummary() {
+  const s = costTracking.samples;
+  if (!s.length) return { samples: 0 };
+  const med = a => { const x = [...a].sort((p, q) => p - q); return x[Math.floor(x.length / 2)]; };
+  const realized = med(s.map(x => x.realized)), modelled = med(s.map(x => x.modelled));
+  return {
+    samples: s.length,
+    medianRealizedEntryCostPct: +(realized * 100).toFixed(4),
+    medianModelledEntryCostPct: +(modelled * 100).toFixed(4),
+    ratio: modelled > 0 ? +(realized / modelled).toFixed(2) : null,
+    note: modelled > 0 && realized > modelled * 1.43
+      ? 'Real entry costs exceed the model by >43% — the measured backtest edge would be wiped out.'
+      : 'Within the modelled range so far.'
+  };
+}
+
 let pendingOrders = {};                    // id → {kind, ...meta, submittedAt} (persisted)
 let brokerMirror  = { at: 0, ok: false };  // latest broker account+positions snapshot
 const ORDER_TIMEOUT_MS = 45 * 1000;        // market orders should fill ~instantly on paper
@@ -4210,6 +4229,19 @@ function applyEntryFill(plan, fillPrice, filledSize, brokerFill = false) {
     atrFrac: plan.atrFrac,
     stopPrice, stopFrac: plan.stop.frac, targetPrice: tgtPrice   // ← explicit stop the trade must honor
   });
+  // REALIZED-COST INSTRUMENTATION (v11.21). The largest unknown in whether this bot
+  // can profit is whether real fills cost what the model assumes — adverse selection on
+  // limit orders is unmodellable in backtest but directly measurable here. Comparing the
+  // actual fill against the reference price the plan was built on turns that guess into
+  // a number. Surfaced at /api/portfolio -> execution.costTracking.
+  try {
+    const ref = plan.entryPrice;
+    if (ref > 0 && fillPrice > 0) {
+      const realized = direction === 'LONG' ? (fillPrice - ref) / ref : (ref - fillPrice) / ref;
+      costTracking.samples.push({ sym: ticker, realized, modelled: (plan.cost || 0) / 2, at: Date.now() });
+      if (costTracking.samples.length > 200) costTracking.samples.shift();
+    }
+  } catch (_) {}
   jupiter.observeEntry(ticker, direction, fillPrice);   // capture entry conditions for the learning model
   portfolio.cash -= cost;
   riskSystem.dailyTradeCount++;
@@ -5630,6 +5662,7 @@ app.get('/api/portfolio', (req, res) => {
       pendingOrders: Object.keys(pendingOrders).length,
       mirror:        EXEC_BROKER_AUTH ? brokerMirror : null,
       driftPct:      EXEC_BROKER_AUTH ? executionDriftPct() : null,
+      costTracking:  costTrackingSummary(),
       // Stuck orders (see STALE_ORDER_ALERT_MS). `exitsBlocked` is the one that needs
       // immediate operator attention — it means a stop-loss cannot fire on that symbol.
       stuck: Object.entries(pendingOrders)
@@ -6092,7 +6125,7 @@ module.exports = {
     getTotalValue, getNotionalExposure, calculateTradeExpectancy,
     ema, rsi, calculateATR, atrPct, SENTIMENT_EMA_REF_MS, sentimentAlpha,
     computeDrawdown, isEarningsBlackout, EARNINGS_BLACKOUT_ENABLED, START_CAPITAL,
-    trimTrades, cancelPendingSave, refreshMarketCalendar, marketClosedReason,
+    trimTrades, cancelPendingSave, refreshMarketCalendar, marketClosedReason, costTrackingSummary,
     marketCalendar: () => marketCalendar, getCurrentMarket, getEasternTimeParts, resolveSession,
     atrQuality, hasReliableVolatility, MIN_CANDLES_FOR_ATR,
     releaseExpiredLossHalt, LOSS_HALT_MS, getKillSwitchReason, lossHaltReason,
