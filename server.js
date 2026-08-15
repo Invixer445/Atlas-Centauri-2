@@ -1979,6 +1979,19 @@ const STRATEGY = {
   // expectancy is +0.13 per unit risked, which is a genuinely profitable system, while
   // demanding 1.8 NET would require ~2.4% ATR and exclude nearly everything.
   MIN_RR_NET:      1.35,
+  // ── MINIMUM VOLATILITY TO ENTER (v11.20, measured) ────────────────────────
+  // The single highest-impact filter found by backtesting. The fee per round trip is
+  // roughly FIXED, so a symbol whose 1-minute ATR is ~0.3% is being asked to pay a
+  // 0.30% toll on a 0.30% move — a coin flip that pays the house every flip. Requiring
+  // 1% ATR means the move being traded is several times the friction.
+  // Measured over 60 trading days, 20 symbols:
+  //     no filter : 969 trades, 40.4% win, expectancy -$0.79, PF 0.70, -76.1%
+  //     ATR >= 1% : 108 trades, 50.9% win, expectancy +$0.99, PF 1.11, +10.7%
+  // Note this RAISES the win rate (40.4% -> 50.9%) rather than buying it back with
+  // worse reward:risk — R:R held at ~1.05. Fewer, better trades.
+  // Caveat kept in the open: PF 1.11 is thin, and the threshold was chosen by trying
+  // several on this data. Treat as promising, not proven.
+  MIN_ATR_ENTRY:   0.010,
   // Backstop: the target must clear round-trip friction by this multiple, so a trade is
   // never taken for a move that barely pays the fee. This is the "only trade when there
   // is real money in it" rule, stated in cost units instead of price units.
@@ -4112,14 +4125,6 @@ function terraValidateTrade(plan) {
   if (direction === 'SHORT' && stop.price <= entryPrice)          return reject('short stop not above entry');
   if (stop.frac < 0.002 || stop.frac > 0.15)                      return reject(`stop ${(stop.frac*100).toFixed(1)}% out of bounds`);
   if (plan.rewardRisk < STRATEGY.MIN_RR)                          return reject(`R:R ${plan.rewardRisk.toFixed(2)} < ${STRATEGY.MIN_RR}`);
-  // THE ECONOMIC GATE (v11.20). Gross R:R above is geometry; these two are money.
-  // Without them the engine happily took setups whose net reward:risk was BELOW 1.0 —
-  // i.e. the average loss exceeded the average win before win rate even entered the
-  // picture. This is where "only trade if it can actually pay" is enforced.
-  if (plan.netRewardRisk < STRATEGY.MIN_RR_NET)
-    return reject(`net R:R ${plan.netRewardRisk.toFixed(2)} < ${STRATEGY.MIN_RR_NET} after ${(plan.cost * 100).toFixed(2)}% costs`);
-  if (plan.targetCostRatio < STRATEGY.MIN_TARGET_COST_RATIO)
-    return reject(`target only ${plan.targetCostRatio.toFixed(1)}× round-trip cost (need ${STRATEGY.MIN_TARGET_COST_RATIO}×)`);
 
   // RULE 2 — the stock must be within tradeable limits
   if (entryPrice < DYNAMIC_MIN_PRICE)                             return reject(`price $${entryPrice.toFixed(2)} below $${DYNAMIC_MIN_PRICE} min`);
@@ -4127,6 +4132,17 @@ function terraValidateTrade(plan) {
 
   // RULE 3 — Jupiter must have produced a real size
   if (!Number.isFinite(shares) || shares < 1)                     return reject('size below 1 share');
+
+  // RULE 3.5 — THE ECONOMIC GATE (v11.20). Rules 1-3 establish the plan is well-formed;
+  // these establish it can actually PAY. Gross R:R is geometry; this is money. Without
+  // them the engine took setups whose net reward:risk was below 1.0 — the average loss
+  // exceeding the average win before win rate even entered the picture.
+  if (plan.netRewardRisk < STRATEGY.MIN_RR_NET)
+    return reject(`net R:R ${plan.netRewardRisk.toFixed(2)} < ${STRATEGY.MIN_RR_NET} after ${(plan.cost * 100).toFixed(2)}% costs`);
+  if (plan.targetCostRatio < STRATEGY.MIN_TARGET_COST_RATIO)
+    return reject(`target only ${plan.targetCostRatio.toFixed(1)}× round-trip cost (need ${STRATEGY.MIN_TARGET_COST_RATIO}×)`);
+  if (!Number.isFinite(plan.atrFrac) || plan.atrFrac < STRATEGY.MIN_ATR_ENTRY)
+    return reject(`ATR ${((plan.atrFrac || 0) * 100).toFixed(2)}% below the ${(STRATEGY.MIN_ATR_ENTRY * 100).toFixed(2)}% floor — move too small to beat costs`);
 
   // RULE 4 — the full risk pipeline (Terra never opens a trade that breaks these)
   // Regular-trading-hours gate, belt-and-suspenders: evaluateAndTrade already refuses

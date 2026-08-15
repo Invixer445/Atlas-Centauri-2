@@ -43,6 +43,9 @@ const DAYS     = Math.max(1, Math.min(60, parseInt(arg('--days', '5'), 10)));
 const CAPITAL  = Math.max(100, parseFloat(arg('--capital', '1000')));
 const VERBOSE  = flag('--verbose');
 const COSTS_ON = arg('--costs', '1') !== '0';
+const TF       = Math.max(1, parseInt(arg('--tf', '1'), 10));        // aggregate to N-minute bars
+const MIN_ATR  = parseFloat(arg('--minatr', '0'));                   // require this much volatility
+const NEED_ADX = flag('--adx');                                      // trending regimes only
 const SYMBOLS  = arg('--symbols', 'PLTR,SOFI,MARA,HOOD,SOUN,IONQ,RKLB,BBAI,HIMS,CIFR,F,BAC,JPM,WFC,GE,XOM,MRK,JNJ,PFE,KO')
                   .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
 
@@ -50,6 +53,8 @@ const KEY = process.env.APCA_API_KEY_ID, SEC = process.env.APCA_API_SECRET_KEY;
 if (!KEY || !SEC) { console.error('✖ Set APCA_API_KEY_ID / APCA_API_SECRET_KEY (paper keys work).'); process.exit(1); }
 const FEED = (process.env.ALPACA_DATA_FEED || 'iex').toLowerCase();
 
+const fs = require('fs');
+const CACHE_DIR = '.backtest-cache';
 const https = require('https');
 function get(path) {
   return new Promise(res => {
@@ -77,6 +82,18 @@ async function fetchBars(sym, startISO, endISO) {
     }
     token = j && j.next_page_token;
   } while (token);
+  return out;
+}
+
+// Combine N consecutive 1-minute bars into one — the cost per trade is roughly fixed,
+// so capturing a bigger move per trade is the most direct lever on net edge.
+function aggregate(bars, n) {
+  const out = [];
+  for (let i = 0; i + n <= bars.length; i += n) {
+    const g = bars.slice(i, i + n);
+    out.push({ t: g[g.length-1].t, o: g[0].o, h: Math.max(...g.map(b=>b.h)),
+               l: Math.min(...g.map(b=>b.l)), c: g[g.length-1].c, v: g.reduce((s,b)=>s+(b.v||0),0) });
+  }
   return out;
 }
 
@@ -186,6 +203,8 @@ function replay(hist, usable, cfg, capital, verbose = false) {
       if (Object.keys(open).length >= 8) { rej.maxPositions++; continue; }
       const gate = I.evaluateStrategyGate(sym, I.marketData[sym]);
       if (!gate.longGate && !gate.shortGate) { rej.strategyGate++; continue; }
+      if (NEED_ADX && gate.mode !== 'momentum-strong') { rej.adxFilter = (rej.adxFilter||0)+1; continue; }
+      if (MIN_ATR > 0 && I.atrPct(sym) < MIN_ATR) { rej.minAtr = (rej.minAtr||0)+1; continue; }
       const dir = gate.longGate ? 'LONG' : 'SHORT';
 
       const plan = I.buildTradePlan(sym, dir, bar.c, 5, 'backtest');
@@ -195,7 +214,10 @@ function replay(hist, usable, cfg, capital, verbose = false) {
       if (qty > maxShares) { rej.notionalCap++; qty = maxShares; }
       if (qty < 1) { rej.sizeBelow1++; continue; }
 
+      // Mirror the engine's economic gates (terraValidateTrade rule 3.5). Kept in sync
+      // deliberately: a harness that skips a live gate measures a different bot.
       if (cfg.costsOn) {
+        if (plan.atrFrac < S.MIN_ATR_ENTRY) { rej.minAtrGate = (rej.minAtrGate||0)+1; continue; }
         if (plan.netRewardRisk < S.MIN_RR_NET) {
           rej.netRR++; netRRSamples.push(plan.netRewardRisk); costSamples.push(plan.cost); atrSamples.push(plan.atrFrac); continue;
         }
@@ -232,12 +254,17 @@ function metrics(trades, equity, startCap) {
   console.log(`\n🔬  ATLAS backtest — ${SYMBOLS.length} symbols, ~${DAYS} trading days, feed=${FEED}, costs ${COSTS_ON?'ON':'OFF'}`);
   console.log(`    ${start.toISOString().slice(0,10)} → ${end.toISOString().slice(0,10)}`);
 
+  if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR);
   const hist = {};
   for (const s of SYMBOLS) {
-    process.stdout.write(`    fetching ${s} … `);
-    hist[s] = await fetchBars(s, start.toISOString(), end.toISOString());
+    const cf = `${CACHE_DIR}/${s}-${DAYS}d-${FEED}-${end.toISOString().slice(0,10)}.json`;
+    if (fs.existsSync(cf)) { hist[s] = JSON.parse(fs.readFileSync(cf,'utf8')); process.stdout.write(`    ${s} (cached) `); }
+    else { process.stdout.write(`    fetching ${s} … `); hist[s] = await fetchBars(s, start.toISOString(), end.toISOString());
+           try { fs.writeFileSync(cf, JSON.stringify(hist[s])); } catch {} }
     console.log(`${hist[s].length} bars`);
+    if (TF > 1) hist[s] = aggregate(hist[s], TF);
   }
+  if (TF > 1) console.log(`    → aggregated to ${TF}-minute bars`);
   const usable = SYMBOLS.filter(s => hist[s].length >= 60);
   if (!usable.length) { console.error('\n✖ Not enough bars. Try --days 20 or a paid sip feed.\n'); process.exit(1); }
 

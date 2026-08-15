@@ -358,9 +358,30 @@ check('net R:R goes BELOW 1 exactly where the live bot was losing', () => {
 // mask each other and removing either one still "passes" (mutation testing caught this).
 const planWith = (o) => ({ ticker: 'X', direction: 'LONG', entryPrice: 20, shares: 10,
   stop: { price: 19.87, frac: 0.0066 }, target: { price: 20.24, frac: 0.012 },
-  rewardRisk: 0.012 / 0.0066, cost: 0.004,
+  rewardRisk: 0.012 / 0.0066, cost: 0.004, atrFrac: 0.02,
   netRewardRisk: I.netRewardRisk(0.012, 0.0066, 0.004),
   targetCostRatio: 0.012 / 0.004, ...o });
+
+check('a too-quiet symbol is rejected — its move cannot beat the fee', () => {
+  // The highest-impact measured filter: 60d backtest, no filter -> 40.4% win / PF 0.70;
+  // ATR >= 1% -> 50.9% win / PF 1.11. A fixed fee against a 0.3% move cannot win.
+  // Stop/target/cost are set so the OTHER economic gates pass, isolating this one.
+  // (Deliberately inconsistent with atrFrac — a unit test of one rule, not a realistic plan.)
+  const p = planWith({ atrFrac: 0.003, cost: 0.002,
+                       stop: { price: 19.84, frac: 0.008 }, target: { price: 20.4, frac: 0.02 },
+                       rewardRisk: 0.02 / 0.008,
+                       netRewardRisk: I.netRewardRisk(0.02, 0.008, 0.002),
+                       targetCostRatio: 0.02 / 0.002 });
+  ok(p.netRewardRisk >= I.STRATEGY.MIN_RR_NET, 'setup: net R:R must pass');
+  ok(p.targetCostRatio >= I.STRATEGY.MIN_TARGET_COST_RATIO, 'setup: cost ratio must pass');
+  const v = I.terraValidateTrade(p);
+  eq(v.approved, false);
+  ok(/ATR/i.test(v.reason), `reason was: ${v.reason}`);
+});
+check('MIN_ATR_ENTRY is a sane floor', () => {
+  const f = I.STRATEGY.MIN_ATR_ENTRY;
+  ok(Number.isFinite(f) && f >= 0.005 && f <= 0.05, `floor ${f} out of range`);
+});
 
 check('net-R:R gate fires on its own (target/cost ratio is fine)', () => {
   const p = planWith({});
