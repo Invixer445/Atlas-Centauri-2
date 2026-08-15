@@ -724,6 +724,20 @@ function secGet(path) {
   });
 }
 
+// 13F filing count → [0,1] institutional-interest score.
+// v11.19: the divisor was `2`, which saturated at 1.0 by just 100 filings — and every
+// real US-listed stock has thousands, so 242 filings and 10,000+ scored IDENTICALLY.
+// Live effect: every watchlist symbol scored 1.0, which pinned conviction at 0.65–0.70
+// across the board (the "conv 65/66/67%" wall in the logs) — the signal carried zero
+// information while presenting as confident research. `/4` spreads the realistic
+// 50–10,000 range across roughly [0.43, 1.0] so it can actually discriminate.
+// Pure + exported so the discrimination property is regression-tested.
+function institutionalScore(filings) {
+  const f = Number(filings);
+  if (!Number.isFinite(f) || f <= 0) return 0;
+  return Math.max(0, Math.min(1, Math.log10(1 + f) / 4));
+}
+
 // Recent 13F-HR filings that mention a company → institutional-interest score (cached).
 async function institutionalInterest(symbol) {
   const cached = _instCache[symbol];
@@ -737,10 +751,25 @@ async function institutionalInterest(symbol) {
     // Elasticsearch caps total at 10,000 with relation 'gte' — the real count is higher.
     capped  = !!(data.hits.total && data.hits.total.relation === 'gte');
   }
-  const score = Math.max(0, Math.min(1, Math.log10(1 + filings) / 2));   // ~100 filings → ~1.0 (already saturated well before any cap)
+  const score = institutionalScore(filings);
   const out = { filings, capped, score, at: Date.now() };
   _instCache[symbol] = out;
   return out;
+}
+
+// Direction for a research idea — NEWS ONLY (v11.19). instScore is accepted purely to
+// make the invariant explicit at the call site: institutional interest ranks what to
+// WATCH, it never picks a side.
+// This was `newsDir || (instScore >= 0.3 ? 'long' : null)`. Combined with the score
+// saturation bug (see institutionalScore), instScore was always 1.0, so the test was
+// always true and EVERY research idea was forced LONG — a structural long-only bias
+// with no path to ever emit a short. Every rec in the live log was LONG. It is also
+// wrong on the merits: 13F filings are QUARTERLY and lag ~45 days, so "institutions
+// hold this" says nothing about direction today. This file's own header agrees ("a
+// watchlist/bias signal, NOT intraday timing"). News decides the side; failing that,
+// Terra's technical scan does — and that scan is fully direction-symmetric.
+function ideaDirection(newsDir, instScore) {
+  return (newsDir === 'long' || newsDir === 'short') ? newsDir : null;
 }
 
 const researchData = { watchlist: [], bySymbol: {}, lastRun: 0, institutions: 0, posture: null };
@@ -768,8 +797,17 @@ async function research({ recs = [], universe = [], rvolOf = () => 1, max = 8 } 
     const newsDir  = rec ? (rec.direction === 'short' ? 'short' : 'long') : null;
     const volScore = Math.max(0, Math.min(1, (rvol - 1) / 2));            // rvol 1→0, 3→1
     const score    = 0.45 * inst.score + 0.35 * newsConv + 0.20 * volScore;
-    // Direction: news wins if present; else institutional accumulation reads bullish-bias
-    const direction = newsDir || (inst.score >= 0.3 ? 'long' : null);
+    // DIRECTION comes from NEWS ONLY (v11.19).
+    // This was `newsDir || (inst.score >= 0.3 ? 'long' : null)`. Combined with the
+    // saturation bug above, inst.score was always 1.0, so that test was always true and
+    // EVERY research idea was forced LONG — a structural long-only bias with no way to
+    // ever emit a short (every single rec in the live log was LONG). It is also just
+    // wrong on the merits: 13F filings are QUARTERLY and lag ~45 days, so "institutions
+    // hold this" says nothing about direction TODAY. This file's own header says as much
+    // ("a watchlist/bias signal, NOT intraday timing"), so honour it: institutional
+    // interest ranks what to WATCH, and news (or Terra's own technical scan, which is
+    // fully direction-symmetric) decides which WAY to trade.
+    const direction = ideaDirection(newsDir, inst.score);
     const bias = direction === 'short' ? 'bearish' : direction === 'long' ? 'bullish' : 'neutral';
 
     const sources = [];
@@ -1026,14 +1064,27 @@ function createJupiter(config = {}) {
     const now = Date.now();
     const dynamicCandidates = [];
     for (const rec of (recs || [])) {
+      // A re-reported idea must keep its ORIGINAL birth time. Previously createdAt and
+      // expiresAt were stamped `now` on every cycle, so the time-decay term in
+      // scoreAdjustment (which scales by remaining/total life) was pinned near full
+      // strength forever — a 240-minute "horizon" refreshed every few minutes never
+      // aged at all. Research that keeps saying the same thing is not new information.
+      const prev = signals[rec.symbol];
+      const sameIdea = prev && prev.direction === rec.direction && prev.catalyst === rec.catalyst
+                       && prev.expiresAt > now;
       signals[rec.symbol] = {
         direction: rec.direction, conviction: rec.conviction,
         convictionRaw: rec.convictionRaw ?? rec.conviction,
         catalyst: rec.catalyst, reasoning: rec.reasoning,
-        createdAt: now, expiresAt: now + rec.horizonMinutes * 60000,
-        traded: signals[rec.symbol]?.traded || false
+        createdAt: sameIdea ? prev.createdAt : now,
+        expiresAt: sameIdea ? prev.expiresAt : now + rec.horizonMinutes * 60000,
+        traded: prev?.traded || false
       };
-      console.log(`[JUPITER] ◀ Venus rec: ${rec.direction.toUpperCase()} ${rec.symbol} conv ${(rec.conviction*100).toFixed(0)}% [${rec.catalyst}] — ${rec.reasoning}`);
+      // Log only genuinely new/changed ideas. Re-logging an unchanged watchlist every
+      // cycle is what turned the live log into an unreadable wall of identical lines.
+      if (!sameIdea || Math.abs((prev.conviction || 0) - rec.conviction) >= 0.05) {
+        console.log(`[JUPITER] ◀ Venus rec: ${rec.direction.toUpperCase()} ${rec.symbol} conv ${(rec.conviction*100).toFixed(0)}% [${rec.catalyst}] — ${rec.reasoning}`);
+      }
       if (rec.conviction >= CONVICTION_MIN) dynamicCandidates.push({ symbol: rec.symbol, rec });
     }
     return dynamicCandidates;
@@ -1421,19 +1472,32 @@ Output ONLY JSON:
 // ║  it executes, manages positions, and enforces the risk pipeline.           ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 const AI_ENABLED            = venus.isConfigured();
-// v11.19 aggression tune: faster news cycle (5min→3min) needs a higher call budget to
-// avoid starving assess()/deliberate() of budget every cycle (analyze+assess+deliberate
-// can be up to 3 LLM calls/cycle). Still env-overridable; still fails safe — over-budget
-// or provider-429 calls just skip gracefully (llmReason returns null), never crash/hang.
-const NEWS_POLL_MS          = Math.max(60000, parseInt(process.env.NEWS_POLL_MS || '180000', 10));        // default 3 min
-const AI_MAX_CALLS_PER_HOUR = Math.max(1, parseInt(process.env.AI_MAX_CALLS_PER_HOUR || '60', 10));   // both engines now reason via LLM each cycle
+// v11.19 REVERTED to 5min/40. The 3min/60 tune caused sustained Groq 429s in the live
+// session ("Analysis rate-limited … cooling down 90s" on nearly every cycle): each cycle
+// makes up to 3 LLM calls, so 3min ≈ 60 calls/hr against a free-tier per-minute token
+// cap. The damage was not just missing news — when analysis fails the cycle falls back
+// to the institutional-only path, so the tune actively INCREASED the share of
+// low-information signals reaching Jupiter.
+const NEWS_POLL_MS          = Math.max(60000, parseInt(process.env.NEWS_POLL_MS || '300000', 10));        // default 5 min
+const AI_MAX_CALLS_PER_HOUR = Math.max(1, parseInt(process.env.AI_MAX_CALLS_PER_HOUR || '40', 10));   // both engines now reason via LLM each cycle
 const AI_CONVICTION_MIN     = Math.min(0.9, Math.max(0.5, parseFloat(process.env.AI_CONVICTION_MIN || '0.60')));
 const AI_SIGNAL_WEIGHT      = Math.min(0.20, Math.max(0, parseFloat(process.env.AI_SIGNAL_WEIGHT || '0.12'))); // max score boost
 const DYNAMIC_WATCHLIST_ON  = (process.env.DYNAMIC_WATCHLIST || 'on').toLowerCase() !== 'off';
 const DYNAMIC_MAX_SYMBOLS   = Math.max(0, Math.min(15, parseInt(process.env.DYNAMIC_MAX_SYMBOLS || '10', 10)));
 const DYNAMIC_MIN_PRICE     = 2.0;       // avoid sub-$2 names (manipulation, wide spreads)
 const DYNAMIC_MAX_PRICE     = 1000;      // sizing sanity on a small account
-const DYNAMIC_MIN_DAY_VOL   = 750000;    // need real liquidity for fills
+// Liquidity floor, expressed in CONSOLIDATED-tape shares.
+const DYNAMIC_MIN_DAY_VOL   = 750000;
+// …but the volume we actually observe comes from ALPACA_DATA_FEED, and the free `iex`
+// feed reports IEX-only prints — roughly 2–4% of consolidated volume. Comparing a
+// consolidated threshold against IEX volume demanded ~25M consolidated ADV and rejected
+// genuinely liquid mid-caps: the live log shows MP (220,090), NBIS (314,679) and BYND
+// (91,975) all rejected as "too thin" — and those were the bot's HIGHEST-conviction,
+// news-driven ideas (82% regulatory, 86% earnings), while meaningless 65% institutional
+// recs sailed through. Scale the floor to the feed so the test means the same thing on
+// both. 0.04 is the conservative end of the IEX share range.
+const FEED_VOLUME_FACTOR    = ALPACA_DATA_FEED === 'sip' ? 1.0 : 0.04;
+const EFFECTIVE_MIN_DAY_VOL = Math.round(DYNAMIC_MIN_DAY_VOL * FEED_VOLUME_FACTOR);
 
 // Jupiter is instantiated now; it's wired to Terra's live state after those
 // objects are declared (see jupiter.init below, after capitalSystem/riskSystem).
@@ -1614,7 +1678,8 @@ let riskSystem = {
   dailyResetDate:   null,
   peakValue:        START_CAPITAL,
   consecutiveLosses:0,           // kill-switch counter
-  maxConsecutiveLosses: 4        // halt after 4 straight losses
+  maxConsecutiveLosses: 4,       // halt after 4 straight losses
+  lossHaltUntil:    0            // v11.19: when that halt actually expires (see LOSS_HALT_MS)
 };
 
 // ─── SENTIMENT (computed from real breadth) ───────────────────────────────
@@ -1651,11 +1716,10 @@ let marketTransitionData = { lastMarket: null };
 // ─── COOLDOWNS ────────────────────────────────────────────────────────────
 let symbolCooldowns  = {};
 let symbolLossCount  = {};
-// v11.19 aggression tune: shortened from 20min so a stopped-out symbol can be
-// re-evaluated sooner if the setup is still there. REPEAT_LOSS_MULTIPLIER (below,
-// unchanged) still escalates this on repeat losses on the same symbol, so genuine
-// revenge-trading is still throttled — this only speeds up the FIRST retry.
-const STOP_LOSS_COOLDOWN_MS    = 12 * 60 * 1000;
+// v11.19: REVERTED to 20min. Combined with the broken ATR, the 12min variant meant
+// re-entering the same name that had just stopped out on noise, roughly twice as often.
+// REPEAT_LOSS_MULTIPLIER still escalates this per-symbol on repeat losses.
+const STOP_LOSS_COOLDOWN_MS    = 20 * 60 * 1000;
 const REPEAT_LOSS_MULTIPLIER   = 2;
 
 // v11.19 aggression tune: raised from 6 (was hardcoded in three separate places —
@@ -2686,8 +2750,8 @@ async function addDynamicSymbol(sym, sig) {
     console.log(`[JUPITER] ${sym} rejected — price $${q.price.toFixed(2)} outside [$${DYNAMIC_MIN_PRICE}, $${DYNAMIC_MAX_PRICE}]`);
     return false;
   }
-  if ((q.volume || 0) < DYNAMIC_MIN_DAY_VOL) {
-    console.log(`[JUPITER] ${sym} rejected — day volume ${q.volume} < ${DYNAMIC_MIN_DAY_VOL} (too thin)`);
+  if ((q.volume || 0) < EFFECTIVE_MIN_DAY_VOL) {
+    console.log(`[JUPITER] ${sym} rejected — day volume ${q.volume} < ${EFFECTIVE_MIN_DAY_VOL} (too thin on the ${ALPACA_DATA_FEED} feed)`);
     return false;
   }
 
@@ -3009,12 +3073,41 @@ function calculateATR(symbol, period = 14) {
   return lookbackPeriod > 0 ? trSum / lookbackPeriod : (d.price || 10) * 0.015;
 }
 
+// ── VOLATILITY DATA QUALITY (v11.19 — the primary live money-loser) ──────────
+// A live session ran with `[CANDLES] Updated 3/21 symbols` (the IEX feed is only ~3%
+// of the consolidated tape, so thin names get very few 1-minute bars). With no candles
+// calculateATR falls back to TICK-TO-TICK deltas, which on IEX are pennies apart — so
+// measured ATR collapsed to the 0.3% floor, producing a 0.66% stop against a 0.5–1.5%
+// round-trip execution cost. That stop sits INSIDE the spread+noise: on a name that
+// moves 5% a day it is a coin flip that pays the spread every flip. Five consecutive
+// losses followed, and the R:R gate never caught it because the ratio (1.38/0.66) still
+// read as a healthy 2.09 — the geometry was fine, the volatility input was fiction.
+//
+// Two defences, because either alone is insufficient:
+//   1. atrQuality() — entries are gated on candle-grade data (see evaluateAndTrade),
+//      so we simply do not trade a symbol whose volatility we cannot measure.
+//   2. A quality-aware FLOOR here — if the fallback is ever used anyway (managing an
+//      already-open position, a mid-session data gap), it must err WIDE, never tight.
+//      Real candle-derived ATR keeps the original 0.3% floor so genuinely calm names
+//      (KO, JNJ) are not forced into artificially wide stops.
+const MIN_CANDLES_FOR_ATR = 15;   // enough 1m bars for a meaningful 14-period ATR
+
+function atrQuality(symbol) {
+  const m1 = candleData[symbol]?.m1;
+  return (m1 && m1.length >= MIN_CANDLES_FOR_ATR) ? 'candle' : 'fallback';
+}
+// True only when the symbol's volatility is measured from real OHLC bars.
+function hasReliableVolatility(symbol) { return atrQuality(symbol) === 'candle'; }
+
 // ATR as a fraction of price (volatility %), clamped to a sane band.
 function atrPct(symbol) {
   const price = marketData[symbol]?.price || 0;
   if (price <= 0) return 0.02;
   const a = calculateATR(symbol, STRATEGY.ATR_PERIOD) / price;
-  return Number.isFinite(a) ? Math.max(0.003, Math.min(0.15, a)) : 0.02;
+  // Fallback floor is deliberately ~2.7x the candle floor: 0.8% ATR → a 1.76% stop,
+  // comfortably clear of round-trip costs, instead of 0.66% which is inside them.
+  const floor = atrQuality(symbol) === 'candle' ? 0.003 : 0.008;
+  return Number.isFinite(a) ? Math.max(floor, Math.min(0.15, a)) : 0.02;
 }
 
 // ✅ ADX (Average Directional Index) — Wilder. Measures TREND STRENGTH (not
@@ -3076,8 +3169,11 @@ function calculateRVOL(symbol) {
   const candles = candleData[symbol]?.m1;
   if (!candles || candles.length < 10) {
     // Fallback: compare dailyVolume to threshold
+    // Feed-scaled for the same reason as EFFECTIVE_MIN_DAY_VOL: on the iex feed this
+    // threshold was being compared against ~3%-of-tape volume, so almost every symbol
+    // read as "thin" and got RVOL 0.5 — which then halves position size in computeSize.
     const vol = marketData[symbol]?.dailyVolume || 0;
-    return vol > VOLATILITY_FILTERS.MIN_VOLUME_THRESHOLD ? 1.0 : 0.5;
+    return vol > VOLATILITY_FILTERS.MIN_VOLUME_THRESHOLD * FEED_VOLUME_FACTOR ? 1.0 : 0.5;
   }
 
   // Sum of the most recent 5 bars = current 5-min volume
@@ -3520,6 +3616,41 @@ function wouldExceedHeat(price, qty) {
 //  KILL SWITCHES — stale data, WS disconnect, consecutive losses
 // ════════════════════════════════════════════════════════════════════════════
 
+// How long the consecutive-loss halt pauses NEW entries. Long enough to break a losing
+// streak's momentum (regimes shift, spreads settle), short enough that one bad stretch
+// does not cost the rest of the session. Exits/stops are NEVER paused by this.
+const LOSS_HALT_MS = 45 * 60 * 1000;
+
+// The consecutive-loss halt, as a reason string (null = not halted).
+// TIME-BOUNDED (v11.19 deadlock fix). This used to test `consecutiveLosses >= max`
+// directly, and that counter resets in only two places: a WINNING trade, or a new
+// Eastern-time calendar day. But the halt blocks new entries, so no new trade can
+// happen, so no win can happen, so the counter could never clear — the bot bricked
+// itself until midnight ET while logging "cooling off", implying a timer that did not
+// exist. The live log is an unbroken wall of exactly that message.
+// Split out of getKillSwitchReason so it is testable on its own: that function returns
+// early on `!wsConnected`, which silently made an earlier version of this test pass
+// without ever reaching the loss check.
+function lossHaltReason() {
+  if (riskSystem.lossHaltUntil > Date.now()) {
+    const mins = Math.ceil((riskSystem.lossHaltUntil - Date.now()) / 60000);
+    return `${riskSystem.consecutiveLosses} consecutive losses — cooling off ${mins}min`;
+  }
+  return null;
+}
+
+// Clear an expired loss halt and reset the streak so trading can genuinely resume.
+// Without this the counter stays at/above the limit forever (see getKillSwitchReason).
+function releaseExpiredLossHalt() {
+  if (riskSystem.lossHaltUntil && Date.now() >= riskSystem.lossHaltUntil) {
+    console.log(`[RISK] Loss-streak cool-off expired — entries re-armed (streak of ${riskSystem.consecutiveLosses} cleared)`);
+    riskSystem.lossHaltUntil     = 0;
+    riskSystem.consecutiveLosses = 0;
+    return true;
+  }
+  return false;
+}
+
 // Returns a non-null reason string if trading should be halted, null if safe.
 function getKillSwitchReason() {
   // 1. WS disconnected: refuse to trade on potentially stale data
@@ -3538,9 +3669,9 @@ function getKillSwitchReason() {
   // If more than half the watchlist is stale, halt new entries
   if (staleCount > symbols.length / 2) return `${staleCount}/${symbols.length} prices stale`;
 
-  // 3. Consecutive loss halt
-  if (riskSystem.consecutiveLosses >= riskSystem.maxConsecutiveLosses)
-    return `${riskSystem.consecutiveLosses} consecutive losses — cooling off`;
+  // 3. Consecutive loss halt (see lossHaltReason)
+  const lh = lossHaltReason();
+  if (lh) return lh;
 
   return null;   // all clear
 }
@@ -4198,8 +4329,14 @@ function finalizeClose(ticker, direction, totalPnL, exitPrice, market, stopLoss,
   if (totalPnL < 0) {
     riskSystem.dailyRealizedLoss += Math.abs(totalPnL);
     riskSystem.consecutiveLosses++;
+    // Arm (or extend) the time-bounded cool-off the moment the streak hits its limit.
+    if (riskSystem.consecutiveLosses >= riskSystem.maxConsecutiveLosses) {
+      riskSystem.lossHaltUntil = Date.now() + LOSS_HALT_MS;
+      console.log(`[RISK] ${riskSystem.consecutiveLosses} consecutive losses — pausing NEW entries for ${LOSS_HALT_MS / 60000}min (exits still managed)`);
+    }
   } else {
     riskSystem.consecutiveLosses = 0;  // reset on any win
+    riskSystem.lossHaltUntil     = 0;  // a win clears the halt immediately
   }
 
   if (stopLoss || totalPnL < 0) {
@@ -4393,7 +4530,8 @@ function buildStateObject() {
       dailyTradeCount:   riskSystem.dailyTradeCount,
       dailyResetDate:    riskSystem.dailyResetDate,
       peakValue:         riskSystem.peakValue,
-      consecutiveLosses: riskSystem.consecutiveLosses
+      consecutiveLosses: riskSystem.consecutiveLosses,
+      lossHaltUntil:     riskSystem.lossHaltUntil    // persisted so a restart can't skip the cool-off
     },
     sentimentData: {
       general:      sentimentData.general,
@@ -4544,6 +4682,7 @@ function loadState() {
       riskSystem.dailyResetDate     = state.riskSystem.dailyResetDate     ?? null;
       riskSystem.peakValue          = state.riskSystem.peakValue          ?? START_CAPITAL;
       riskSystem.consecutiveLosses  = state.riskSystem.consecutiveLosses  ?? 0;
+      riskSystem.lossHaltUntil      = state.riskSystem.lossHaltUntil      ?? 0;
     }
     if (state.sentimentData) {
       sentimentData.general      = state.sentimentData.general      ?? 0.5;
@@ -4609,6 +4748,7 @@ function loadState() {
       riskSystem.dailyRealizedLoss = 0;
       riskSystem.dailyTradeCount   = 0;
       riskSystem.consecutiveLosses = 0;
+      riskSystem.lossHaltUntil     = 0;   // a new session does not inherit yesterday's cool-off
       riskSystem.dailyResetDate    = todayET;
     }
     console.log(`[LOAD] Restored $${portfolio.cash.toFixed(2)} cash, vault $${capitalSystem.profitVault.toFixed(2)}`);
@@ -4649,6 +4789,7 @@ function scheduleDailyReset() {
     riskSystem.dailyRealizedLoss = 0;
     riskSystem.dailyTradeCount   = 0;
     riskSystem.consecutiveLosses = 0;
+    riskSystem.lossHaltUntil     = 0;
     riskSystem.dailyResetDate    = getEasternTimeParts().dateStr;
     Object.keys(symbolLossCount).forEach(k => { symbolLossCount[k] = 0; });
     
@@ -4842,6 +4983,7 @@ function evaluateAndTrade() {
     riskSystem.dailyRealizedLoss = 0;
     riskSystem.dailyTradeCount   = 0;
     riskSystem.consecutiveLosses = 0;
+    riskSystem.lossHaltUntil     = 0;
     riskSystem.dailyResetDate    = todayET;
   }
 
@@ -4981,6 +5123,7 @@ function evaluateAndTrade() {
   }
 
   // ── 3. KILL SWITCHES ──────────────────────────────────────────────────────
+  releaseExpiredLossHalt();   // let a finished cool-off actually end before we test it
   const killReason = getKillSwitchReason();
   if (killReason) {
     if (Date.now() - evaluateAndTrade._lastKillLog > 60000) {
@@ -5088,6 +5231,20 @@ function evaluateAndTrade() {
     // strategy gate's cold-start fallback is permissive by design for the core
     // list (those symbols accumulate history within minutes of boot), but a
     // just-added news symbol could otherwise trade on a 1-tick history.
+    // VOLATILITY-DATA GATE (v11.19) — applies to EVERY symbol, core included.
+    // Previously only dynamic symbols were checked, so core names (PLTR, MARA, SOUN…)
+    // could trade with ZERO candles: tick-fallback ATR → stops tighter than the spread
+    // → the five straight losses seen live. If we cannot measure a symbol's volatility
+    // from real bars we do not size a trade on it, full stop. Exits are unaffected —
+    // this is the entry scan only, so open positions are still managed normally.
+    if (!hasReliableVolatility(symbol)) {
+      if (Date.now() - (evaluateAndTrade._lastAtrLog || 0) > 300000) {
+        evaluateAndTrade._lastAtrLog = Date.now();
+        const n = rankedSymbols.filter(s => !hasReliableVolatility(s)).length;
+        console.log(`[DATA] ${n}/${rankedSymbols.length} symbols lack candle-grade ATR (<${MIN_CANDLES_FOR_ATR} 1m bars) — entries on those are paused. Thin IEX tape? Consider ALPACA_DATA_FEED=sip.`);
+      }
+      continue;
+    }
     if (dynamicSymbols[symbol]) {
       const hist = q.history?.length || 0;
       const m1   = candleData[symbol]?.m1?.length || 0;
@@ -5135,16 +5292,18 @@ function evaluateAndTrade() {
     const aiAdj = aiScoreAdjustment(symbol);
     longScore = Math.max(0, Math.min(1, longScore + aiAdj.long));
     
-    // Threshold: 0.70 A+ (top signals), 0.46 normal.
-    // v11.19 aggression tune: lowered from 0.72/0.50 so more real setups clear the
-    // bar and get taken — this changes trade FREQUENCY, not the stop-loss/R:R/kill-
-    // switch rules a trade still has to pass once it's proposed (terraValidateTrade).
-    const A_PLUS_SETUP_THRESHOLD = 0.70;
-    const NORMAL_SETUP_THRESHOLD = 0.46;
+    // Threshold: 0.72 A+ (top signals), 0.50 normal.
+    // v11.19: REVERTED from the 0.70/0.46 aggression tune. Lowering the bar admitted
+    // more marginal setups at exactly the time the ATR feeding their stops was broken
+    // (see atrQuality) — more trades, each with a stop inside the spread. Restore the
+    // researched values; revisit only once the data-quality fixes have real trades
+    // behind them.
+    const A_PLUS_SETUP_THRESHOLD = 0.72;
+    const NORMAL_SETUP_THRESHOLD = 0.50;
     // Apply regime micro-adjustment: bull regime makes threshold slightly easier,
     // bear/choppy makes it slightly harder. Clamped to a safe range.
     const baseThreshold = aiSystem.a_plus_mode ? A_PLUS_SETUP_THRESHOLD : NORMAL_SETUP_THRESHOLD;
-    const minThreshold  = Math.max(0.36, Math.min(0.80, baseThreshold + regimeThreshAdj));
+    const minThreshold  = Math.max(0.40, Math.min(0.80, baseThreshold + regimeThreshAdj));
 
     // Formal EMA-crossover + RSI gate (hard filter on top of the weighted score)
     const gate = evaluateStrategyGate(symbol, q);
@@ -5197,6 +5356,7 @@ evaluateAndTrade._lastRiskLog     = 0;
 evaluateAndTrade._lastKillLog     = 0;
 evaluateAndTrade._lastSessionLog  = 0;
 evaluateAndTrade._lastVolLog      = 0;
+evaluateAndTrade._lastAtrLog      = 0;
 
 // ════════════════════════════════════════════════════════════════════════════
 //  API — Luna reads these endpoints
@@ -5757,5 +5917,8 @@ module.exports = {
     ema, rsi, calculateATR, atrPct, SENTIMENT_EMA_REF_MS, sentimentAlpha,
     computeDrawdown, isEarningsBlackout, EARNINGS_BLACKOUT_ENABLED, START_CAPITAL,
     trimTrades, cancelPendingSave,
+    atrQuality, hasReliableVolatility, MIN_CANDLES_FOR_ATR,
+    releaseExpiredLossHalt, LOSS_HALT_MS, getKillSwitchReason, lossHaltReason,
+    institutionalScore, ideaDirection, EFFECTIVE_MIN_DAY_VOL, FEED_VOLUME_FACTOR, DYNAMIC_MIN_DAY_VOL,
     setPendingOrders: (o) => { pendingOrders = o; } }
 };

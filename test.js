@@ -302,6 +302,220 @@ check('open SHORT equity counts locked margin (not a phantom drawdown)', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+group('VOLATILITY DATA QUALITY — the live money-loser (5 straight losses)');
+// A session ran with candles for only 3 of 21 symbols. Tick-fallback ATR collapsed to
+// the floor, producing stops INSIDE the round-trip spread. These lock that shut.
+check('a symbol with no candles is flagged as fallback quality', () => {
+  delete I.candleData['NOCANDLE'];
+  eq(I.atrQuality('NOCANDLE'), 'fallback');
+  eq(I.hasReliableVolatility('NOCANDLE'), false);
+});
+check('too few candles still counts as fallback', () => {
+  I.candleData['FEW'] = { m1: Array.from({ length: I.MIN_CANDLES_FOR_ATR - 1 },
+    (_, i) => ({ t: i, o: 10, h: 10.1, l: 9.9, c: 10, v: 100 })) };
+  eq(I.atrQuality('FEW'), 'fallback');
+});
+check('enough candles is candle-grade', () => {
+  seedSymbol('GOOD', 20);   // seeds 40 m1 bars
+  eq(I.atrQuality('GOOD'), 'candle');
+  eq(I.hasReliableVolatility('GOOD'), true);
+});
+check('fallback ATR floor keeps the stop clear of round-trip costs', () => {
+  // The whole bug: 0.3% ATR -> 0.66% stop vs ~0.5-1.5% round-trip cost.
+  delete I.candleData['NOCANDLE'];
+  I.marketData['NOCANDLE'] = { price: 20, prevClose: 20, high: 20, low: 20,
+                               lastUpdate: Date.now(), history: [20, 20, 20] };
+  const a = I.atrPct('NOCANDLE');
+  ok(a >= 0.008, `fallback atrPct ${a} below the 0.8% floor`);
+  const stopFrac = Math.max(0.004, I.STRATEGY.ATR_STOP_MULT * a);
+  ok(stopFrac >= 0.017, `stop ${(stopFrac * 100).toFixed(2)}% is too tight to survive costs`);
+});
+check('candle-grade symbols keep the tighter floor (calm names not over-widened)', () => {
+  seedSymbol('CALM', 100);
+  ok(I.atrQuality('CALM') === 'candle');
+  const a = I.atrPct('CALM');
+  ok(a >= 0.003 && a <= 0.15, `atrPct ${a} out of band`);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+group('13F INSTITUTIONAL SCORE — must discriminate, not saturate');
+check('does not saturate across the realistic filing range', () => {
+  const s = [52, 242, 1675, 3127, 10000].map(I.institutionalScore);
+  for (let i = 1; i < s.length; i++) {
+    ok(s[i] > s[i - 1], `score did not increase from ${s[i - 1]} to ${s[i]}`);
+  }
+  ok(s[0] < 0.6 && s[4] >= 0.99, `range too narrow: ${s[0]} .. ${s[4]}`);
+});
+check('the old /2 formula demonstrably DID saturate (control)', () => {
+  const old = f => Math.max(0, Math.min(1, Math.log10(1 + f) / 2));
+  eq(old(242), 1, 'control: 242 filings should have saturated');
+  eq(old(10000), 1, 'control: 10000 filings should have saturated');
+  ok(I.institutionalScore(242) < I.institutionalScore(10000), 'new formula must separate them');
+});
+check('handles junk input', () => {
+  for (const f of [0, -5, NaN, undefined, null]) {
+    const s = I.institutionalScore(f);
+    ok(Number.isFinite(s) && s >= 0 && s <= 1, `score ${s} invalid for ${f}`);
+  }
+});
+
+group('RESEARCH DIRECTION — 13F must never pick a side');
+check('institutional interest alone yields NO direction, even at max score', () => {
+  // The structural long-only bias: `newsDir || (instScore >= 0.3 ? 'long' : null)` with
+  // a saturated score meant every idea was forced LONG. Every rec in the live log was LONG.
+  eq(I.ideaDirection(null, 1.0), null, 'max institutional score must not imply long');
+  eq(I.ideaDirection(null, 0.5), null);
+  eq(I.ideaDirection(undefined, 1.0), null);
+});
+check('news direction is honoured in BOTH directions', () => {
+  eq(I.ideaDirection('long', 0), 'long');
+  eq(I.ideaDirection('short', 0), 'short', 'shorts must be expressible');
+  eq(I.ideaDirection('short', 1.0), 'short', 'institutional score must not override a short');
+});
+check('garbage direction values are rejected', () => {
+  for (const d of ['sideways', '', 0, {}, true]) eq(I.ideaDirection(d, 1.0), null, `for ${String(d)}`);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+group('LIQUIDITY THRESHOLD — must match the data feed in use');
+check('iex feed scales the consolidated threshold down', () => {
+  ok(I.EFFECTIVE_MIN_DAY_VOL < I.DYNAMIC_MIN_DAY_VOL,
+     'IEX reports ~3% of consolidated volume; threshold must scale or it rejects everything');
+});
+check('the symbols rejected live would now pass', () => {
+  // From the live log: MP 220090, NBIS 314679, BYND 91975 — all real, liquid mid-caps
+  // wrongly rejected as "too thin" because IEX volume was compared to a consolidated bar.
+  for (const [sym, vol] of [['MP', 220090], ['NBIS', 314679], ['BYND', 91975]]) {
+    ok(vol >= I.EFFECTIVE_MIN_DAY_VOL, `${sym} (${vol}) still rejected by ${I.EFFECTIVE_MIN_DAY_VOL}`);
+  }
+});
+check('genuinely illiquid volume is still rejected', () => {
+  ok(500 < I.EFFECTIVE_MIN_DAY_VOL, 'a 500-share day must still fail the screen');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+group('CONSECUTIVE-LOSS HALT — must be a cooldown, not a deadlock');
+// The counter resets only on a WIN or a new ET day, but the halt blocks entries, so no
+// win can occur -> it bricked itself until midnight while logging "cooling off".
+check('the halt expires and re-arms entries', () => {
+  I.riskSystem.consecutiveLosses = 5;
+  I.riskSystem.lossHaltUntil = Date.now() - 1000;      // already elapsed
+  const released = I.releaseExpiredLossHalt();
+  eq(released, true, 'should have released');
+  eq(I.riskSystem.consecutiveLosses, 0, 'streak must clear so it cannot re-block instantly');
+  eq(I.riskSystem.lossHaltUntil, 0, 'halt timestamp cleared');
+});
+check('an UNEXPIRED halt is left alone', () => {
+  I.riskSystem.consecutiveLosses = 5;
+  I.riskSystem.lossHaltUntil = Date.now() + 10 * 60000;
+  eq(I.releaseExpiredLossHalt(), false, 'must not release early');
+  eq(I.riskSystem.consecutiveLosses, 5, 'streak preserved during cool-off');
+  I.riskSystem.consecutiveLosses = 0; I.riskSystem.lossHaltUntil = 0;   // cleanup
+});
+check('a high loss count alone no longer blocks forever (the deadlock)', () => {
+  // Tests lossHaltReason() directly, NOT getKillSwitchReason(): that outer function
+  // returns early on `!wsConnected`, which is always true offline — an earlier version
+  // of this test passed for that reason alone and mutation testing caught it.
+  I.riskSystem.consecutiveLosses = 99;                 // far past maxConsecutiveLosses
+  I.riskSystem.lossHaltUntil = 0;                      // but no active cool-off
+  eq(I.lossHaltReason(), null,
+     'a raw counter with no live cool-off must NOT block — that was the deadlock');
+  I.riskSystem.consecutiveLosses = 0;
+});
+check('an active cool-off DOES block, and says how long is left', () => {
+  I.riskSystem.consecutiveLosses = 4;
+  I.riskSystem.lossHaltUntil = Date.now() + 10 * 60000;
+  const reason = I.lossHaltReason();
+  ok(reason && /consecutive losses/.test(reason), `expected a halt reason, got: ${reason}`);
+  ok(/\d+min/.test(reason), `reason should state remaining time, got: ${reason}`);
+  I.riskSystem.consecutiveLosses = 0; I.riskSystem.lossHaltUntil = 0;
+});
+check('LOSS_HALT_MS is a sane, finite cooldown', () => {
+  ok(Number.isFinite(I.LOSS_HALT_MS) && I.LOSS_HALT_MS > 0 && I.LOSS_HALT_MS <= 4 * 3600 * 1000,
+     `LOSS_HALT_MS ${I.LOSS_HALT_MS} out of range`);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+group('SIGNAL AGEING — a re-reported idea must actually decay');
+const freshJupiter = () => {
+  const j = engine.createJupiter({ strategy: I.STRATEGY });
+  j.init({
+    strategy: I.STRATEGY, venus: engine.venus,
+    capitalSystem: { safeMode: false, tradingCapital: 1000 },
+    riskSystem: { consecutiveLosses: 0, currentDrawdown: 0 },
+    aiSystem: { aggressionLevel: 0.5 },
+    helpers: {
+      atrPct: () => 0.02, calculateATR: () => 0.5, calculateRVOL: () => 1.2,
+      calculateMarketStress: () => 0.1, getGapSizeAdjust: () => 1,
+      calculateTradeExpectancy: () => ({ winRate: 0.5, profitFactor: 1, avgWin: 10, avgLoss: 8 }),
+      isHighVolatility: () => false, closedTradeCount: () => 0,
+      adx: () => ({ adx: 25 }), rsi: () => 55, regimeNumeric: () => 1,
+      sessionFraction: () => 0.5, spread: () => 0.001,
+      quote: () => ({ price: 10, prevClose: 9.9 })
+    }
+  });
+  return j;
+};
+const REC = () => ({ symbol: 'AAA', direction: 'long', conviction: 0.7,
+                     catalyst: 'earnings', reasoning: 'x', horizonMinutes: 240 });
+
+check('re-reporting the SAME idea preserves its original birth time', () => {
+  // Venus re-emits its whole watchlist every cycle. Stamping createdAt=now each time
+  // pinned the decay term in scoreAdjustment at full strength forever, so a 240-minute
+  // "horizon" refreshed every few minutes never aged at all.
+  //
+  // The signal is BACKDATED between the two calls rather than sleeping: both calls would
+  // otherwise land in the same millisecond, making `createdAt = now` and
+  // `createdAt = prev.createdAt` indistinguishable — a weak test that mutation testing
+  // caught passing against the reintroduced bug.
+  const j = freshJupiter();
+  j.consumeRecommendations([REC()]);
+  const sig = j.getSignal('AAA');
+  const born = sig.createdAt - 60 * 60000;    // pretend it was first seen an hour ago
+  // Shorten the remaining life too (still in the future, so it stays the "same idea").
+  // Both fields must differ from what a freshly-stamped `now + horizon` would produce,
+  // or the assertion cannot distinguish preserved from re-stamped.
+  const dies = Date.now() + 60 * 60000;
+  sig.createdAt = born;
+  sig.expiresAt = dies;
+  j.consumeRecommendations([REC()]);          // identical idea, next cycle
+  const again = j.getSignal('AAA');
+  eq(again.createdAt, born, 'createdAt was reset — decay would never progress');
+  eq(again.expiresAt, dies, 'expiresAt was extended — the signal would never expire');
+});
+check('an aged signal really does decay toward zero influence', () => {
+  // End-to-end proof that preserving createdAt has the intended effect on the score.
+  const j = freshJupiter();
+  j.consumeRecommendations([REC()]);
+  const sig = j.getSignal('AAA');
+  const fresh = Math.abs(j.scoreAdjustment('AAA').long);
+  // Age it to ~95% through its life without changing anything else.
+  const life = sig.expiresAt - sig.createdAt;
+  sig.createdAt = Date.now() - life * 0.95;
+  sig.expiresAt = sig.createdAt + life;
+  const aged = Math.abs(j.scoreAdjustment('AAA').long);
+  ok(aged < fresh, `aged influence ${aged} should be below fresh ${fresh}`);
+});
+check('a CHANGED idea (new direction) starts a fresh clock', () => {
+  const j = freshJupiter();
+  j.consumeRecommendations([REC()]);
+  const born = j.getSignal('AAA').createdAt;
+  const flipped = { ...REC(), direction: 'short' };
+  j.consumeRecommendations([flipped]);
+  const s = j.getSignal('AAA');
+  eq(s.direction, 'short', 'direction should update');
+  ok(s.expiresAt > born, 'a genuinely new idea must get a fresh horizon');
+});
+check('the traded flag survives a re-report', () => {
+  const j = freshJupiter();
+  j.consumeRecommendations([REC()]);
+  j.markTraded('AAA', 'LONG');
+  eq(j.getSignal('AAA').traded, true, 'setup');
+  j.consumeRecommendations([REC()]);
+  eq(j.getSignal('AAA').traded, true, 'traded flag lost on refresh — would allow re-entry');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 group('TRADE LOG TRIMMING — must stay chronological');
 check('open trades survive a trim and stay visible in the recent-trades tail', () => {
   resetBook();
