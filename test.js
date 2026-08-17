@@ -320,6 +320,31 @@ check('calendar failure falls back to weekday hours (never halts trading)', () =
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+group('LLM MODEL RESOLUTION — a retired model id must not silently kill Venus');
+check('the default model is on the preference list', () => {
+  // llama-3.3-70b-versatile was retired by Groq and Venus then failed EVERY cycle for a
+  // full session while the engine looked healthy.
+  ok(Array.isArray(I.GROQ_CHAT_PREFERENCE) && I.GROQ_CHAT_PREFERENCE.length > 1,
+     'preference list missing');
+});
+check('preference list contains only chat-capable models', () => {
+  // The account also serves whisper (speech), orpheus (TTS) and prompt-guard
+  // (classifier) models — none can do JSON reasoning and must never be selected.
+  const bad = I.GROQ_CHAT_PREFERENCE.filter(m => /whisper|orpheus|prompt-guard/i.test(m));
+  eq(bad.length, 0, `non-chat models in preference list: ${bad}`);
+});
+check('resolveAiModel is callable and never throws without network', async () => {
+  ok(typeof I.resolveAiModel === 'function', 'not exported');
+  ok(typeof I.aiModel() === 'string' || I.aiModel() === null, 'model accessor broken');
+});
+check('venus.AI_MODEL is a live getter, not a stale snapshot', () => {
+  // AI_MODEL is reassigned at boot by resolveAiModel(); a copied property would keep
+  // reporting the configured (possibly retired) name forever.
+  const d = Object.getOwnPropertyDescriptor(engine.venus, 'AI_MODEL');
+  ok(d && typeof d.get === 'function', 'venus.AI_MODEL must be a getter');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 group('COST TRACKING — measures the biggest unknown (adverse selection)');
 check('summary is safe with no samples', () => {
   const c = I.costTrackingSummary();

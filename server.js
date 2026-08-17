@@ -342,8 +342,65 @@ else if (FORCED === 'anthropic' && ANTHROPIC_KEY) PROVIDER = 'anthropic';
 else if (!FORCED && GROQ_KEY)                     PROVIDER = 'groq';
 else if (!FORCED && ANTHROPIC_KEY)                PROVIDER = 'anthropic';
 
-const DEFAULT_MODELS = { groq: 'llama-3.3-70b-versatile', anthropic: 'claude-sonnet-4-6' };
-const AI_MODEL = PROVIDER ? (process.env.AI_MODEL || DEFAULT_MODELS[PROVIDER]) : null;
+const DEFAULT_MODELS = { groq: 'openai/gpt-oss-120b', anthropic: 'claude-sonnet-4-6' };
+// MUTABLE (v11.21): resolved against the provider's live model list at boot.
+// A hardcoded model id is a time bomb — `llama-3.3-70b-versatile` was retired by Groq
+// and Venus then failed EVERY cycle for a whole session ("does not exist or you do not
+// have access to it"), silently killing all news analysis while the engine looked
+// healthy. Pinning a new name just resets the timer, so instead we ask the provider
+// what it actually serves and pick the best available.
+let AI_MODEL = PROVIDER ? (process.env.AI_MODEL || DEFAULT_MODELS[PROVIDER]) : null;
+
+// Preference order for Groq chat models, best-for-this-job first. Anything not on this
+// list is ignored — the account also exposes speech (whisper), TTS (orpheus) and
+// classifier (prompt-guard) models that cannot do JSON reasoning.
+const GROQ_CHAT_PREFERENCE = [
+  'openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen/qwen3.6-27b',
+  'groq/compound', 'groq/compound-mini', 'openai/gpt-oss-safeguard-20b',
+  'llama-3.3-70b-versatile', 'llama-3.1-70b-versatile', 'llama-3.1-8b-instant'
+];
+
+function httpsGetJson(host, path, headers) {
+  return new Promise(resolve => {
+    let done = false;
+    const finish = v => { if (!done) { done = true; clearTimeout(th); resolve(v); } };
+    const th = setTimeout(() => { try { req.destroy(); } catch {} finish(null); }, 10000);
+    const req = https.request({ host, path, method: 'GET', headers }, res => {
+      let b = ''; res.on('data', d => b += d);
+      res.on('end', () => { try { finish(JSON.parse(b)); } catch { finish(null); } });
+    });
+    req.on('error', () => finish(null));
+    req.end();
+  });
+}
+
+// Ask the provider which models it actually serves and adopt the best usable one.
+// Returns the resolved id, or null if the check could not run (we then keep the
+// configured value and let the normal error path report it).
+async function resolveAiModel() {
+  if (PROVIDER !== 'groq' || !GROQ_KEY) return AI_MODEL;      // only Groq exposes a list we use
+  const j = await httpsGetJson('api.groq.com', '/openai/v1/models', { authorization: 'Bearer ' + GROQ_KEY });
+  const ids = (j && Array.isArray(j.data)) ? j.data.map(m => m && m.id).filter(Boolean) : null;
+  if (!ids || !ids.length) {
+    console.warn('[VENUS] Could not read the Groq model list — keeping configured model ' + AI_MODEL);
+    return AI_MODEL;
+  }
+  // An explicitly configured model wins IF the account can actually serve it.
+  if (process.env.AI_MODEL) {
+    if (ids.includes(process.env.AI_MODEL)) { AI_MODEL = process.env.AI_MODEL; return AI_MODEL; }
+    console.warn(`[VENUS] AI_MODEL="${process.env.AI_MODEL}" is not available on this key — auto-selecting instead.`);
+  }
+  const picked = GROQ_CHAT_PREFERENCE.find(m => ids.includes(m));
+  if (!picked) {
+    console.error(`[VENUS] ⚠️ None of the known chat models are available on this key. Saw: ${ids.join(', ')}`);
+    console.error('[VENUS]   Venus news analysis will not work until AI_MODEL is set to a chat model this key can serve.');
+    return AI_MODEL;
+  }
+  if (picked !== AI_MODEL) console.log(`[VENUS] Model auto-selected: ${picked} (configured "${AI_MODEL}" unavailable)`);
+  else                     console.log(`[VENUS] Model confirmed available: ${picked}`);
+  AI_MODEL = picked;
+  return AI_MODEL;
+}
 // Venus's calibration learning rate. VENUS_CALIB_LR is correct (this IS Venus's model);
 // JUPITER_CALIB_LR is kept as a deprecated alias — it was backwards pre-v11.8.
 const CALIB_LR = Math.max(0.005, Math.min(0.2, parseFloat(process.env.VENUS_CALIB_LR || process.env.JUPITER_CALIB_LR || '0.05')));
@@ -933,7 +990,11 @@ Output ONLY JSON:
 
 // ── Venus's public surface: the RESEARCH engine (news analysis + web/13F + watchlist).
 const venus = {
-  isConfigured, AI_MODEL, PROVIDER,
+  isConfigured, PROVIDER,
+  // getter, not a snapshot: AI_MODEL is resolved against the provider's live model
+  // list at boot, so a copied value here would report the stale configured name.
+  get AI_MODEL() { return AI_MODEL; },
+  resolveAiModel,
   analyze, research, assess, researchRecommendations, getResearch, getResearchFor, institutionalInterest,
   learn, calibrateConviction, getCalibration, getState, serialize, loadState: venusLoadState,
   trainOffline, ingestCalibrationData, getTrainStats
@@ -2571,13 +2632,21 @@ async function fetchCandles() {
 
   try {
     const symbols  = [...WATCHLISTS.nasdaq, ...WATCHLISTS.nyse, ...Object.keys(dynamicSymbols)];
-    const start1m  = new Date(Date.now() - 60 * 60 * 1000).toISOString();        // last 60 min
-    const start5m  = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();    // last 7h
+    // v11.21: the 1-minute window was 60 MINUTES, which starves on the free IEX feed.
+    // IEX is ~3% of the consolidated tape, so a thin name simply does not print every
+    // minute — measured live: a 1h window returned enough bars for 0 of 20 symbols,
+    // a 4h window for 20 of 20. The engine then paused entries on 17/20 symbols
+    // ("lack candle-grade ATR") and traded nothing for a whole session. Widening the
+    // lookback costs one identical API call and fixes the starvation outright.
+    // Sparse bars spread over a longer span can slightly OVERSTATE ATR, which widens
+    // stops — the safe direction to err.
+    const start1m  = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();    // last 4h
+    const start5m  = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();   // last 12h
 
     // Two batch calls — all symbols at once per timeframe.
     const [bars1m, bars5m] = await Promise.all([
-      fetchBars(symbols, '1Min', start1m, 100),   // 1m bars: tf5m trend + true ATR
-      fetchBars(symbols, '5Min', start5m, 100)     // 5m bars: tf15m bias
+      fetchBars(symbols, '1Min', start1m, 400),   // 1m bars: tf5m trend + true ATR
+      fetchBars(symbols, '5Min', start5m, 200)     // 5m bars: tf15m bias
     ]);
 
     let updated = 0;
@@ -2898,8 +2967,8 @@ async function addDynamicSymbol(sym, sig) {
 
   // Warm up candles immediately so ATR/RVOL/strategy-gate have real data fast
   try {
-    const start1m = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-    const start5m = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();
+    const start1m = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();    // see fetchCandles
+    const start5m = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
     const [b1, b5] = await Promise.all([
       fetchBars([sym], '1Min', start1m, 100),
       fetchBars([sym], '5Min', start5m, 100)
@@ -6026,6 +6095,10 @@ if (require.main === module) app.listen(PORT, async () => {
   // 3. Real-time WS feed
   connectWebSocket();
 
+  // 3a. Confirm the LLM model actually exists on this key before Venus needs it.
+  //     A retired model id silently killed every news cycle for a full session.
+  if (AI_ENABLED) { try { await resolveAiModel(); } catch (e) { console.warn('[VENUS] model check failed:', e.message); } }
+
   // 3b. Official trading calendar (holidays + early closes). Best-effort: on failure
   //     the engine falls back to standard weekday hours, exactly as before.
   await refreshMarketCalendar();
@@ -6126,6 +6199,7 @@ module.exports = {
     ema, rsi, calculateATR, atrPct, SENTIMENT_EMA_REF_MS, sentimentAlpha,
     computeDrawdown, isEarningsBlackout, EARNINGS_BLACKOUT_ENABLED, START_CAPITAL,
     trimTrades, cancelPendingSave, refreshMarketCalendar, marketClosedReason, costTrackingSummary,
+    resolveAiModel, GROQ_CHAT_PREFERENCE, aiModel: () => AI_MODEL,
     marketCalendar: () => marketCalendar, getCurrentMarket, getEasternTimeParts, resolveSession,
     atrQuality, hasReliableVolatility, MIN_CANDLES_FOR_ATR,
     releaseExpiredLossHalt, LOSS_HALT_MS, getKillSwitchReason, lossHaltReason,
