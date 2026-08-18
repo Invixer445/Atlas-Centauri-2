@@ -267,6 +267,7 @@ function replay(hist, usable, cfg, capital, verbose = false) {
           rej.netRR++; netRRSamples.push(plan.netRewardRisk); costSamples.push(plan.cost); atrSamples.push(plan.atrFrac); continue;
         }
         if (plan.targetCostRatio < S.MIN_TARGET_COST_RATIO) { rej.targetCost++; continue; }
+        if (plan.cost > S.MAX_ROUND_TRIP_COST) { rej.tooExpensive = (rej.tooExpensive||0)+1; continue; }
       }
       if (plan.rewardRisk < S.MIN_RR) { rej.grossRR++; continue; }
       rej.accepted++;

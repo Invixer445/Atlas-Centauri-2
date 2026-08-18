@@ -412,12 +412,52 @@ const CATALYSTS = new Set([
   'legal','macro','insider','partnership','contract','other'
 ]);
 
+// ── MECHANISMS (v11.22) — WHY would this trade pay? ──────────────────────────
+// The architectural point of Venus is to form an idea, investigate it, and hand a
+// reasoned setup to Jupiter. Until now it handed over a *catalyst* ("earnings") and
+// a confidence number, which says what happened but not why anyone should profit.
+// That is pattern-matching, and backtesting six such patterns found no persistent
+// edge — they were either market beta, smaller than the fee, or decayed to zero.
+//
+// A tradeable idea needs a COUNTERPARTY STORY: who is on the other side of this
+// trade, and why are they willing to lose money to me? If that question has no
+// answer, there is no edge — only a shape on a chart that thousands of faster
+// participants already found.
+//
+// These are the mechanisms with a real economic reason behind them:
+const MECHANISMS = new Set([
+  // Someone MUST trade regardless of price — index funds tracking a rebalance,
+  // funds dumping a stock that fell out of an index, forced margin liquidation,
+  // tax-loss selling. Price-insensitive sellers pay whoever absorbs their supply.
+  'forced_flow',
+  // Information is genuinely new and the stock is small/neglected enough that it
+  // prices in slowly. The edge is being early where few analysts are looking.
+  'slow_diffusion',
+  // Prices under-react to earnings surprises and drift for weeks afterward (PEAD).
+  'underreaction',
+  // Somebody needs liquidity NOW and pays a premium for immediacy — the classic
+  // market-maker's edge, available when a name gaps on no fundamental news.
+  'liquidity_premium',
+  // A structural, calendar-driven flow: index adds/deletes, month-end rebalancing,
+  // options-expiry pinning. Mechanical, documented, and dated in advance.
+  'structural_flow',
+  // Explicitly "no mechanism identified" — the honest answer, and the DEFAULT.
+  // Ideas that land here are watchlist-grade only and never become trade signals.
+  'none'
+]);
+// Only these carry a genuine counterparty story. 'none' is tracked but never traded.
+const TRADEABLE_MECHANISMS = new Set(['forced_flow','slow_diffusion','underreaction','liquidity_premium','structural_flow']);
+
 // ════════════════════════════════════════════════════════════════════════════
 //  VENUS'S LEARNING — calibration models + per-catalyst track record
 // ════════════════════════════════════════════════════════════════════════════
 let calibGlobal = new PlattCalibrator({ lr: CALIB_LR });        // overall confidence calibration
 let calibByCat  = {};                                          // catalyst → PlattCalibrator
 let calibration = {};                                          // catalyst → {wins,losses,totalPnL}
+// Per-MECHANISM outcomes. Catalyst says what happened; mechanism says why it should
+// pay. Tracking the latter is how Venus learns which counterparty stories are real.
+let mechanismRecord = {};                                      // mechanism → {wins,losses,totalPnL}
+let mechanismStats  = { rejectedNoMechanism: 0, byMechanism: {} };
 let learnLog    = [];                                          // last 200 learned outcomes
 let calibLog    = [];                                          // experience replay buffer: {rawConv,cat,won}
 
@@ -451,6 +491,12 @@ function learn(outcome) {
   calibration[cat] = calibration[cat] || { wins: 0, losses: 0, totalPnL: 0 };
   if (won) calibration[cat].wins++; else calibration[cat].losses++;
   calibration[cat].totalPnL += pnl;
+
+  // Same record, keyed by the REASON the trade was supposed to work.
+  const mech = MECHANISMS.has(outcome.mechanism) ? outcome.mechanism : 'none';
+  mechanismRecord[mech] = mechanismRecord[mech] || { wins: 0, losses: 0, totalPnL: 0 };
+  if (won) mechanismRecord[mech].wins++; else mechanismRecord[mech].losses++;
+  mechanismRecord[mech].totalPnL += pnl;
 
   // Learning models (this is the real "gets smarter as it goes" part)
   calibGlobal.update(rawConv, won);
@@ -548,6 +594,19 @@ function getState() {
           .map(([cat, c]) => [cat, { samples: c.n, shift: c.shift() }])
       )
     },
+    // WHICH REASONS ACTUALLY PAY. This is the number that tells you whether Venus is
+    // finding real edges or just labelling patterns — a mechanism with a losing record
+    // over a real sample is a story that isn't true.
+    mechanisms: {
+      rejectedNoMechanism: mechanismStats.rejectedNoMechanism,
+      proposed: mechanismStats.byMechanism,
+      record: Object.fromEntries(Object.entries(mechanismRecord).map(([m, r]) => {
+        const tot = r.wins + r.losses;
+        return [m, { wins: r.wins, losses: r.losses,
+                     winRate: tot ? ((r.wins / tot) * 100).toFixed(0) + '%' : '—',
+                     totalPnL: +(r.totalPnL || 0).toFixed(2) }];
+      }))
+    },
     calibration: Object.fromEntries(Object.entries(calibration).map(([cat, s]) => {
       const total = s.wins + s.losses;
       return [cat, {
@@ -563,6 +622,7 @@ function getState() {
 function serialize() {
   return {
     calibration,
+    mechanismRecord,
     learnLog: learnLog.slice(-200),
     calibLog: calibLog.slice(-4000),
     calibGlobal: calibGlobal.toJSON(),
@@ -572,6 +632,7 @@ function serialize() {
 function venusLoadState(s) {
   if (!s || typeof s !== 'object') return;
   if (s.calibration && typeof s.calibration === 'object') calibration = s.calibration;
+  if (s.mechanismRecord && typeof s.mechanismRecord === 'object') mechanismRecord = s.mechanismRecord;
   if (Array.isArray(s.learnLog)) learnLog = s.learnLog.slice(-200);
   if (Array.isArray(s.calibLog)) calibLog = s.calibLog.filter(r => r && Number.isFinite(r.rawConv)).slice(-4000);
   if (s.calibGlobal) calibGlobal.load(s.calibGlobal);
@@ -646,30 +707,69 @@ function buildPrompt(articles) {
     `HEADLINE: ${a.headline}\n` + (a.summary ? `SUMMARY: ${String(a.summary).slice(0, 400)}\n` : '')
   ).join('\n');
 
-  return `You are VENUS, the news-analysis engine of an intraday US-equity trading system.
-Analyze the news below and identify ONLY items with a clear, near-term (today)
-directional implication for a specific US-listed common stock. Your output goes to the
-trading engine (Jupiter), which sizes and risk-checks every idea — be precise, not prolific.
+  return `You are VENUS, the research engine of a US-equity trading system. You form ideas,
+investigate them, and hand only the defensible ones to the trading engine (Jupiter).
+
+THE ONE QUESTION THAT MATTERS: for each idea, WHO is on the other side of this trade,
+and WHY are they willing to lose money to us? A price pattern is not an answer —
+patterns are found instantly by faster participants and stop working. A trade is only
+worth taking when you can name the counterparty and their reason.
+
+Backtesting confirmed this the hard way: six pattern-based strategies were tested on
+this exact universe and NONE had a persistent edge. They were market drift in disguise,
+smaller than trading costs, or decayed to nothing in recent data. Do not hand over
+another pattern. Hand over a situation with a mechanism.
 
 ${accuracyLines.length ? `YOUR OWN TRACK RECORD & CALIBRATION BY CATALYST (a learning model derived this from
 real outcomes — heed the OVER/UNDERconfident notes when setting conviction):
 ${accuracyLines.join('\n')}\n` : ''}
+MECHANISMS — pick the one that genuinely applies, or "none":
+  forced_flow       someone MUST trade regardless of price (index rebalance, fund
+                    forced to sell a deleted name, margin liquidation, tax-loss
+                    selling). Price-insensitive sellers pay whoever absorbs them.
+  slow_diffusion    genuinely new information in a small/neglected name that few
+                    analysts cover, so it prices in over hours-days rather than seconds.
+  underreaction     an earnings surprise the market is under-reacting to; documented
+                    to drift for weeks afterward.
+  liquidity_premium someone needs out NOW and pays for immediacy — a gap on no real
+                    fundamental news, where we are paid to provide liquidity.
+  structural_flow   a dated, mechanical flow: index add/delete, month-end rebalance,
+                    options-expiry pinning.
+  none              you cannot name a counterparty or reason. THIS IS THE RIGHT ANSWER
+                    MOST OF THE TIME and costs you nothing.
+
 RULES:
 - US-listed common stocks only. Skip ETFs, indices, crypto, foreign listings, OTC.
-- Only signal when the news plausibly moves the stock TODAY (intraday).
-- Skip vague, stale, already-priced-in, or purely retrospective stories.
+- A mega-cap reacting to widely-covered news is almost never an edge — it is priced in
+  within seconds by participants far faster than us. Prefer neglect over headlines.
+- If the only thing you can say is "this seems bullish", the mechanism is "none".
 - conviction is YOUR probability the direction is right, 0.50-0.95. Be honest; an empty
-  array is a good answer.
+  array is an EXCELLENT answer and is expected on most cycles.
+- counterparty: one short phrase naming who loses and why. Required when mechanism is
+  not "none". If you cannot write it, the mechanism IS "none".
 - catalyst ∈ {earnings, guidance, analyst, ma, product, regulatory, legal, macro, insider, partnership, contract, other}
 - horizon_minutes: how long the edge likely lasts (30-390).
-- Max 6 recommendations. One per symbol (strongest catalyst wins).
+- Max 6 recommendations. One per symbol.
 
 NEWS ITEMS:
 ${articleBlock}
 
 Respond with ONLY a JSON array (no fences, no commentary):
-[{"symbol":"TICKER","direction":"long"|"short","conviction":0.0,"catalyst":"...","horizon_minutes":120,"reasoning":"one short sentence"}]
+[{"symbol":"TICKER","direction":"long"|"short","conviction":0.0,"catalyst":"...",
+  "mechanism":"forced_flow|slow_diffusion|underreaction|liquidity_premium|structural_flow|none",
+  "counterparty":"who loses and why, one phrase",
+  "horizon_minutes":120,"reasoning":"one short sentence"}]
 If nothing qualifies: []`;
+}
+
+// Is this idea allowed to become a trade signal? Pure and exported so the gate is
+// regression-testable without a live LLM call — analyze() needs the network, so a test
+// that only covered validateRec left this path unguarded (mutation testing caught it).
+function isTradeableIdea(rec) {
+  if (!rec) return false;
+  if (!TRADEABLE_MECHANISMS.has(rec.mechanism)) return false;
+  if (!rec.counterparty || String(rec.counterparty).trim().length < 8) return false;
+  return true;
 }
 
 function validateRec(raw) {
@@ -683,11 +783,40 @@ function validateRec(raw) {
   conviction = Math.max(0, Math.min(0.95, conviction));
   if (conviction < 0.5) return null;
   const catalyst = CATALYSTS.has(raw.catalyst) ? raw.catalyst : 'other';
+  // MECHANISM (v11.22). Unknown/absent collapses to 'none' — an idea with no named
+  // counterparty is watchlist-grade, never a trade signal. A counterparty phrase is
+  // required alongside a real mechanism: if the model cannot say who loses and why,
+  // it does not actually have a mechanism, whatever label it picked.
+  let mechanism = MECHANISMS.has(raw.mechanism) ? raw.mechanism : 'none';
+  const counterparty = String(raw.counterparty || '').slice(0, 160).trim();
+  if (mechanism !== 'none' && counterparty.length < 8) mechanism = 'none';
   let horizon = parseInt(raw.horizon_minutes, 10);
   if (!Number.isFinite(horizon)) horizon = 120;
   horizon = Math.max(30, Math.min(390, horizon));
   const reasoning = String(raw.reasoning || '').slice(0, 200);
-  return { symbol, direction, conviction, catalyst, horizonMinutes: horizon, reasoning };
+  return { symbol, direction, conviction, catalyst, mechanism, counterparty, horizonMinutes: horizon, reasoning };
+}
+
+// Parsed LLM array -> validated, calibrated, mechanism-gated recommendations.
+// Split out of analyze() so the FULL pipeline (validate -> calibrate -> mechanism gate
+// -> dedupe) is testable without a network call. Testing the gate predicate alone left
+// analyze() free to skip calling it, which mutation testing caught.
+function recsFromParsed(parsed) {
+  const bySymbol = {};
+  for (const raw of (Array.isArray(parsed) ? parsed : []).slice(0, 10)) {
+    const rec = validateRec(raw);
+    if (!rec) continue;
+    // Apply LEARNED calibration: keep the LLM's raw conviction for training, but
+    // hand Jupiter the empirically-calibrated conviction for decision-making.
+    rec.convictionRaw = rec.conviction;
+    rec.conviction    = calibrateConviction(rec.conviction, rec.catalyst);
+    // An idea with no counterparty story is not tradeable, however confident the model
+    // sounds. This is the gate that stops Venus handing Jupiter another chart pattern.
+    if (!isTradeableIdea(rec)) { mechanismStats.rejectedNoMechanism++; continue; }
+    mechanismStats.byMechanism[rec.mechanism] = (mechanismStats.byMechanism[rec.mechanism] || 0) + 1;
+    if (!bySymbol[rec.symbol] || rec.conviction > bySymbol[rec.symbol].conviction) bySymbol[rec.symbol] = rec;
+  }
+  return Object.values(bySymbol).slice(0, 6);
 }
 
 // ── Main entry: analyze articles → calibrated recommendations ───────────────
@@ -708,17 +837,7 @@ async function analyze(articles) {
   catch (e) { return { ok:false, error:'unparseable-json' }; }
   if (!Array.isArray(parsed)) return { ok:false, error:'not-an-array' };
 
-  const bySymbol = {};
-  for (const raw of parsed.slice(0, 10)) {
-    const rec = validateRec(raw);
-    if (!rec) continue;
-    // Apply LEARNED calibration: keep the LLM's raw conviction for training, but
-    // hand Jupiter the empirically-calibrated conviction for decision-making.
-    rec.convictionRaw = rec.conviction;
-    rec.conviction    = calibrateConviction(rec.conviction, rec.catalyst);
-    if (!bySymbol[rec.symbol] || rec.conviction > bySymbol[rec.symbol].conviction) bySymbol[rec.symbol] = rec;
-  }
-  const recommendations = Object.values(bySymbol).slice(0, 6);
+  const recommendations = recsFromParsed(parsed);
   return { ok:true, recommendations, usage: r.usage || null, model: AI_MODEL, provider: PROVIDER };
 }
 
@@ -887,6 +1006,10 @@ async function research({ recs = [], universe = [], rvolOf = () => 1, max = 8 } 
     bySymbol[sym] = {
       symbol: sym, score, bias, direction,
       conviction, catalyst: rec ? rec.catalyst : (inst.filings > 0 ? 'institutional' : 'momentum'),
+      // Institutional interest alone is NOT a mechanism — 13F data is quarterly and
+      // lags ~45 days, so it cannot explain why anyone loses to us today.
+      mechanism: rec ? (rec.mechanism || 'none') : 'none',
+      counterparty: rec ? (rec.counterparty || '') : '',
       institutional: inst.score, institutionalFilings: inst.filings,
       newsConviction: newsConv, rvol,
       rationale: sources.join(' · ') || 'no strong signal'
@@ -908,11 +1031,12 @@ function researchRecommendations() {
     // that, a stored signal's nudge is ~zero or wrong-signed — pure noise in the scorer.
     // (Dynamic-watchlist candidates are additionally gated at AI_CONVICTION_MIN inside
     // Jupiter's consumeRecommendations.)
-    .filter(w => w.direction && w.conviction >= 0.55)
+    .filter(w => w.direction && w.conviction >= 0.55 && TRADEABLE_MECHANISMS.has(w.mechanism))
     .map(w => ({
       symbol: w.symbol, direction: w.direction,
       conviction: w.conviction, convictionRaw: w.conviction,
-      catalyst: w.catalyst, horizonMinutes: 240,
+      catalyst: w.catalyst, mechanism: w.mechanism || 'none', counterparty: w.counterparty || '',
+      horizonMinutes: 240,
       reasoning: 'Venus research — ' + w.rationale
     }));
 }
@@ -997,6 +1121,7 @@ const venus = {
   resolveAiModel,
   analyze, research, assess, researchRecommendations, getResearch, getResearchFor, institutionalInterest,
   learn, calibrateConviction, getCalibration, getState, serialize, loadState: venusLoadState,
+  MECHANISMS, TRADEABLE_MECHANISMS, validateRec, isTradeableIdea, recsFromParsed,
   trainOffline, ingestCalibrationData, getTrainStats
 };
 
@@ -1136,7 +1261,8 @@ function createJupiter(config = {}) {
       signals[rec.symbol] = {
         direction: rec.direction, conviction: rec.conviction,
         convictionRaw: rec.convictionRaw ?? rec.conviction,
-        catalyst: rec.catalyst, reasoning: rec.reasoning,
+        catalyst: rec.catalyst, mechanism: rec.mechanism || 'none',
+        counterparty: rec.counterparty || '', reasoning: rec.reasoning,
         createdAt: sameIdea ? prev.createdAt : now,
         expiresAt: sameIdea ? prev.expiresAt : now + rec.horizonMinutes * 60000,
         traded: prev?.traded || false
@@ -1198,7 +1324,7 @@ function createJupiter(config = {}) {
                     (sig.direction === 'short' && direction === 'SHORT');
     if (!matches) return null;
     sig.traded = true;
-    return { catalyst: sig.catalyst, conviction: sig.conviction, convictionRaw: sig.convictionRaw };
+    return { catalyst: sig.catalyst, mechanism: sig.mechanism || 'none', conviction: sig.conviction, convictionRaw: sig.convictionRaw };
   }
 
   // ── Position sizing (HOT PATH — pure sync): dollar-risk × Kelly × MODEL ──
@@ -1309,7 +1435,8 @@ function createJupiter(config = {}) {
     if (!trade.aiCatalyst) return null;
     const outcome = {
       ticker: trade.ticker, direction: trade.direction,
-      catalyst: trade.aiCatalyst, conviction: trade.aiConviction || 0,
+      catalyst: trade.aiCatalyst, mechanism: trade.aiMechanism || 'none',
+      conviction: trade.aiConviction || 0,
       convictionRaw: trade.aiConvictionRaw ?? trade.aiConviction ?? 0, pnl
     };
     console.log(`[JUPITER] ▶ Reporting outcome to Venus: ${trade.ticker} ${dir} $${pnl.toFixed(2)} [${trade.aiCatalyst}]`);
@@ -2053,6 +2180,16 @@ const STRATEGY = {
   // Caveat kept in the open: PF 1.11 is thin, and the threshold was chosen by trying
   // several on this data. Treat as promising, not proven.
   MIN_ATR_ENTRY:   0.010,
+  // ── MAX ROUND-TRIP COST (v11.22) ──────────────────────────────────────────
+  // The real cost lever. Position SIZE is cost-neutral here — Alpaca charges no
+  // commission and spread/slippage are percentages, so a $1,000 position pays the
+  // same rate as a $100 one. What does vary, hugely, is the stock: a liquid name
+  // costs ~5bp round trip while a thin one costs 50bp+. Every basis point of fee is
+  // a basis point the strategy must out-earn on EVERY trade, forever, so simply
+  // refusing the expensive names is free edge.
+  // 0.45% is deliberately above the ~0.30% median so it removes the tail, not the
+  // body — the gate is meant to exclude expensive stocks, not stop trading.
+  MAX_ROUND_TRIP_COST: 0.0045,
   // Backstop: the target must clear round-trip friction by this multiple, so a trade is
   // never taken for a move that barely pays the fee. This is the "only trade when there
   // is real money in it" rule, stated in cost units instead of price units.
@@ -3024,6 +3161,7 @@ function stampAiMetadata(symbol, direction) {
   );
   if (!t) return;
   t.aiCatalyst      = meta.catalyst;
+  t.aiMechanism     = meta.mechanism || 'none';
   t.aiConviction    = meta.conviction;
   t.aiConvictionRaw = meta.convictionRaw;
 }
@@ -3041,7 +3179,8 @@ function recordAiOutcome(ticker, direction, totalPnL) {
   // result straight to Venus via a direct in-process call (zero latency).
   jupiter.recordOutcome({
     ticker, direction,
-    aiCatalyst: t.aiCatalyst, aiConviction: t.aiConviction, aiConvictionRaw: t.aiConvictionRaw,
+    aiCatalyst: t.aiCatalyst, aiMechanism: t.aiMechanism,
+    aiConviction: t.aiConviction, aiConvictionRaw: t.aiConvictionRaw,
     realizedPnL: totalPnL
   });
 }
@@ -4231,6 +4370,8 @@ function terraValidateTrade(plan) {
     return reject(`target only ${plan.targetCostRatio.toFixed(1)}× round-trip cost (need ${STRATEGY.MIN_TARGET_COST_RATIO}×)`);
   if (!Number.isFinite(plan.atrFrac) || plan.atrFrac < STRATEGY.MIN_ATR_ENTRY)
     return reject(`ATR ${((plan.atrFrac || 0) * 100).toFixed(2)}% below the ${(STRATEGY.MIN_ATR_ENTRY * 100).toFixed(2)}% floor — move too small to beat costs`);
+  if (plan.cost > STRATEGY.MAX_ROUND_TRIP_COST)
+    return reject(`round-trip cost ${(plan.cost * 100).toFixed(2)}% above the ${(STRATEGY.MAX_ROUND_TRIP_COST * 100).toFixed(2)}% ceiling — too expensive to trade`);
 
   // RULE 4 — the full risk pipeline (Terra never opens a trade that breaks these)
   // Regular-trading-hours gate, belt-and-suspenders: evaluateAndTrade already refuses

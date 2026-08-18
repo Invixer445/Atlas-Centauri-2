@@ -356,6 +356,90 @@ check('summary reports the 43% threshold that erases the measured edge', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+group('VENUS MECHANISMS — an idea needs a counterparty, not a pattern');
+// Six pattern-based strategies were backtested on this universe and none had a
+// persistent edge. A tradeable idea must name WHO loses and WHY.
+check('no mechanism supplied collapses to "none"', () => {
+  const r = engine.venus.validateRec({ symbol: 'AAPL', direction: 'long', conviction: 0.8, catalyst: 'earnings' });
+  eq(r.mechanism, 'none');
+});
+check('an unknown mechanism label collapses to "none"', () => {
+  const r = engine.venus.validateRec({ symbol: 'AAPL', direction: 'long', conviction: 0.8,
+    catalyst: 'earnings', mechanism: 'vibes', counterparty: 'a perfectly long explanation here' });
+  eq(r.mechanism, 'none');
+});
+check('a mechanism with NO real counterparty phrase collapses to "none"', () => {
+  // If you cannot say who loses, you do not have a mechanism whatever label you picked.
+  const r = engine.venus.validateRec({ symbol: 'AAPL', direction: 'long', conviction: 0.8,
+    catalyst: 'earnings', mechanism: 'forced_flow', counterparty: 'idk' });
+  eq(r.mechanism, 'none');
+});
+check('a real mechanism with a real counterparty survives', () => {
+  const r = engine.venus.validateRec({ symbol: 'AAPL', direction: 'long', conviction: 0.8,
+    catalyst: 'earnings', mechanism: 'underreaction', counterparty: 'analysts slow to revise after a large surprise' });
+  eq(r.mechanism, 'underreaction');
+  ok(r.counterparty.length > 8, 'counterparty must be carried through');
+});
+check('"none" is never tradeable', () => {
+  ok(!engine.venus.TRADEABLE_MECHANISMS.has('none'),
+     'an idea with no counterparty story must never become a trade signal');
+  ok(engine.venus.TRADEABLE_MECHANISMS.size >= 4, 'should have several real mechanisms');
+});
+check('the analyze() gate itself rejects mechanism-less ideas', () => {
+  // Tests the ACTUAL predicate analyze() uses. Covering only validateRec left this
+  // path unguarded — mutation testing caught the gate being bypassed entirely.
+  const good = { mechanism: 'forced_flow', counterparty: 'index funds forced to sell on deletion' };
+  const noMech = { mechanism: 'none', counterparty: 'index funds forced to sell on deletion' };
+  const noCp   = { mechanism: 'forced_flow', counterparty: '' };
+  eq(engine.venus.isTradeableIdea(good), true, 'a real idea must pass');
+  eq(engine.venus.isTradeableIdea(noMech), false, '"none" must never trade');
+  eq(engine.venus.isTradeableIdea(noCp), false, 'no counterparty means no mechanism');
+  eq(engine.venus.isTradeableIdea(null), false, 'null must not crash or pass');
+});
+check('the real pipeline drops mechanism-less ideas end-to-end', () => {
+  // Drives recsFromParsed — the ACTUAL function analyze() delegates to — so this
+  // covers validate -> calibrate -> mechanism gate -> dedupe without a network call.
+  const out = engine.venus.recsFromParsed([
+    { symbol: 'AAA', direction: 'long', conviction: 0.9, catalyst: 'earnings',
+      mechanism: 'forced_flow', counterparty: 'index funds forced to sell on deletion' },
+    { symbol: 'BBB', direction: 'long', conviction: 0.95, catalyst: 'earnings' },          // no mechanism
+    { symbol: 'CCC', direction: 'long', conviction: 0.95, catalyst: 'earnings',
+      mechanism: 'underreaction', counterparty: 'x' }                                       // no counterparty
+  ]);
+  const syms = out.map(r => r.symbol);
+  ok(syms.includes('AAA'), 'the idea WITH a counterparty must survive');
+  ok(!syms.includes('BBB'), 'no mechanism must be dropped even at 0.95 conviction');
+  ok(!syms.includes('CCC'), 'no counterparty must be dropped even at 0.95 conviction');
+  eq(out.length, 1, `expected exactly 1 tradeable idea, got ${out.length}`);
+});
+check('every tradeable mechanism is a known mechanism', () => {
+  for (const m of engine.venus.TRADEABLE_MECHANISMS) {
+    ok(engine.venus.MECHANISMS.has(m), `${m} not in the MECHANISMS set`);
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+group('COST CEILING — refuse stocks that are too expensive to trade');
+check('an over-priced round trip is rejected', () => {
+  // Built inline rather than via planWith(), which is declared further down the file
+  // and would be in the temporal dead zone here.
+  const p = { ticker: 'X', direction: 'LONG', entryPrice: 20, shares: 10,
+              stop: { price: 18.68, frac: 0.066 }, target: { price: 22.76, frac: 0.138 },
+              rewardRisk: 0.138 / 0.066, cost: 0.02, atrFrac: 0.03,
+              netRewardRisk: I.netRewardRisk(0.138, 0.066, 0.02), targetCostRatio: 0.138 / 0.02 };
+  ok(p.netRewardRisk >= I.STRATEGY.MIN_RR_NET, 'setup: net R:R must pass so the cost gate is what fires');
+  ok(p.targetCostRatio >= I.STRATEGY.MIN_TARGET_COST_RATIO, 'setup: cost-ratio gate must pass');
+  ok(p.atrFrac >= I.STRATEGY.MIN_ATR_ENTRY, 'setup: ATR gate must pass');
+  const v = I.terraValidateTrade(p);
+  eq(v.approved, false);
+  ok(/round-trip cost|too expensive/i.test(v.reason), `reason was: ${v.reason}`);
+});
+check('the ceiling sits above the typical cost so it trims the tail, not the body', () => {
+  const c = I.STRATEGY.MAX_ROUND_TRIP_COST;
+  ok(c > 0.003 && c <= 0.01, `ceiling ${c} should exclude expensive names without stopping trading`);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 group('TRADE ECONOMICS — costs must be in the gate, not just the geometry');
 check('spread model is microstructure-realistic, not session-range-driven', () => {
   // Was `0.25% + sessionRange*0.5`, which modelled a 3%-range day as a 1.5% bid-ask.
