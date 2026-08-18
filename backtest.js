@@ -39,13 +39,16 @@ if (flag('--help') || flag('-h')) {
     .split('\n').slice(1).filter(l => l.startsWith('//')).map(l => l.replace(/^\/\/ ?/, '')).join('\n'));
   process.exit(0);
 }
-const DAYS     = Math.max(1, Math.min(60, parseInt(arg('--days', '5'), 10)));
+const BARS     = arg('--bars', '1Min');                              // 1Min | 5Min | 1Hour | 1Day
+const DAILY    = /Day/i.test(BARS);
+const DAYS     = Math.max(1, Math.min(DAILY ? 900 : 60, parseInt(arg('--days', DAILY ? '500' : '5'), 10)));
 const CAPITAL  = Math.max(100, parseFloat(arg('--capital', '1000')));
 const VERBOSE  = flag('--verbose');
 const COSTS_ON = arg('--costs', '1') !== '0';
 const TF       = Math.max(1, parseInt(arg('--tf', '1'), 10));        // aggregate to N-minute bars
 const MIN_ATR  = parseFloat(arg('--minatr', '0'));                   // require this much volatility
 const MAX_ATR  = parseFloat(arg('--maxatr', '0'));                   // diagnostic: ONLY the quiet names
+const WARMUP   = 32;                                                 // bars of history before any decision
 const NEED_ADX = flag('--adx');                                      // trending regimes only
 const END_DATE = arg('--end', null);   // YYYY-MM-DD — test a window the rule never saw
 const WF_WINDOWS = Math.max(2, parseInt(arg('--windows', '5'), 10));
@@ -74,7 +77,7 @@ function get(path) {
 async function fetchBars(sym, startISO, endISO) {
   const out = []; let token = null;
   do {
-    const q = `symbols=${sym}&timeframe=1Min&start=${encodeURIComponent(startISO)}&end=${encodeURIComponent(endISO)}` +
+    const q = `symbols=${sym}&timeframe=${BARS}&start=${encodeURIComponent(startISO)}&end=${encodeURIComponent(endISO)}` +
               `&limit=10000&adjustment=raw&feed=${FEED}&sort=asc` + (token ? `&page_token=${token}` : '');
     const j = await get(`/v2/stocks/bars?${q}`);
     const arr = (j && j.bars && j.bars[sym]) || [];
@@ -183,16 +186,18 @@ function replay(hist, usable, cfg, capital, verbose = false) {
       const bars = hist[sym];
       while (idx[sym] < bars.length && bars[idx[sym]].t <= t) idx[sym]++;
       const upto = idx[sym];
-      if (upto < 32) continue;
+      if (upto < WARMUP) continue;
       const bar = bars[upto - 1];
       if (bar.t !== t) continue;
 
       // Decision data EXCLUDES the current bar — no lookahead.
       const window = bars.slice(Math.max(0, upto - 61), upto - 1);
-      if (window.length < 30) continue;
+      if (window.length < WARMUP - 2) continue;
       I.candleData[sym] = { m1: window, m5: [] };
       I.marketData[sym] = {
-        price: window[window.length - 1].c, prevClose: window[0].o, dayOpen: window[0].o,
+        price: window[window.length - 1].c,
+        prevClose: window.length >= 2 ? window[window.length - 2].c : window[0].o,
+        dayOpen: window[window.length - 1].o,
         high: Math.max(...window.map(b => b.h)), low: Math.min(...window.map(b => b.l)),
         dailyVolume: window.reduce((s, b) => s + (b.v || 0), 0),
         lastUpdate: Date.now(), lastTradeTime: Date.now(),
@@ -293,22 +298,22 @@ function metrics(trades, equity, startCap) {
 // ── main ─────────────────────────────────────────────────────────────────────
 (async function main() {
   const end = END_DATE ? new Date(END_DATE + 'T20:00:00Z') : new Date();
-  const start = new Date(end.getTime() - DAYS * 24 * 3600 * 1000 * 1.6);
-  console.log(`\n🔬  ATLAS backtest — ${SYMBOLS.length} symbols, ~${DAYS} trading days, feed=${FEED}, costs ${COSTS_ON?'ON':'OFF'}`);
+  const start = new Date(end.getTime() - DAYS * 24 * 3600 * 1000 * (DAILY ? 1.0 : 1.6));
+  console.log(`\n🔬  ATLAS backtest — ${SYMBOLS.length} symbols, ~${DAYS} trading days, feed=${FEED}, bars=${BARS}, costs ${COSTS_ON?'ON':'OFF'}`);
   console.log(`    ${start.toISOString().slice(0,10)} → ${end.toISOString().slice(0,10)}`);
 
   if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR);
   const hist = {};
   for (const s of SYMBOLS) {
-    const cf = `${CACHE_DIR}/${s}-${DAYS}d-${FEED}-${end.toISOString().slice(0,10)}.json`;
+    const cf = `${CACHE_DIR}/${s}-${BARS}-${DAYS}d-${FEED}-${end.toISOString().slice(0,10)}.json`;
     if (fs.existsSync(cf)) { hist[s] = JSON.parse(fs.readFileSync(cf,'utf8')); process.stdout.write(`    ${s} (cached) `); }
     else { process.stdout.write(`    fetching ${s} … `); hist[s] = await fetchBars(s, start.toISOString(), end.toISOString());
            try { fs.writeFileSync(cf, JSON.stringify(hist[s])); } catch {} }
     console.log(`${hist[s].length} bars`);
-    if (TF > 1) hist[s] = aggregate(hist[s], TF);
+    if (TF > 1 && !DAILY) hist[s] = aggregate(hist[s], TF);
   }
   if (TF > 1) console.log(`    → aggregated to ${TF}-minute bars`);
-  const usable = SYMBOLS.filter(s => hist[s].length >= 60);
+  const usable = SYMBOLS.filter(s => hist[s].length >= WARMUP + 20);
   if (!usable.length) { console.error('\n✖ Not enough bars. Try --days 20 or a paid sip feed.\n'); process.exit(1); }
 
   const S = I.STRATEGY;
