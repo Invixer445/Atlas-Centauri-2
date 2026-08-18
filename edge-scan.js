@@ -152,6 +152,71 @@ for (const g of [0.03, 0.05]) {
   results.push(stats(`buy gap-down >${(g*100)}%`, r2, 0));
 }
 
+// 7. CROSS-SECTIONAL RELATIVE STRENGTH — genuinely different from everything above.
+//    Every earlier test compared a stock to its OWN past. This ranks stocks AGAINST
+//    EACH OTHER on the same day and buys the leaders / sells the laggards. That is the
+//    basis of real momentum funds, and it is a different question: not "is this stock
+//    going up?" but "is this stock going up MORE than its peers?"
+for (const [look, hold] of [[20, 5], [60, 10], [10, 3]]) {
+  const winners = [], losers = [];
+  const anyLen = Math.min(...syms.map(s => data[s].length));
+  for (let i = look; i < anyLen - hold; i++) {
+    const ranked = syms.map(s => {
+      const b = data[s];
+      return { s, past: (b[i].c - b[i - look].c) / b[i - look].c, fwd: (b[i + hold].c - b[i].c) / b[i].c };
+    }).filter(x => Number.isFinite(x.past) && Number.isFinite(x.fwd));
+    if (ranked.length < 8) continue;
+    ranked.sort((a2, b2) => b2.past - a2.past);
+    const k = Math.max(1, Math.floor(ranked.length / 4));      // top / bottom quartile
+    for (let j = 0; j < k; j++) winners.push(ranked[j].fwd);
+    for (let j = ranked.length - k; j < ranked.length; j++) losers.push(ranked[j].fwd);
+  }
+  results.push(stats(`X-SECT buy leaders ${look}d hold ${hold}d`, winners, hold));
+  results.push(stats(`X-SECT buy laggards ${look}d hold ${hold}d`, losers, hold));
+}
+
+// 8. DONCHIAN BREAKOUT — buy a new N-day high. A classic trend-following entry that is
+//    structurally different from an EMA crossover (level-based, not average-based).
+for (const [look, hold] of [[20, 10], [55, 20]]) {
+  const r = [];
+  for (const s of syms) { const b = data[s];
+    for (let i = look; i < b.length - hold; i++) {
+      const hi = Math.max(...b.slice(i - look, i).map(x => x.h));
+      if (b[i].c > hi) r.push((b[i + hold].c - b[i].c) / b[i].c);
+    }
+  }
+  results.push(stats(`donchian ${look}d high, hold ${hold}d`, r, hold));
+}
+
+// 9. VOLUME SURGE + PRICE — big volume is where information arrives. Does a volume
+//    spike with an up-close predict continuation?
+{
+  const r = [];
+  for (const s of syms) { const b = data[s];
+    for (let i = 21; i < b.length - 5; i++) {
+      const avg = b.slice(i - 20, i).reduce((a2, x) => a2 + (x.v || 0), 0) / 20;
+      if (avg > 0 && (b[i].v || 0) > 3 * avg && b[i].c > b[i].o) r.push((b[i + 5].c - b[i].c) / b[i].c);
+    }
+  }
+  results.push(stats('volume 3x + up day, hold 5d', r, 5));
+}
+
+// 10. STRETCHED FROM THE MEAN — distance from a 20-day average. Tests mean-reversion
+//     and trend in the same measure, on a level rather than a crossover.
+for (const [z, hold, dir] of [[-0.10, 5, 'below'], [0.10, 5, 'above']]) {
+  const r = [];
+  for (const s of syms) { const b = data[s];
+    for (let i = 21; i < b.length - hold; i++) {
+      const ma = b.slice(i - 20, i).reduce((a2, x) => a2 + x.c, 0) / 20;
+      if (ma <= 0) continue;
+      const dist = (b[i].c - ma) / ma;
+      const hit = z < 0 ? dist <= z : dist >= z;
+      if (hit) r.push((b[i + hold].c - b[i].c) / b[i].c);
+    }
+  }
+  results.push(stats(`${dir} 20d-MA by 10%, hold ${hold}d`, r, hold));
+}
+
 // 6. BUY-AND-HOLD baseline — the return you get for doing nothing. Any strategy
 //    must beat THIS, not merely beat zero.
 {
@@ -214,6 +279,19 @@ splitTest('buy gap-down >3%', (b, lo, hi, r) => {
     if (gap <= -0.03) r.push((b[i].c - b[i].o) / b[i].o);
   }
 }, 0);
+splitTest('above 20dMA +10% h5d', (b, lo, hi, r) => {
+  for (let i = Math.max(lo, 21); i < hi - 5; i++) {
+    const ma = b.slice(i - 20, i).reduce((a2, x) => a2 + x.c, 0) / 20;
+    if (ma > 0 && (b[i].c - ma) / ma >= 0.10) r.push((b[i + 5].c - b[i].c) / b[i].c);
+  }
+}, 5);
+splitTest('X-SECT leaders 20d h5d', (b, lo, hi, r) => {
+  // per-symbol proxy: own 20d momentum, for a like-for-like persistence read
+  for (let i = Math.max(lo, 21); i < hi - 5; i++) {
+    const past = (b[i].c - b[i - 20].c) / b[i - 20].c;
+    if (past >= 0.10) r.push((b[i + 5].c - b[i].c) / b[i].c);
+  }
+}, 5);
 splitTest('buy gap-down >5%', (b, lo, hi, r) => {
   for (let i = Math.max(lo, 1); i < hi; i++) {
     const gap = (b[i].o - b[i - 1].c) / b[i - 1].c;
