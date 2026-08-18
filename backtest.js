@@ -319,9 +319,10 @@ function metrics(trades, equity, startCap) {
 
   const S = I.STRATEGY;
   if (arg('--minrr', null)) S.MIN_RR_NET = parseFloat(arg('--minrr'));
+  if (arg('--trail', null)) S.ATR_TRAIL_MULT = parseFloat(arg('--trail'));
   if (arg('--tcr', null))   S.MIN_TARGET_COST_RATIO = parseFloat(arg('--tcr'));
   const base = { stopMult: S.ATR_STOP_MULT, targetMult: S.ATR_TARGET_MULT,
-                 trailMult: S.ATR_TRAIL_MULT, trailArmR: 1.0, costsOn: COSTS_ON,
+                 trailMult: S.ATR_TRAIL_MULT, trailArmR: parseFloat(arg('--arm','1.0')), costsOn: COSTS_ON,
                  realistic: !flag('--optimistic') };
   console.log(`    execution model: ${base.realistic ? 'REALISTIC (adverse selection + gap slippage + intrabar stops)' : 'OPTIMISTIC'}`);
 
@@ -399,6 +400,76 @@ function metrics(trades, equity, startCap) {
     console.log(NET > 0 && profitable > rows.length / 2
       ? '  Edge persists across windows. Still not proof — but not a single-window fluke.\n'
       : '  ❌ NO PERSISTENT EDGE. Profitable windows do not outweigh losing ones.\n     A configuration that wins in some regimes and loses badly in others is not\n     an edge — it is exposure to whichever regime happens to arrive.\n');
+    process.exit(0);
+  }
+
+  // ── WALK-FORWARD OPTIMISATION — the only projection worth quoting ──────────
+  // Tuning parameters on the same data you then report is how every fake backtest is
+  // built: it fits the noise in that period and predicts nothing. This instead splits
+  // the history into sequential blocks and, for each one, chooses parameters using
+  // ONLY the blocks before it, then trades the next block untouched. Every number
+  // reported is out-of-sample by construction — it is what you would actually have
+  // earned trading forward with a rule chosen from the past.
+  if (flag('--optimize')) {
+    const grid = [];
+    for (const targetMult of [3.5, 4.6, 6.0])
+      for (const trailMult of [0.8, 1.2, 2.0])
+        for (const trailArmR of [1.0, 1.5, 2.5, 99])
+          grid.push({ targetMult, trailMult, trailArmR });
+
+    const blocks = Math.max(4, WF_WINDOWS);
+    const slice = (lo, hi) => {
+      const sub = {};
+      for (const sym of usable) {
+        const b = hist[sym];
+        sub[sym] = b.slice(Math.floor(b.length * lo), Math.floor(b.length * hi));
+      }
+      return sub;
+    };
+
+    console.log(`\n  Walk-forward optimisation: ${grid.length} configs, ${blocks} blocks.`);
+    console.log('  Each block is traded with the config that was best on ALL PRIOR blocks only.\n');
+    console.log('  block   chosen config (tgt/trail/arm)   trades   win%   expectancy      net%');
+    console.log('  ' + '─'.repeat(74));
+
+    let pooledNet = 0, pooledN = 0, blocksProfitable = 0, blocksTested = 0;
+    for (let k = 1; k < blocks; k++) {
+      // TRAIN on everything before this block
+      const trainHist = slice(0, k / blocks);
+      const trainUse = usable.filter(s => trainHist[s].length >= WARMUP + 20);
+      if (!trainUse.length) continue;
+      let best = null;
+      for (const g of grid) {
+        const cfg = { ...base, ...g };
+        const r = replay(trainHist, trainUse, cfg, CAPITAL);
+        const m = metrics(r.trades, r.equity, CAPITAL);
+        if (m.n < 10) continue;                       // ignore configs with no evidence
+        if (!best || m.expectancy > best.m.expectancy) best = { g, m };
+      }
+      if (!best) { console.log(`  ${k}       (no config had enough training trades)`); continue; }
+
+      // TEST on the next block, which the optimiser never saw
+      const testHist = slice(k / blocks, (k + 1) / blocks);
+      const testUse = usable.filter(s => testHist[s].length >= WARMUP + 20);
+      if (!testUse.length) continue;
+      const rt = replay(testHist, testUse, { ...base, ...best.g }, CAPITAL);
+      const mt = metrics(rt.trades, rt.equity, CAPITAL);
+      pooledNet += mt.net; pooledN += mt.n; blocksTested++;
+      if (mt.net > 0) blocksProfitable++;
+      const cfgTxt = `${best.g.targetMult}/${best.g.trailMult}/${best.g.trailArmR === 99 ? 'off' : best.g.trailArmR + 'R'}`;
+      console.log('  ' + String(k).padEnd(8) + cfgTxt.padEnd(30) + String(mt.n).padStart(6) +
+        (mt.n ? (mt.wr * 100).toFixed(0) : '—').padStart(7) + '%' +
+        ('$' + mt.expectancy.toFixed(2)).padStart(13) +
+        ((mt.net / CAPITAL * 100).toFixed(1) + '%').padStart(10) + (mt.net > 0 ? '' : '   LOSS'));
+    }
+    console.log('  ' + '─'.repeat(74));
+    console.log(`  OUT-OF-SAMPLE POOLED: ${pooledN} trades, net $${pooledNet.toFixed(2)}, ` +
+                `expectancy $${(pooledN ? pooledNet / pooledN : 0).toFixed(2)}/trade`);
+    console.log(`  Profitable in ${blocksProfitable} of ${blocksTested} forward blocks`);
+    console.log('  ' + '─'.repeat(74));
+    console.log(pooledNet > 0 && blocksProfitable > blocksTested / 2
+      ? '\n  This is a real out-of-sample result. Parameters were never fitted to the\n  periods they were scored on. Still one asset universe and one history.\n'
+      : '\n  ❌ Optimising on the past did NOT produce profit going forward.\n     The best-performing rule in each period failed to carry into the next,\n     which means the "best" rule was fitting noise, not finding structure.\n');
     process.exit(0);
   }
 
