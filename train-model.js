@@ -30,6 +30,7 @@ const argv = process.argv.slice(2);
 const arg = (n, d) => { const i = argv.indexOf(n); return i >= 0 && argv[i + 1] ? argv[i + 1] : d; };
 const flag = n => argv.includes(n);
 const SPLIT = Math.min(0.9, Math.max(0.5, parseFloat(arg('--split', '0.7'))));
+const RICH  = flag('--rich');   // extended feature set (see richFeatures)
 const CACHE = '.backtest-cache';
 
 const files = fs.existsSync(CACHE) ? fs.readdirSync(CACHE).filter(f => f.includes('-1Day-')) : [];
@@ -42,6 +43,26 @@ for (const f of files) {
 }
 const syms = Object.keys(data).filter(s => data[s].length >= 120);
 console.log(`\n🧠  MODEL TRAINING — ${syms.length} symbols, daily bars, ${(SPLIT*100).toFixed(0)}% train / ${((1-SPLIT)*100).toFixed(0)}% test\n`);
+
+// Cross-sectional momentum rank per date, precomputed once.
+const xsRankByDate = {};
+(function buildXsRanks() {
+  const byDate = {};
+  for (const sym of syms) {
+    const b = data[sym];
+    for (let i = 21; i < b.length; i++) {
+      const mom = (b[i].c - b[i - 20].c) / b[i - 20].c;
+      if (!Number.isFinite(mom)) continue;
+      (byDate[b[i].t] = byDate[b[i].t] || []).push({ sym, mom });
+    }
+  }
+  for (const t of Object.keys(byDate)) {
+    const arr = byDate[t].sort((a2, b2) => a2.mom - b2.mom);
+    xsRankByDate[t] = {};
+    arr.forEach((o, idx) => { xsRankByDate[t][o.sym] = arr.length > 1 ? idx / (arr.length - 1) : 0.5; });
+  }
+})();
+
 
 // ── build labelled samples ───────────────────────────────────────────────────
 // One sample per candidate setup: Jupiter's own feature vector at the moment of
@@ -84,7 +105,7 @@ for (const sym of syms) {
     if (label === null) continue;                       // unresolved — no clean label
 
     // Jupiter's OWN feature extractor, via a minimal harness.
-    const feats = featuresFor(sym, dir);
+    const feats = RICH ? richFeatures(sym, dir, bars, i, window) : featuresFor(sym, dir);
     if (!feats) continue;
     samples.push({ x: feats, y: label, t: bars[i].t, meta: { sym, i, atr: a, entry, dir } });
   }
@@ -118,6 +139,74 @@ function featuresFor(sym, direction) {
   return f.every(Number.isFinite) ? f : null;
 }
 
+// ── RICH FEATURES ────────────────────────────────────────────────────────────
+// The baseline model scored AUC 0.63 using only SIX live features — jupiterConv,
+// catalystEdge, session and regimeAlign are all hardcoded to zero in historical
+// replay, because Venus signals and intraday session context do not exist here.
+// So the measured signal came from a crippled model. These are inputs that ARE
+// computable from history and that it has never seen:
+//   • where price sits inside its recent range (extension vs exhaustion)
+//   • distance from the 20-day mean (stretch)
+//   • whether volatility is expanding or contracting
+//   • volume relative to its own recent norm
+//   • CROSS-SECTIONAL rank — how this stock is doing versus its peers TODAY, which
+//     is a different question from anything the old feature set asked
+const RICH_NAMES = ['adx','atr','rvol','rsiAlign','momAlign','spread',
+                    'rangePos','maStretch','volExpand','volRatio','xsRank','trendAge'];
+
+function richFeatures(sym, direction, bars, i, window) {
+  const dir = direction === 'SHORT' ? -1 : 1;
+  const clip = (x, lo, hi) => (x < lo ? lo : x > hi ? hi : x);
+  const q = I.marketData[sym];
+  const adxData = I.calculateADX(sym);
+  const adx = adxData && Number.isFinite(adxData.adx) ? adxData.adx : 18;
+  const atr = I.atrPct(sym);
+  const rvol = I.calculateRVOL(sym);
+  const rsi = I.rsi(q.history || [], S.RSI_PERIOD);
+  const mom = (q.prevClose > 0) ? (q.price - q.prevClose) / q.prevClose : 0;
+  const spread = I.estimateDynamicSpread(sym);
+
+  const last20 = window.slice(-20);
+  const hi20 = Math.max(...last20.map(b => b.h)), lo20 = Math.min(...last20.map(b => b.l));
+  const px = q.price;
+  const rangePos = hi20 > lo20 ? (px - lo20) / (hi20 - lo20) : 0.5;          // 0=low, 1=high
+  const ma20 = last20.reduce((a2, b) => a2 + b.c, 0) / last20.length;
+  const maStretch = ma20 > 0 ? (px - ma20) / ma20 : 0;
+  const recentVol = stdOf(last20.slice(-5).map(b => b.c));
+  const olderVol  = stdOf(last20.map(b => b.c));
+  const volExpand = olderVol > 0 ? recentVol / olderVol : 1;
+  const avgVol = last20.reduce((a2, b) => a2 + (b.v || 0), 0) / last20.length;
+  const volRatio = avgVol > 0 ? (bars[i - 1].v || 0) / avgVol : 1;
+  const xs = (xsRankByDate[bars[i - 1].t] || {})[sym];
+  const xsRank = Number.isFinite(xs) ? xs : 0.5;
+  // How long the current direction has persisted, as an exhaustion proxy.
+  let age = 0;
+  for (let k = window.length - 1; k > 0 && age < 10; k--) {
+    if ((window[k].c > window[k - 1].c) === (dir > 0)) age++; else break;
+  }
+
+  const f = [
+    clip((adx - 20) / 30, -1, 1),
+    clip((atr - 0.02) / 0.03, -1, 1),
+    clip((rvol - 1) / 1.5, -1, 1),
+    clip((dir * (rsi - 50)) / 50, -1, 1),
+    clip(dir * mom * 20, -1, 1),
+    clip((spread - 0.001) / 0.002, -1, 1),
+    clip((rangePos - 0.5) * 2 * dir, -1, 1),
+    clip(dir * maStretch * 10, -1, 1),
+    clip((volExpand - 1) * 2, -1, 1),
+    clip((volRatio - 1), -1, 1),
+    clip((xsRank - 0.5) * 2 * dir, -1, 1),
+    clip((age / 5) - 1, -1, 1)
+  ];
+  return f.every(Number.isFinite) ? f : null;
+}
+function stdOf(a) {
+  if (a.length < 2) return 0;
+  const m = a.reduce((x, y) => x + y, 0) / a.length;
+  return Math.sqrt(a.reduce((x, y) => x + (y - m) ** 2, 0) / (a.length - 1));
+}
+
 if (samples.length < 200) { console.error(`✖ Only ${samples.length} labelled setups — not enough to train.`); process.exit(1); }
 samples.sort((a, b) => a.t - b.t);                       // chronological, so the split is a real time split
 const cut = Math.floor(samples.length * SPLIT);
@@ -129,8 +218,10 @@ console.log(`  win rate overall: ${(samples.reduce((a, s) => a + s.y, 0) / sampl
 console.log(`  win rate in test: ${(baseRate * 100).toFixed(1)}%   <-- always guessing "win" scores this\n`);
 
 // ── train ────────────────────────────────────────────────────────────────────
-const res = engine.trainLogisticBatch(train.map(s => ({ x: s.x, y: s.y })), 10,
-  { epochs: 40, valSplit: 0.2, lr: 0.05, l2: 0.002, names: engine.jupiter.FEATURES });
+const DIM = RICH ? RICH_NAMES.length : 10;
+const res = engine.trainLogisticBatch(train.map(s => ({ x: s.x, y: s.y })), DIM,
+  { epochs: 40, valSplit: 0.2, lr: 0.05, l2: 0.002,
+    names: RICH ? RICH_NAMES : engine.jupiter.FEATURES });
 const model = res.model;
 
 // ── score on data it has never seen ──────────────────────────────────────────

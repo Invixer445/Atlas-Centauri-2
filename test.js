@@ -356,6 +356,32 @@ check('summary reports the 43% threshold that erases the measured edge', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+group('CRASH HANDLER — a tool crashing must not wipe the live state file');
+check('server.js is imported here, so it must NOT own the state file', () => {
+  // Observed for real: a ReferenceError in train-model.js triggered server.js's
+  // uncaughtException handler, which called saveStateSync() and overwrote
+  // atlas-solar-state.json with the module's pristine defaults — cash 1000, no
+  // positions, untrained models. Any tool that imports the engine could silently
+  // destroy accumulated learning.
+  // server.js must not be the entry point — it is a library here.
+  ok(require.main.filename !== require.resolve('./server.js'),
+     'server.js is the entry point; the state-file guard would not apply');
+  ok(typeof I.cancelPendingSave === 'function', 'the debounced-save escape hatch must exist');
+});
+check('saveStateSync exists but is not invoked on import', () => {
+  // The guard is `require.main === module` inside the handler. If that check is
+  // removed, this suite (and every other tool) becomes able to clobber real state.
+  const src = require('fs').readFileSync('server.js', 'utf8');
+  const handler = src.slice(src.indexOf("process.on('uncaughtException'"));
+  const body = handler.slice(0, handler.indexOf('});'));
+  ok(/require\.main === module/.test(body),
+     'uncaughtException must guard saveStateSync behind require.main === module');
+  const saveIdx = body.indexOf('saveStateSync');
+  const guardIdx = body.indexOf('require.main === module');
+  ok(guardIdx >= 0 && guardIdx < saveIdx, 'the guard must come BEFORE the save');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 group('VENUS MECHANISMS — an idea needs a counterparty, not a pattern');
 // Six pattern-based strategies were backtested on this universe and none had a
 // persistent edge. A tradeable idea must name WHO loses and WHY.

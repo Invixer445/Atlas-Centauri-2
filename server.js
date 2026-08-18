@@ -5179,9 +5179,20 @@ process.on('unhandledRejection', (reason) => {
   console.error('[SAFETY] Unhandled promise rejection (survived):', reason && reason.message ? reason.message : reason);
 });
 process.on('uncaughtException', (err) => {
-  console.error('[SAFETY] Uncaught exception — saving state and exiting for a clean restart:', err && err.stack ? err.stack : err);
-  try { saveStateSync(); } catch (_) {}
-  process.exit(1);
+  console.error('[SAFETY] Uncaught exception:', err && err.stack ? err.stack : err);
+  // ONLY persist when this process is actually running the engine. server.js is also
+  // imported as a library by train.js, backtest.js, edge-scan.js, train-model.js and
+  // the test suite — and if one of THOSE crashed, this handler would write the module's
+  // pristine default state (cash 1000, no positions, untrained models) straight over
+  // the live state file, silently destroying accumulated learning. Observed for real:
+  // a ReferenceError in a training script reset atlas-solar-state.json.
+  if (require.main === module) {
+    console.error('[SAFETY] Saving state and exiting for a clean restart.');
+    try { saveStateSync(); } catch (_) {}
+    process.exit(1);
+  }
+  console.error('[SAFETY] Imported as a library — NOT touching the state file. Re-throwing.');
+  throw err;
 });
 
 // ════════════════════════════════════════════════════════════════════════════
