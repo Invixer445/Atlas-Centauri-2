@@ -445,6 +445,32 @@ check('every tradeable mechanism is a known mechanism', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+group('LONG-ONLY — the short book measured anti-predictive');
+check('shorts are rejected while LONG_ONLY is on', () => {
+  // Measured over 263 out-of-sample setups: gate-SHORT won 8.5% against a 32.4%
+  // break-even, while the opposite side of those setups won 65.9%.
+  const p = { ticker: 'X', direction: 'SHORT', entryPrice: 20, shares: 10,
+              stop: { price: 20.5, frac: 0.025 }, target: { price: 19, frac: 0.05 },
+              rewardRisk: 2, cost: 0.003, atrFrac: 0.02,
+              netRewardRisk: I.netRewardRisk(0.05, 0.025, 0.003), targetCostRatio: 0.05 / 0.003 };
+  ok(p.netRewardRisk >= I.STRATEGY.MIN_RR_NET, 'setup: economics must pass so DIRECTION is what fires');
+  const v = I.terraValidateTrade(p);
+  eq(v.approved, false);
+  ok(/short/i.test(v.reason), `reason was: ${v.reason}`);
+});
+check('the identical plan as a LONG is not rejected for direction', () => {
+  const p = { ticker: 'X', direction: 'LONG', entryPrice: 20, shares: 10,
+              stop: { price: 19.5, frac: 0.025 }, target: { price: 21, frac: 0.05 },
+              rewardRisk: 2, cost: 0.003, atrFrac: 0.02,
+              netRewardRisk: I.netRewardRisk(0.05, 0.025, 0.003), targetCostRatio: 0.05 / 0.003 };
+  const v = I.terraValidateTrade(p);
+  ok(!/short/i.test(v.reason || ''), `a LONG must never be rejected as a short: ${v.reason}`);
+});
+check('LONG_ONLY is a single switch, not a tuned number', () => {
+  eq(typeof I.LONG_ONLY, 'boolean', 'must be binary — a threshold would be fittable');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 group('COST CEILING — refuse stocks that are too expensive to trade');
 check('an over-priced round trip is rejected', () => {
   // Built inline rather than via planWith(), which is declared further down the file

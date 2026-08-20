@@ -332,6 +332,107 @@ const beatsBaseline = hasSignal && topBeatsBE;
     (best.exp > 0 ? '  <-- POSITIVE' : '  <-- still negative'));
 }
 
+// ── INVERSION TEST ─────────────────────────────────────────────────────────
+// The model's BOTTOM bucket wins 1.9% — those setups fail ~98% of the time. That is a
+// far stronger, cleaner signal than anything on the winning side (19-25%). We have
+// only ever used the model to pick winners. This asks the opposite question: if it is
+// near-certain a LONG here fails, does the SHORT win?
+//
+// It is NOT automatic. "Fails" means price hit -2.2xATR before +4.6xATR. The mirrored
+// trade needs price to reach -4.6xATR before +2.2xATR, which is a strictly harder bar.
+// So this is a real experiment, not an arithmetic identity.
+{
+  console.log('\n  ── INVERSION: take the OPPOSITE side of the model\'s worst-rated setups ──');
+  const ranked = test.map(sm => ({ sm, p: model.predict(sm.x) })).sort((a, b) => a.p - b.p);
+  console.log('  slice            n    normal win%   INVERTED win%   break-even   verdict');
+  const beWin = 1 / (1 + (S.ATR_TARGET_MULT / S.ATR_STOP_MULT));
+  // DIRECTION SPLIT — the decisive control. If the setups are overwhelmingly SHORT and
+  // the sample period ROSE, then "invert" simply means "go long" and the whole result is
+  // market beta wearing a disguise. This is the exact trap that killed four earlier
+  // "edges", so it gets checked before anything is believed.
+  {
+    const longs = ranked.filter(r => r.sm.meta.dir === 'LONG').length;
+    const shorts = ranked.length - longs;
+    console.log(`  [control] setup directions: ${longs} LONG / ${shorts} SHORT`);
+    // Win rate of inverting, split by original direction.
+    for (const d of ['LONG', 'SHORT']) {
+      const grp = ranked.filter(r => r.sm.meta.dir === d);
+      if (!grp.length) continue;
+      let inv = 0, ires = 0, norm = 0, nres = 0;
+      for (const { sm } of grp) {
+        const a2 = resolveDir(sm, d); if (a2 !== null) { nres++; if (a2 === 1) norm++; }
+        const flip = d === 'LONG' ? 'SHORT' : 'LONG';
+        const b2 = resolveDir(sm, flip); if (b2 !== null) { ires++; if (b2 === 1) inv++; }
+      }
+      console.log(`  [control] gate said ${d.padEnd(5)} (${grp.length}): as-is ${(nres?norm/nres*100:0).toFixed(1)}%  inverted ${(ires?inv/ires*100:0).toFixed(1)}%`);
+    }
+  }
+
+  // CONTROL: invert EVERY setup, not just the low-ranked ones. If this also wins ~65%,
+  // the model is contributing nothing — the strategy gate is simply backwards, which is
+  // a completely different (and much simpler) finding.
+  {
+    let inv = 0, ires = 0, norm = 0, nres = 0;
+    for (const { sm } of ranked) {
+      const a2 = resolveDir(sm, sm.meta.dir);
+      if (a2 !== null) { nres++; if (a2 === 1) norm++; }
+      const flip = sm.meta.dir === 'LONG' ? 'SHORT' : 'LONG';
+      const b2 = resolveDir(sm, flip);
+      if (b2 !== null) { ires++; if (b2 === 1) inv++; }
+    }
+    console.log('  ALL setups     ' + String(ranked.length).padStart(5) +
+      (nres ? (norm / nres * 100).toFixed(1) : '—').padStart(13) + '%' +
+      (ires ? (inv / ires * 100).toFixed(1) : '—').padStart(15) + '%' +
+      (beWin * 100).toFixed(1).padStart(12) + '%   <-- CONTROL');
+  }
+  // And the model's BEST-rated setups, inverted. If the model truly ranks direction,
+  // inverting its favourites should do WORSE than inverting its rejects.
+  {
+    const best = ranked.slice(-Math.max(20, Math.floor(ranked.length * 0.20)));
+    let inv = 0, ires = 0;
+    for (const { sm } of best) {
+      const flip = sm.meta.dir === 'LONG' ? 'SHORT' : 'LONG';
+      const b2 = resolveDir(sm, flip);
+      if (b2 !== null) { ires++; if (b2 === 1) inv++; }
+    }
+    console.log('  BEST 20% inv   ' + String(best.length).padStart(5) + '            —' +
+      (ires ? (inv / ires * 100).toFixed(1) : '—').padStart(15) + '%' +
+      (beWin * 100).toFixed(1).padStart(12) + '%   <-- should be LOW if model ranks');
+  }
+  for (const frac of [0.20, 0.30, 0.40]) {
+    const grp = ranked.slice(0, Math.max(20, Math.floor(ranked.length * frac)));
+    let norm = 0, inv = 0, nres = 0, ires = 0;
+    for (const { sm } of grp) {
+      const a2 = resolveDir(sm, sm.meta.dir);
+      if (a2 !== null) { nres++; if (a2 === 1) norm++; }
+      const flip = sm.meta.dir === 'LONG' ? 'SHORT' : 'LONG';
+      const b2 = resolveDir(sm, flip);
+      if (b2 !== null) { ires++; if (b2 === 1) inv++; }
+    }
+    const nw = nres ? norm / nres : 0, iw = ires ? inv / ires : 0;
+    console.log('  worst ' + (frac * 100).toFixed(0) + '%'.padEnd(10) + String(grp.length).padStart(5) +
+      (nw * 100).toFixed(1).padStart(13) + '%' + (iw * 100).toFixed(1).padStart(15) + '%' +
+      (beWin * 100).toFixed(1).padStart(12) + '%' + (iw > beWin ? '   PROFITABLE INVERTED' : ''));
+  }
+}
+
+// Resolve a sample in an arbitrary direction, same geometry.
+function resolveDir(sm, dir) {
+  const m = sm.meta; if (!m) return null;
+  const bars = data[m.sym]; if (!bars) return null;
+  const a = m.atr, entry = m.entry;
+  const stopPx = dir === 'LONG' ? entry * (1 - S.ATR_STOP_MULT * a) : entry * (1 + S.ATR_STOP_MULT * a);
+  const tgtPx  = dir === 'LONG' ? entry * (1 + S.ATR_TARGET_MULT * a) : entry * (1 - S.ATR_TARGET_MULT * a);
+  for (let j = m.i; j < Math.min(m.i + 12, bars.length); j++) {
+    const b = bars[j];
+    if (dir === 'LONG'  && b.l <= stopPx) return 0;
+    if (dir === 'SHORT' && b.h >= stopPx) return 0;
+    if (dir === 'LONG'  && b.h >= tgtPx)  return 1;
+    if (dir === 'SHORT' && b.l <= tgtPx)  return 1;
+  }
+  return null;
+}
+
 // Re-resolve one sample's outcome at a different target multiple.
 function resolveAt(sm, tgtMult) {
   const m = sm.meta; if (!m) return null;

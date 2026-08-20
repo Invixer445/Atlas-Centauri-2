@@ -2204,6 +2204,29 @@ const STRATEGY = {
   RISK_PER_TRADE_MAX:  0.030,  // 3.0% hard ceiling, ever
   KELLY_FRACTION:      0.25,   // ¼-Kelly overlay on measured edge
 };
+// ── LONG-ONLY (v11.24) ───────────────────────────────────────────────────────
+// The bot's SHORT book is systematically broken. Measured over 263 out-of-sample
+// setups: trades the gate called SHORT won 8.5% of the time against a 32.4%
+// break-even, while taking the opposite side of those same setups won 65.9%. It is
+// not a tuning problem — the short signal is anti-predictive.
+//
+// This is NOT a fitted parameter, and that distinction matters given how many
+// apparent edges here turned out to be curve-fitting:
+//   • ONE binary decision, no value to optimise
+//   • a structural prior that existed before the data: equities carry positive
+//     long-run drift (the equity risk premium), so shorting fights that drift
+//   • shorts additionally pay borrow (0.03-0.05%/day here) and carry unbounded loss
+//   • it REDUCES risk rather than reaching for return
+//
+// Measured across five 60-day windows: pooled -$119.77 -> +$128.49, and it rescues
+// the two worst windows. It also holds up in DOWN markets (lost 3.5% while the market
+// fell 8.3%), so it is not merely capturing a rising sample.
+//
+// HONEST CAVEAT, kept here so nobody rediscovers it as a win: the long-only bot still
+// UNDERPERFORMS simply buying and holding the same 20 stocks over these windows
+// (+$128 vs ~+$163). It reduces damage; it does not create alpha.
+const LONG_ONLY = (process.env.LONG_ONLY || 'on').toLowerCase() !== 'off';
+
 const STRATEGY_GATE_ENABLED = (process.env.STRATEGY_GATE || 'on').toLowerCase() !== 'off';
 const MEAN_REVERSION_ENABLED = (process.env.MEAN_REVERSION || 'on').toLowerCase() !== 'off';
 
@@ -4373,6 +4396,11 @@ function terraValidateTrade(plan) {
   if (plan.cost > STRATEGY.MAX_ROUND_TRIP_COST)
     return reject(`round-trip cost ${(plan.cost * 100).toFixed(2)}% above the ${(STRATEGY.MAX_ROUND_TRIP_COST * 100).toFixed(2)}% ceiling — too expensive to trade`);
 
+  // RULE 3.6 — direction. See LONG_ONLY: the short book measured 8.5% wins against a
+  // 32.4% break-even, i.e. anti-predictive, and shorting fights positive equity drift.
+  if (LONG_ONLY && direction === 'SHORT')
+    return reject('shorts disabled (LONG_ONLY) — the short signal measured anti-predictive');
+
   // RULE 4 — the full risk pipeline (Terra never opens a trade that breaks these)
   // Regular-trading-hours gate, belt-and-suspenders: evaluateAndTrade already refuses
   // to scan outside 9:30–16:00 ET, but Terra enforces the same invariant at the money
@@ -6352,6 +6380,7 @@ module.exports = {
     computeDrawdown, isEarningsBlackout, EARNINGS_BLACKOUT_ENABLED, START_CAPITAL,
     trimTrades, cancelPendingSave, refreshMarketCalendar, marketClosedReason, costTrackingSummary,
     resolveAiModel, GROQ_CHAT_PREFERENCE, aiModel: () => AI_MODEL,
+    LONG_ONLY,
     marketCalendar: () => marketCalendar, getCurrentMarket, getEasternTimeParts, resolveSession,
     atrQuality, hasReliableVolatility, MIN_CANDLES_FOR_ATR,
     releaseExpiredLossHalt, LOSS_HALT_MS, getKillSwitchReason, lossHaltReason,

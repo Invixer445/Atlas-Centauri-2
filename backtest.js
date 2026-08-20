@@ -250,6 +250,7 @@ function replay(hist, usable, cfg, capital, verbose = false) {
       if (NEED_ADX && gate.mode !== 'momentum-strong') { rej.adxFilter = (rej.adxFilter||0)+1; continue; }
       if (MIN_ATR > 0 && I.atrPct(sym) < MIN_ATR) { rej.minAtr = (rej.minAtr||0)+1; continue; }
       if (MAX_ATR > 0 && I.atrPct(sym) >= MAX_ATR) { rej.maxAtr = (rej.maxAtr||0)+1; continue; }
+      if (flag('--longonly') && !gate.longGate) { rej.shortSkipped = (rej.shortSkipped||0)+1; continue; }
       const dir = gate.longGate ? 'LONG' : 'SHORT';
 
       // Signal fires on the previous close; the first reachable price is THIS bar's open.
@@ -320,6 +321,7 @@ function metrics(trades, equity, startCap) {
   const S = I.STRATEGY;
   if (arg('--minrr', null)) S.MIN_RR_NET = parseFloat(arg('--minrr'));
   if (arg('--trail', null)) S.ATR_TRAIL_MULT = parseFloat(arg('--trail'));
+  if (arg('--atrfloor', null)) S.MIN_ATR_ENTRY = parseFloat(arg('--atrfloor'));
   if (arg('--tcr', null))   S.MIN_TARGET_COST_RATIO = parseFloat(arg('--tcr'));
   const base = { stopMult: S.ATR_STOP_MULT, targetMult: S.ATR_TARGET_MULT,
                  trailMult: S.ATR_TRAIL_MULT, trailArmR: parseFloat(arg('--arm','1.0')), costsOn: COSTS_ON,
