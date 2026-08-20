@@ -250,7 +250,12 @@ function replay(hist, usable, cfg, capital, verbose = false) {
       if (NEED_ADX && gate.mode !== 'momentum-strong') { rej.adxFilter = (rej.adxFilter||0)+1; continue; }
       if (MIN_ATR > 0 && I.atrPct(sym) < MIN_ATR) { rej.minAtr = (rej.minAtr||0)+1; continue; }
       if (MAX_ATR > 0 && I.atrPct(sym) >= MAX_ATR) { rej.maxAtr = (rej.maxAtr||0)+1; continue; }
-      if (flag('--longonly') && !gate.longGate) { rej.shortSkipped = (rej.shortSkipped||0)+1; continue; }
+      // Mirror the engine's LONG_ONLY gate. The harness does not call terraValidateTrade,
+      // so every live gate must be duplicated here explicitly or the backtest silently
+      // measures a DIFFERENT bot than the one that runs (this exact divergence hid the
+      // long-only change from the first evaluation run).
+      const longOnly = I.LONG_ONLY && !flag('--allowshorts');
+      if (longOnly && !gate.longGate) { rej.shortSkipped = (rej.shortSkipped||0)+1; continue; }
       const dir = gate.longGate ? 'LONG' : 'SHORT';
 
       // Signal fires on the previous close; the first reachable price is THIS bar's open.
@@ -281,6 +286,21 @@ function replay(hist, usable, cfg, capital, verbose = false) {
 
   S.ATR_STOP_MULT = savedStop; S.ATR_TARGET_MULT = savedTgt;
   return { trades, equity, rej, netRRSamples, costSamples, atrSamples };
+}
+
+// Equal-weight buy-and-hold over the same symbols and the same period. THE benchmark.
+// Judging a strategy against zero is how you convince yourself that market drift is
+// skill — it is the error that produced four false "edges" in this project. A strategy
+// that does not beat simply holding the same stocks is not worth running.
+function buyHoldReturn(hist, usable) {
+  let sum = 0, n = 0;
+  for (const sym of usable) {
+    const b = hist[sym];
+    if (!b || b.length < 2) continue;
+    const first = b[0].c, last = b[b.length - 1].c;
+    if (first > 0) { sum += (last - first) / first; n++; }
+  }
+  return n ? sum / n : 0;
 }
 
 function metrics(trades, equity, startCap) {
@@ -507,6 +527,11 @@ function metrics(trades, equity, startCap) {
   console.log(`  Net P&L               ${usd(m.net)} on ${usd(CAPITAL)} = ${pct(m.net/CAPITAL)}`);
   console.log(`  Max drawdown          ${pct(m.maxDD)}`);
   console.log(`  Paid in costs         ${usd(m.totalCost)}`);
+  const bh = buyHoldReturn(hist, usable);
+  const bhDollars = bh * CAPITAL;
+  console.log('  ' + '─'.repeat(60));
+  console.log(`  BUY & HOLD same stocks ${usd(bhDollars)}  (${pct(bh)})   <-- the real benchmark`);
+  console.log(`  STRATEGY vs BUY&HOLD   ${usd(m.net - bhDollars)}   ${m.net > bhDollars ? 'strategy wins' : 'JUST HOLDING WINS'}`);
   console.log('═'.repeat(64));
   console.log(m.expectancy > 0 && m.pf > 1.1 ? '  ✅ POSITIVE expectancy on this sample. Worth paper-trading — not proof.'
     : m.expectancy > 0 ? '  ⚠️  Barely positive — inside noise. Do not size up.'
