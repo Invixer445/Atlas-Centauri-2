@@ -819,23 +819,142 @@ function recsFromParsed(parsed) {
   return Object.values(bySymbol).slice(0, 6);
 }
 
+// ── Robust JSON-array extraction from an LLM response ───────────────────────
+// The old version did indexOf('[') … lastIndexOf(']') and one JSON.parse. That
+// throws away a usable answer in four failure modes seen live:
+//   1. the model wraps the array — {"recommendations":[…]} — very common
+//   2. prose after the array containing a ']' , or a truncated response where the
+//      last ']' closes a NESTED array rather than the outer one
+//   3. a trailing comma before the closing bracket (models emit these constantly)
+//   4. the response is cut off mid-array by a token limit, so nothing parses even
+//      though 9 complete objects are sitting right there
+// Each of those used to cost a whole research cycle. Returns an array or null.
+function extractJsonArray(text) {
+  if (typeof text !== 'string' || !text) return null;
+  const cleaned = text.replace(/<think>[\s\S]*?<\/think>/g, '')
+                      .replace(/```(?:json)?/gi, '').trim();
+
+  const asArray = (v) => {
+    if (Array.isArray(v)) return v;
+    // (1) unwrap a single-property object whose value is the array
+    if (v && typeof v === 'object') {
+      for (const k of ['recommendations','recs','ideas','results','items','data','output']) {
+        if (Array.isArray(v[k])) return v[k];
+      }
+      const arrays = Object.values(v).filter(Array.isArray);
+      if (arrays.length === 1) return arrays[0];
+    }
+    return null;
+  };
+
+  // Fast path: the whole thing is valid JSON.
+  try { const a = asArray(JSON.parse(cleaned)); if (a) return a; } catch {}
+
+  // (2) Bracket-match from the first '[' so prose or nested arrays cannot fool us.
+  // Tracks string state so a bracket inside a quoted value is not counted.
+  // NOTE: mutation testing shows this string tracking is defence-in-depth, not
+  // load-bearing — removing it does not fail the suite, because stage (4) below
+  // recovers the same objects. The salvage loop's string tracking IS load-bearing
+  // and is covered by a test. Don't assume this branch is protected by one.
+  const scanFrom = (open, close) => {
+    const s = cleaned.indexOf(open);
+    if (s === -1) return null;
+    let depth = 0, inStr = false, esc = false;
+    for (let i = s; i < cleaned.length; i++) {
+      const c = cleaned[i];
+      if (esc) { esc = false; continue; }
+      if (c === '\\') { esc = true; continue; }
+      if (c === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (c === open) depth++;
+      else if (c === close) { depth--; if (depth === 0) return cleaned.slice(s, i + 1); }
+    }
+    return null;                                   // unbalanced → truncated
+  };
+  for (const [o, c] of [['[', ']'], ['{', '}']]) {
+    const frag = scanFrom(o, c);
+    if (!frag) continue;
+    try { const a = asArray(JSON.parse(frag)); if (a) return a; } catch {}
+    // (3) strip trailing commas and retry
+    try { const a = asArray(JSON.parse(frag.replace(/,\s*([\]}])/g, '$1'))); if (a) return a; } catch {}
+  }
+
+  // (4) Salvage: pull every complete top-level {...} object out of a truncated
+  // array. A partial answer beats discarding the cycle's whole LLM call.
+  const objs = [];
+  let depth = 0, start = -1, inStr = false, esc = false;
+  for (let i = 0; i < cleaned.length; i++) {
+    const c = cleaned[i];
+    if (esc) { esc = false; continue; }
+    if (c === '\\') { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === '{') { if (depth === 0) start = i; depth++; }
+    else if (c === '}') {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        const frag = cleaned.slice(start, i + 1);
+        try { objs.push(JSON.parse(frag)); }
+        catch { try { objs.push(JSON.parse(frag.replace(/,\s*([\]}])/g, '$1'))); } catch {} }
+        start = -1;
+      }
+    }
+  }
+  return objs.length ? objs : null;
+}
+
+// Object counterpart of extractJsonArray, for the shared llmReason() path.
+function extractJsonObject(text) {
+  if (typeof text !== 'string' || !text) return null;
+  const cleaned = text.replace(/<think>[\s\S]*?<\/think>/g, '')
+                      .replace(/```(?:json)?/gi, '').trim();
+  const ok = (v) => (v && typeof v === 'object' && !Array.isArray(v)) ? v : null;
+  try { const v = ok(JSON.parse(cleaned)); if (v) return v; } catch {}
+
+  const s = cleaned.indexOf('{');
+  if (s === -1) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = s; i < cleaned.length; i++) {
+    const c = cleaned[i];
+    if (esc) { esc = false; continue; }
+    if (c === '\\') { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) {
+        const frag = cleaned.slice(s, i + 1);
+        try { const v = ok(JSON.parse(frag)); if (v) return v; } catch {}
+        try { const v = ok(JSON.parse(frag.replace(/,\s*([\]}])/g, '$1'))); if (v) return v; } catch {}
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
 // ── Main entry: analyze articles → calibrated recommendations ───────────────
 async function analyze(articles) {
   if (!PROVIDER) return { ok:false, error:'no-api-key (set GROQ_API_KEY or ANTHROPIC_API_KEY)' };
   if (!Array.isArray(articles) || articles.length === 0) return { ok:true, recommendations: [], usage: null };
 
   const prompt = buildPrompt(articles.slice(0, 15));
-  const r = PROVIDER === 'groq' ? await callGroq(prompt) : await callAnthropic(prompt);
+  const call = () => PROVIDER === 'groq' ? callGroq(prompt) : callAnthropic(prompt);
+
+  let r = await call();
   if (!r.ok) return { ok:false, error: r.error };
 
-  const cleaned = r.text.replace(/<think>[\s\S]*?<\/think>/g, '').replace(/```json|```/g, '').trim();
-  const start = cleaned.indexOf('['), end = cleaned.lastIndexOf(']');
-  if (start === -1 || end === -1 || end < start) return { ok:false, error:'no-json-array-in-response' };
-
-  let parsed;
-  try { parsed = JSON.parse(cleaned.slice(start, end + 1)); }
-  catch (e) { return { ok:false, error:'unparseable-json' }; }
-  if (!Array.isArray(parsed)) return { ok:false, error:'not-an-array' };
+  let parsed = extractJsonArray(r.text);
+  // ONE retry, and only for a malformed body — never for a rate limit or a
+  // transport error, where an immediate second call makes the problem worse.
+  if (!parsed) {
+    console.warn('[VENUS] Response was not parseable JSON — retrying once');
+    r = await call();
+    if (!r.ok) return { ok:false, error: r.error };
+    parsed = extractJsonArray(r.text);
+  }
+  if (!parsed) return { ok:false, error:'unparseable-json' };
 
   const recommendations = recsFromParsed(parsed);
   return { ok:true, recommendations, usage: r.usage || null, model: AI_MODEL, provider: PROVIDER };
@@ -2900,6 +3019,21 @@ function aiCallsThisHour() {
   return aiCallLog.length;
 }
 
+// ── LLM CALL BUDGET (v11.25) ────────────────────────────────────────────────
+// Every cycle fired THREE LLM calls: news analysis, Venus posture, Jupiter
+// self-check. At NEWS_POLL_MS=5min that is 12 cycles × 3 = 36 calls/hour against
+// a 40/hour budget — so the budget was exhausted mid-hour and the log filled with
+// "Call budget reached … articles queued for next cycle" on nearly every cycle.
+//
+// The three calls are NOT equally urgent. News analysis is time-critical: a
+// catalyst is worth acting on for minutes. Market posture and the risk self-check
+// describe slow-moving state — running them every 5 minutes re-derives an answer
+// that has not changed. Throttling those two to ~20 minutes cuts the cycle from
+// 36 to ~18 calls/hour and hands the headroom to the call that actually decays.
+const POSTURE_MIN_INTERVAL_MS   = Math.max(60000, parseInt(process.env.POSTURE_MIN_INTERVAL_MS   || '1200000', 10)); // 20 min
+const SELFCHECK_MIN_INTERVAL_MS = Math.max(60000, parseInt(process.env.SELFCHECK_MIN_INTERVAL_MS || '1200000', 10)); // 20 min
+let _lastPostureAt = 0, _lastSelfCheckAt = 0;
+
 // ── Shared LLM reasoning, budget-aware, used by BOTH engines for genuine reasoning
 //    that goes beyond fixed rules. Returns parsed JSON, or null when there's no API
 //    key / the hourly budget is spent / the response won't parse — in every such case
@@ -2919,12 +3053,9 @@ async function llmReason(prompt) {
     return null;
   }
   if (!r || !r.ok || !r.text) return null;
-  try {
-    const t = r.text.replace(/<think>[\s\S]*?<\/think>/g, '').replace(/```json|```/g, '').trim();
-    const s = t.indexOf('{'), e = t.lastIndexOf('}');
-    if (s === -1 || e === -1 || e < s) return null;
-    return JSON.parse(t.slice(s, e + 1));
-  } catch (_) { return null; }
+  // Same robustness the news path got: indexOf('{')…lastIndexOf('}') breaks on prose
+  // containing a brace and on trailing commas, silently discarding a usable answer.
+  return extractJsonObject(r.text);
 }
 
 function isNewsWindow() {
@@ -3046,13 +3177,20 @@ async function runIntelCycle() {
     // not just the fixed formula (degrades to the formula if no LLM/budget).
     const _edge   = calculateTradeExpectancy();
     const _sample = portfolio.closedTrades.filter(t => !t.partial).length;   // full closes only
-    const venusPosture = await venus.assess({
-      stress:  calculateMarketStress(),
-      regime:  detectMarketRegime(),
-      winRate: _edge.winRate,
-      sample:  _sample
-    });
-    if (venusPosture) console.log(`[VENUS] 🧭 Posture ${venusPosture.stance}${venusPosture.reasoning ? ' — ' + venusPosture.reasoning : ''}`);
+    // Throttled: posture is slow-moving state, not a per-cycle decision. Skipping
+    // leaves the previously stored posture in place (consumers already treat one
+    // older than 90 min as stale), so this trades freshness for budget, never safety.
+    let venusPosture = null;
+    if (Date.now() - _lastPostureAt >= POSTURE_MIN_INTERVAL_MS) {
+      _lastPostureAt = Date.now();
+      venusPosture = await venus.assess({
+        stress:  calculateMarketStress(),
+        regime:  detectMarketRegime(),
+        winRate: _edge.winRate,
+        sample:  _sample
+      });
+      if (venusPosture) console.log(`[VENUS] 🧭 Posture ${venusPosture.stance}${venusPosture.reasoning ? ' — ' + venusPosture.reasoning : ''}`);
+    }
 
     // JUPITER self-checks — reviews how we're actually doing + how exposed we are, and
     // sets its own bounded risk posture (size ×≤1) and optional hold. Discipline only.
@@ -3061,7 +3199,12 @@ async function runIntelCycle() {
     const _tv = getTotalValue();
     const _storedPosture = venus.getResearch().posture;
     const _posFresh = _storedPosture && (Date.now() - (_storedPosture.at || 0)) < 90 * 60000;
-    const jp = await jupiter.deliberate({
+    // Throttled for the same reason as posture. Safe in one direction only, which is
+    // the direction that matters: the self-check's outputs are a size multiplier
+    // capped at ×1 and an optional entry HOLD, so a stale one can only ever be as
+    // cautious as the last review — never more aggressive than the mechanical rules.
+    const jp = (Date.now() - _lastSelfCheckAt < SELFCHECK_MIN_INTERVAL_MS) ? null
+      : (_lastSelfCheckAt = Date.now(), await jupiter.deliberate({
       winRate:           _edge.winRate,
       sample:            _sample,
       profitFactor:      _edge.profitFactor === 999 ? 99 : _edge.profitFactor,
@@ -3071,7 +3214,7 @@ async function runIntelCycle() {
       maxPositions:      MAX_OPEN_POSITIONS,
       deployed:          _tv > 0 ? getNotionalExposure() / _tv : 0,
       venusPosture:      venusPosture ? venusPosture.stance : (_posFresh ? _storedPosture.stance : null)
-    });
+    }));
     if (jp) console.log(`[JUPITER] 🧭 Self-check size ×${jp.multiplier.toFixed(2)}${jp.hold ? ' · HOLD (new entries paused)' : ''}${jp.note ? ' — ' + jp.note : ''}`);
 
     const ideas = venus.researchRecommendations();   // institutional + news + vol, Jupiter-ready
@@ -4387,14 +4530,21 @@ function terraValidateTrade(plan) {
   // these establish it can actually PAY. Gross R:R is geometry; this is money. Without
   // them the engine took setups whose net reward:risk was below 1.0 — the average loss
   // exceeding the average win before win rate even entered the picture.
-  if (plan.netRewardRisk < STRATEGY.MIN_RR_NET)
-    return reject(`net R:R ${plan.netRewardRisk.toFixed(2)} < ${STRATEGY.MIN_RR_NET} after ${(plan.cost * 100).toFixed(2)}% costs`);
-  if (plan.targetCostRatio < STRATEGY.MIN_TARGET_COST_RATIO)
-    return reject(`target only ${plan.targetCostRatio.toFixed(1)}× round-trip cost (need ${STRATEGY.MIN_TARGET_COST_RATIO}×)`);
+  //
+  // ORDER MATTERS FOR DIAGNOSIS, not just for correctness. net R:R is DERIVED from
+  // ATR and cost: target = ATR_TARGET_MULT × atr, so a small ATR mechanically drags
+  // net R:R down. Checking net R:R first meant a symbol that was simply too quiet to
+  // trade got rejected as "net R:R 1.12 < 1.35" — reporting the symptom and hiding
+  // the cause. Whole sessions of logs pointed at the wrong knob. Root causes first:
+  // is it moving at all, and is it cheap enough — THEN whether the economics clear.
   if (!Number.isFinite(plan.atrFrac) || plan.atrFrac < STRATEGY.MIN_ATR_ENTRY)
     return reject(`ATR ${((plan.atrFrac || 0) * 100).toFixed(2)}% below the ${(STRATEGY.MIN_ATR_ENTRY * 100).toFixed(2)}% floor — move too small to beat costs`);
   if (plan.cost > STRATEGY.MAX_ROUND_TRIP_COST)
     return reject(`round-trip cost ${(plan.cost * 100).toFixed(2)}% above the ${(STRATEGY.MAX_ROUND_TRIP_COST * 100).toFixed(2)}% ceiling — too expensive to trade`);
+  if (plan.netRewardRisk < STRATEGY.MIN_RR_NET)
+    return reject(`net R:R ${plan.netRewardRisk.toFixed(2)} < ${STRATEGY.MIN_RR_NET} after ${(plan.cost * 100).toFixed(2)}% costs`);
+  if (plan.targetCostRatio < STRATEGY.MIN_TARGET_COST_RATIO)
+    return reject(`target only ${plan.targetCostRatio.toFixed(1)}× round-trip cost (need ${STRATEGY.MIN_TARGET_COST_RATIO}×)`);
 
   // RULE 3.6 — direction. See LONG_ONLY: the short book measured 8.5% wins against a
   // 32.4% break-even, i.e. anti-predictive, and shorting fights positive equity drift.
@@ -6385,6 +6535,7 @@ module.exports = {
     atrQuality, hasReliableVolatility, MIN_CANDLES_FOR_ATR,
     releaseExpiredLossHalt, LOSS_HALT_MS, getKillSwitchReason, lossHaltReason,
     institutionalScore, ideaDirection, EFFECTIVE_MIN_DAY_VOL, FEED_VOLUME_FACTOR, DYNAMIC_MIN_DAY_VOL,
+    extractJsonArray, extractJsonObject,
     estimateRoundTripCost, netRewardRisk, sideCost, LIMIT_ENTRIES, estimateDynamicSpread,
     evaluateStrategyGate, calculateADX, calculateRVOL, getCandleTrend, priceMidpoint, detectMarketRegime,
     setPendingOrders: (o) => { pendingOrders = o; } }

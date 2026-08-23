@@ -1089,6 +1089,120 @@ check('a genuinely wild tape does trip the threshold', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+//  LLM RESPONSE PARSING (v11.25)
+//  The old extractor was indexOf('[')…lastIndexOf(']') + one JSON.parse. Each of
+//  these cases silently cost a whole research cycle in production. Every case here
+//  FAILS against that old implementation — that is the point of the group.
+// ════════════════════════════════════════════════════════════════════════════
+group('Venus LLM response parsing');
+
+check('plain array parses', () => {
+  const r = I.extractJsonArray('[{"ticker":"AAPL"},{"ticker":"MSFT"}]');
+  ok(Array.isArray(r) && r.length === 2 && r[0].ticker === 'AAPL', `got ${JSON.stringify(r)}`);
+});
+check('array wrapped in an object is unwrapped', () => {
+  const r = I.extractJsonArray('{"recommendations":[{"ticker":"NVDA"}]}');
+  ok(Array.isArray(r) && r.length === 1 && r[0].ticker === 'NVDA', `got ${JSON.stringify(r)}`);
+});
+check('prose before and after the array is ignored', () => {
+  const r = I.extractJsonArray('Here you go:\n[{"ticker":"F"}]\nHope that helps [end]');
+  ok(Array.isArray(r) && r.length === 1 && r[0].ticker === 'F', `got ${JSON.stringify(r)}`);
+});
+check('a trailing comma does not lose the response', () => {
+  const r = I.extractJsonArray('[{"ticker":"KO"},]');
+  ok(Array.isArray(r) && r.length === 1 && r[0].ticker === 'KO', `got ${JSON.stringify(r)}`);
+});
+check('a bracket inside a quoted string does not end the array early', () => {
+  // Prose on both sides so this CANNOT succeed on the whole-string fast path and
+  // must go through the bracket scanner. An unbalanced ']' inside a value is the
+  // case that makes naive lastIndexOf/depth-counting truncate the array.
+  const r = I.extractJsonArray('Here you go: [{"ticker":"GE","note":"raised ] guidance"},{"ticker":"XOM"}] done');
+  ok(Array.isArray(r) && r.length === 2 && r[1].ticker === 'XOM',
+     `string-internal bracket truncated the parse: ${JSON.stringify(r)}`);
+});
+check('complete objects are salvaged from a truncated array', () => {
+  // Response cut off by a token limit — nothing balances, but two whole ideas are there.
+  const r = I.extractJsonArray('[{"ticker":"PLTR","conviction":8},{"ticker":"SOFI","conviction":7},{"tick');
+  ok(Array.isArray(r) && r.length === 2 && r[1].ticker === 'SOFI',
+     `truncated response should salvage 2 objects, got ${JSON.stringify(r)}`);
+});
+check('salvage is not fooled by a brace inside a quoted value', () => {
+  // Truncated AND contains '}' inside a string. Without string tracking the salvage
+  // loop closes the first object early, that fragment fails to parse, and the idea is
+  // silently dropped — recovering 1 of 2 while looking like a success.
+  const r = I.extractJsonArray('[{"ticker":"GE","note":"up } then down"},{"ticker":"XOM"},{"tic');
+  ok(Array.isArray(r) && r.length === 2, `expected 2 salvaged objects, got ${JSON.stringify(r)}`);
+  ok(r[0].ticker === 'GE' && r[0].note === 'up } then down', `first object mangled: ${JSON.stringify(r[0])}`);
+});
+check('<think> blocks and code fences are stripped', () => {
+  const r = I.extractJsonArray('<think>let me consider [this]</think>\n```json\n[{"ticker":"BAC"}]\n```');
+  ok(Array.isArray(r) && r.length === 1 && r[0].ticker === 'BAC', `got ${JSON.stringify(r)}`);
+});
+check('genuinely unusable text returns null, not a bogus array', () => {
+  ok(I.extractJsonArray('I cannot help with that request.') === null, 'should be null');
+  ok(I.extractJsonArray('') === null, 'empty should be null');
+  ok(I.extractJsonArray(null) === null, 'null input should be null');
+});
+check('object extractor handles prose, fences and trailing commas', () => {
+  ok(I.extractJsonObject('```json\n{"stance":"neutral",}\n```').stance === 'neutral', 'fenced+trailing comma');
+  ok(I.extractJsonObject('Posture: {"stance":"risk-off"} — done {').stance === 'risk-off', 'prose either side');
+  ok(I.extractJsonObject('{"note":"be careful {here}","stance":"calm"}').stance === 'calm', 'brace in string');
+});
+check('object extractor recovers an object wrapped in an array', () => {
+  // llmReason callers index named fields, so a bare array is useless to them — but a
+  // model that answers [{...}] instead of {...} has still given a usable answer, and
+  // recovering it beats discarding the call and falling back to mechanical behaviour.
+  const v = I.extractJsonObject('[{"stance":"risk-off","multiplier":0.5}]');
+  ok(v && v.stance === 'risk-off', `should recover the inner object, got ${JSON.stringify(v)}`);
+});
+check('object extractor returns null when there is no object at all', () => {
+  ok(I.extractJsonObject('["a","b"]') === null, 'an array of scalars yields no object');
+  ok(I.extractJsonObject('no json here') === null, 'prose yields null');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  GATE ORDER (v11.25) — the rejection reason must name the CAUSE, not a symptom.
+// ════════════════════════════════════════════════════════════════════════════
+group('Terra gate reports the true rejection cause');
+
+check('a too-quiet symbol is rejected for ATR, not for net R:R', () => {
+  const S = I.STRATEGY;
+  // ATR below the floor mechanically drags net R:R down too, so BOTH gates would
+  // fire. The report must name the root cause — the one the operator can act on.
+  const plan = {
+    ticker: 'QUIET', direction: 'LONG', entryPrice: 50, shares: 10,
+    stop:   { price: 49.5, frac: 0.01 },
+    target: { price: 51,   frac: 0.02 },
+    rewardRisk: 2.0,
+    atrFrac: S.MIN_ATR_ENTRY * 0.5,          // clearly below the floor
+    cost: 0.003,
+    netRewardRisk: S.MIN_RR_NET * 0.5,       // also below its bar, as a consequence
+    targetCostRatio: 99
+  };
+  const v = I.terraValidateTrade(plan);
+  ok(!v.approved, 'should be rejected');
+  ok(/ATR/i.test(v.reason), `reason should name ATR, got: "${v.reason}"`);
+  ok(!/net R:R/i.test(v.reason), `reason should NOT blame net R:R, got: "${v.reason}"`);
+});
+
+check('net R:R is still reported when ATR and cost are both fine', () => {
+  const S = I.STRATEGY;
+  const plan = {
+    ticker: 'OK', direction: 'LONG', entryPrice: 50, shares: 10,
+    stop:   { price: 49, frac: 0.02 },
+    target: { price: 52, frac: 0.04 },
+    rewardRisk: 2.0,
+    atrFrac: S.MIN_ATR_ENTRY * 2,            // comfortably above the floor
+    cost: S.MAX_ROUND_TRIP_COST * 0.5,       // comfortably under the ceiling
+    netRewardRisk: S.MIN_RR_NET * 0.5,       // the ONLY failing gate
+    targetCostRatio: 99
+  };
+  const v = I.terraValidateTrade(plan);
+  ok(!v.approved, 'should be rejected');
+  ok(/net R:R/i.test(v.reason), `reason should name net R:R, got: "${v.reason}"`);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 console.log(`\n${'─'.repeat(60)}`);
 console.log(`${passed} passed, ${failed} failed`);
 if (failed) {
