@@ -343,6 +343,10 @@ function metrics(trades, equity, startCap) {
   if (arg('--trail', null)) S.ATR_TRAIL_MULT = parseFloat(arg('--trail'));
   if (arg('--atrfloor', null)) S.MIN_ATR_ENTRY = parseFloat(arg('--atrfloor'));
   if (arg('--tcr', null))   S.MIN_TARGET_COST_RATIO = parseFloat(arg('--tcr'));
+  // --risk lets you scale bet size directly. Sizing is a MULTIPLIER on per-trade
+  // expectancy, never a source of it: raising this on a negative-expectancy rule
+  // loses money faster, and compounding makes that worse rather than better.
+  if (arg('--risk', null))  S.RISK_PER_TRADE_BASE = parseFloat(arg('--risk'));
   const base = { stopMult: S.ATR_STOP_MULT, targetMult: S.ATR_TARGET_MULT,
                  trailMult: S.ATR_TRAIL_MULT, trailArmR: parseFloat(arg('--arm','1.0')), costsOn: COSTS_ON,
                  realistic: !flag('--optimistic') };
