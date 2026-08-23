@@ -2193,7 +2193,29 @@ const SHORT_BORROW_DAILY = 0.0003;  // 0.03%/day standard rate (~11% annualised)
 // Hard-to-borrow premium for HIGH_VOLATILITY symbols (~18% annualised)
 const SHORT_BORROW_HTB   = 0.0005;  // 0.05%/day for MARA, SOUN, RKLB, etc.
 const MARGIN_RATE        = 0.5;
-const PRICE_HISTORY_LEN  = 60;   // WS tick history per symbol — 60 gives RSI(14) room to stabilise
+const PRICE_HISTORY_LEN  = 60;   // indicator series length — 60 gives RSI(14) room to stabilise
+
+// ── DECISION TIMEFRAME (v11.26) ─────────────────────────────────────────────
+// Which bar size every entry decision is made on. Measured over 392–1393 trades
+// across 7 non-overlapping 60-session windows, gross-of-cost edge and the toll
+// move in opposite directions as the bar grows:
+//
+//     bars     gross edge      t        toll      net edge
+//     1 min    +0.050R       0.80      0.129R     -0.079R
+//     5 min    -0.015R      -0.45      0.123R     -0.138R
+//    15 min    +0.077R       2.16      0.118R     -0.041R
+//    60 min    +0.142R       2.26      0.099R     +0.043R      <-- default
+//   120 min    +0.151R       1.96      0.093R     +0.059R
+//   240 min    -0.077R      -0.66      0.093R     -0.170R      (falls apart)
+//
+// Round-trip cost is roughly fixed per trade while 1R = 2.2 × ATR grows with the
+// bar, so the toll shrinks as a fraction of risk; and the signal itself is only
+// distinguishable from noise at 15 min and above. 60 min is the first setting whose
+// net expectancy is positive. HONESTY: alpha vs buy-and-hold over the same windows
+// is +$22.68 per window at t=0.40 — NOT significant. This moves the bot from losing
+// money to roughly break-even at about half the market's exposure (beta 0.53). It
+// is not a demonstrated edge, and it is not a reason to expect profit.
+const DECISION_TIMEFRAME = (process.env.DECISION_TIMEFRAME || '1Hour');
 // Stale-data guard: don't trade a symbol whose price hasn't updated in >90s
 const MAX_PRICE_AGE_MS   = 90000;
 // Don't trade in the first 5 or last 5 minutes of a session (high noise)
@@ -2270,6 +2292,14 @@ const STRATEGY = {
   ATR_TARGET_MULT: 4.6,   // first target ≈ 4.6×ATR → ~2.1:1 reward:risk before laddering
   MIN_RR:          1.8,   // reject setups below this reward:risk
   ATR_TRAIL_MULT:  2.0,   // trail by 2.0×ATR once in profit (Chandelier-style)
+  // Arm the trail once peak profit reaches this many R. 99 = effectively OFF.
+  // WHY OFF: the geometry promises 4.6/2.2 = 2.09:1, but the trail was realising
+  // only ~1.2:1 — it kept converting would-be target hits into small wins. Measured
+  // across 7 non-overlapping 60-session windows on 60-min bars, disabling it won in
+  // 7 of 7 (pooled $593 vs $277) and restored realised R:R from ~1.2 to ~1.9.
+  // The HARD STOP and the take-profit rungs are untouched; this removes only the
+  // give-back exit, so downside protection is unchanged.
+  ATR_TRAIL_ARM_R: 99,
 
   // ADX trend-strength thresholds (Wilder standard)
   ADX_PERIOD:      14,
@@ -2692,8 +2722,11 @@ function connectWebSocket() {
           ex.low   = Math.min(ex.low,  price);
           ex.lastUpdate    = Date.now();
           ex.lastTradeTime = ts;
-          ex.history.push(price);
-          if (ex.history.length > PRICE_HISTORY_LEN) ex.history.shift();
+          // history is NOT a tick buffer. It is the indicator series, and it is
+          // rebuilt from decision-timeframe bar closes on every candle refresh.
+          // Appending ticks here made EMA/RSI span ~80 seconds instead of the bar
+          // window the strategy was designed and backtested on. Live price still
+          // updates above; only the indicator input is kept bar-clean.
         }
         continue;
       }
@@ -2921,18 +2954,46 @@ async function fetchCandles() {
     // stops — the safe direction to err.
     const start1m  = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();    // last 4h
     const start5m  = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();   // last 12h
+    // Hourly needs a long lookback: 60 bars is 60 trading hours ≈ 9 sessions, and
+    // calendar days include nights/weekends, so ask for 21 days to be safe.
+    const start1h  = new Date(Date.now() - 21 * 24 * 60 * 60 * 1000).toISOString();
 
-    // Two batch calls — all symbols at once per timeframe.
-    const [bars1m, bars5m] = await Promise.all([
+    // Batch calls — all symbols at once per timeframe.
+    const [bars1m, bars5m, bars1h] = await Promise.all([
       fetchBars(symbols, '1Min', start1m, 400),   // 1m bars: tf5m trend + true ATR
-      fetchBars(symbols, '5Min', start5m, 200)     // 5m bars: tf15m bias
+      fetchBars(symbols, '5Min', start5m, 200),    // 5m bars: tf15m bias
+      DECISION_TIMEFRAME === '1Hour'
+        ? fetchBars(symbols, '1Hour', start1h, 300)
+        : Promise.resolve({})
     ]);
 
     let updated = 0;
     symbols.forEach(sym => {
-      const c1m = bars1m[sym], c5m = bars5m[sym];
-      if (c1m && c1m.length) { if (!candleData[sym]) candleData[sym] = {}; candleData[sym].m1 = c1m.slice(-60); updated++; }
-      if (c5m && c5m.length) { if (!candleData[sym]) candleData[sym] = {}; candleData[sym].m5 = c5m.slice(-36); }
+      const c1m = bars1m[sym], c5m = bars5m[sym], c1h = bars1h[sym];
+      if (!candleData[sym]) candleData[sym] = {};
+      if (DECISION_TIMEFRAME === '1Hour') {
+        // DECISION BARS ride in .m1. Every indicator (ATR, ADX, EMA, RSI, RVOL,
+        // trend) reads .m1, and the backtest proves the strategy by putting the
+        // decision-timeframe series in exactly that field. Routing hourly bars
+        // anywhere else would measure one bot and run a different one — the exact
+        // divergence that hid the long-only change from its first evaluation.
+        // .m5 is deliberately LEFT EMPTY so getCandleTrend takes its m1 fallback,
+        // matching the backtest bar for bar.
+        if (c1h && c1h.length) { candleData[sym].m1 = c1h.slice(-60); delete candleData[sym].m5; updated++; }
+        candleData[sym].raw1m = c1m && c1m.length ? c1m.slice(-60) : undefined;  // gaps/diagnostics only
+      } else {
+        if (c1m && c1m.length) { candleData[sym].m1 = c1m.slice(-60); updated++; }
+        if (c5m && c5m.length) { candleData[sym].m5 = c5m.slice(-36); }
+      }
+      // INDICATOR HISTORY MUST BE BAR CLOSES, NOT TICKS. The live loop pushed every
+      // trade print into marketData.history, so EMA(9)/EMA(21)/RSI(14) were running
+      // over the last 40 TICKS — about 80 seconds at a 2s loop — while the backtest
+      // ran them over 40 BAR CLOSES. The live gate was therefore never the gate that
+      // was measured. Rebuilding it from bars on every refresh aligns the two.
+      const dc = candleData[sym].m1;
+      if (dc && dc.length >= 2 && marketData[sym]) {
+        marketData[sym].history = dc.slice(-PRICE_HISTORY_LEN).map(c => c.c);
+      }
     });
     console.log(`[CANDLES] Updated ${updated}/${symbols.length} symbols from Alpaca (feed=${ALPACA_DATA_FEED})`);
     if (updated === 0) {
@@ -3764,9 +3825,14 @@ function evaluateStrategyGate(symbol, q) {
   const rr = stopDist > 0 ? targetDist / stopDist : 0;
   const rrOK = rr >= STRATEGY.MIN_RR;
 
-  // Cold start: indicators not ready → don't block (let weighted score decide)
+  // Cold start: indicators not ready. This used to open BOTH gates and defer to the
+  // weighted score — i.e. trade with no trend information at all. That was tolerable
+  // while history filled from ticks within seconds; now that history is rebuilt from
+  // decision-timeframe bars, "not ready" means genuinely no signal, and the honest
+  // answer to "should I trade this?" with no signal is no. Costs nothing in backtest
+  // (history is always full there), and removes a blind-entry window at live startup.
   if (emaFast === null || emaSlow === null) {
-    return { longGate: true, shortGate: true, detail: 'ema-warmup', mode: 'warmup', rr };
+    return { longGate: false, shortGate: false, detail: 'ema-warmup — no decision bars yet', mode: 'warmup', rr };
   }
 
   const trendUp   = emaFast > emaSlow;
@@ -5626,10 +5692,10 @@ function evaluateAndTrade() {
     const stopPct = STRATEGY.ATR_STOP_MULT   * a;     // R, in % terms
     const tgtPct  = STRATEGY.ATR_TARGET_MULT * a;
     const trailPct= STRATEGY.ATR_TRAIL_MULT  * a;
-    const oneR    = stopPct;
+    const armAt   = STRATEGY.ATR_TRAIL_ARM_R * stopPct;   // 99R => trail effectively off
 
     if (pnlPct <= -stopPct)                              longsStop.push(ticker);     // ATR hard stop
-    else if (peak >= oneR && pnlPct <= peak - trailPct)  longsToClose.push(ticker);  // ATR trailing stop
+    else if (peak >= armAt && pnlPct <= peak - trailPct) longsToClose.push(ticker);  // ATR trailing stop
     else {
       if (pnlPct >= tgtPct * 1.5)      longPartials.push({ ticker, fraction: TP_RUNG_2_FRACTION, rung: 'tp2' });
       else if (pnlPct >= tgtPct)       longPartials.push({ ticker, fraction: TP_RUNG_1_FRACTION, rung: 'tp1' });
@@ -5652,10 +5718,10 @@ function evaluateAndTrade() {
     const stopPct = STRATEGY.ATR_STOP_MULT   * a;
     const tgtPct  = STRATEGY.ATR_TARGET_MULT * a;
     const trailPct= STRATEGY.ATR_TRAIL_MULT  * a;
-    const oneR    = stopPct;
+    const armAt   = STRATEGY.ATR_TRAIL_ARM_R * stopPct;   // 99R => trail effectively off
 
     if (pnlPct <= -stopPct)                              shortsStop.push(ticker);
-    else if (peak >= oneR && pnlPct <= peak - trailPct)  shortsToClose.push(ticker);
+    else if (peak >= armAt && pnlPct <= peak - trailPct) shortsToClose.push(ticker);
     else {
       if (pnlPct >= tgtPct * 1.5)      shortPartials.push({ ticker, fraction: TP_RUNG_2_FRACTION, rung: 'tp2' });
       else if (pnlPct >= tgtPct)       shortPartials.push({ ticker, fraction: TP_RUNG_1_FRACTION, rung: 'tp1' });

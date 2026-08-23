@@ -45,7 +45,11 @@ const DAYS     = Math.max(1, Math.min(DAILY ? 900 : 60, parseInt(arg('--days', D
 const CAPITAL  = Math.max(100, parseFloat(arg('--capital', '1000')));
 const VERBOSE  = flag('--verbose');
 const COSTS_ON = arg('--costs', '1') !== '0';
-const TF       = Math.max(1, parseInt(arg('--tf', '1'), 10));        // aggregate to N-minute bars
+// Aggregate to N-minute bars. The DEFAULT MUST TRACK THE LIVE ENGINE: the engine
+// decides on DECISION_TIMEFRAME bars, so a 1-minute backtest would measure a bot
+// that does not exist. 1Hour => 60. Daily bars are already the decision unit.
+const LIVE_TF  = /Hour/i.test(process.env.DECISION_TIMEFRAME || '1Hour') ? 60 : 1;
+const TF       = Math.max(1, parseInt(arg('--tf', DAILY ? '1' : String(LIVE_TF)), 10));
 const MIN_ATR  = parseFloat(arg('--minatr', '0'));                   // require this much volatility
 const MAX_ATR  = parseFloat(arg('--maxatr', '0'));                   // diagnostic: ONLY the quiet names
 const WARMUP   = 32;                                                 // bars of history before any decision
@@ -348,7 +352,7 @@ function metrics(trades, equity, startCap) {
   // loses money faster, and compounding makes that worse rather than better.
   if (arg('--risk', null))  S.RISK_PER_TRADE_BASE = parseFloat(arg('--risk'));
   const base = { stopMult: S.ATR_STOP_MULT, targetMult: S.ATR_TARGET_MULT,
-                 trailMult: S.ATR_TRAIL_MULT, trailArmR: parseFloat(arg('--arm','1.0')), costsOn: COSTS_ON,
+                 trailMult: S.ATR_TRAIL_MULT, trailArmR: parseFloat(arg('--arm', String(S.ATR_TRAIL_ARM_R))), costsOn: COSTS_ON,
                  realistic: !flag('--optimistic') };
   console.log(`    execution model: ${base.realistic ? 'REALISTIC (adverse selection + gap slippage + intrabar stops)' : 'OPTIMISTIC'}`);
 

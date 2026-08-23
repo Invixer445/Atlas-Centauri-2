@@ -1203,6 +1203,50 @@ check('net R:R is still reported when ATR and cost are both fine', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+//  DECISION TIMEFRAME + INDICATOR HYGIENE (v11.26)
+// ════════════════════════════════════════════════════════════════════════════
+group('Decision timeframe and indicator inputs');
+
+check('warmup closes both gates instead of trading blind', () => {
+  // Previously returned longGate:true, shortGate:true and deferred to the weighted
+  // score — entering with no trend information at all. With history now rebuilt from
+  // decision bars, "not ready" is a real state at startup, not a one-second blip.
+  // Empty history is the real cold-start state: no decision bars fetched yet.
+  const q = { price: 10, prevClose: 10, dayOpen: 10, high: 10, low: 10,
+              dailyVolume: 1e6, lastUpdate: Date.now(), history: [] };
+  const g = I.evaluateStrategyGate('WARMUP_SYM', q);
+  ok(g.mode === 'warmup', `expected warmup mode, got ${g.mode}`);
+  ok(g.longGate === false && g.shortGate === false,
+     `warmup must not open gates, got long=${g.longGate} short=${g.shortGate}`);
+});
+
+check('the trail is disarmed by default and the hard stop is untouched', () => {
+  const S = I.STRATEGY;
+  ok(S.ATR_TRAIL_ARM_R >= 99, `trail should be effectively off, arm=${S.ATR_TRAIL_ARM_R}`);
+  // Removing the give-back exit must not have touched downside protection.
+  ok(S.ATR_STOP_MULT > 0 && S.ATR_STOP_MULT <= 3, `hard stop must survive, got ${S.ATR_STOP_MULT}`);
+  ok(S.ATR_TARGET_MULT > S.ATR_STOP_MULT, 'target must still exceed stop');
+});
+
+check('indicator history is not polluted by ticks', () => {
+  // Regression guard for the live/backtest divergence: the loop used to push every
+  // trade print into marketData.history, so EMA/RSI spanned ~80s of ticks while the
+  // backtest used bar closes. The tick handler must no longer grow that array.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  ok(!/ex\.history\.push\(price\)/.test(src),
+     'tick handler still appends to marketData.history — indicators would not match the backtest');
+});
+
+check('the backtest harness defaults to the live decision timeframe', () => {
+  // A harness sampling a different bar size measures a bot that does not exist.
+  // This exact class of divergence hid the long-only change from its first run.
+  const bt = require('fs').readFileSync(require('path').join(__dirname, 'backtest.js'), 'utf8');
+  ok(/DECISION_TIMEFRAME/.test(bt), 'backtest.js must derive its default --tf from DECISION_TIMEFRAME');
+  ok(/arg\('--arm', String\(S\.ATR_TRAIL_ARM_R\)\)/.test(bt),
+     'backtest.js must default --arm from STRATEGY.ATR_TRAIL_ARM_R, not a hardcoded value');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 console.log(`\n${'─'.repeat(60)}`);
 console.log(`${passed} passed, ${failed} failed`);
 if (failed) {

@@ -46,7 +46,11 @@ const BARS    = arg('--bars', '1Min');
 const DAYS    = Math.max(1, Math.min(60, parseInt(arg('--days', '60'), 10)));
 const END_DATE= arg('--end', null);
 const PERSIST = flag('--persist');
-const TRAIL_ARM_R = parseFloat(arg('--arm', '1.0'));
+const TRAIL_ARM_R = parseFloat(arg('--arm', String(I.STRATEGY.ATR_TRAIL_ARM_R)));
+// MIN_ATR_ENTRY is a crude proxy for "this move can beat costs". MIN_TARGET_COST_RATIO
+// is the exact form of the same question. --atrfloor lets us relax the proxy and see
+// whether the precise gate alone is sufficient.
+if (arg('--atrfloor', null)) I.STRATEGY.MIN_ATR_ENTRY = parseFloat(arg('--atrfloor'));
 const WARMUP  = 32;
 const SYMBOLS = arg('--symbols', 'PLTR,SOFI,MARA,HOOD,SOUN,IONQ,RKLB,BBAI,HIMS,CIFR,F,BAC,JPM,WFC,GE,XOM,MRK,JNJ,PFE,KO')
                   .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
@@ -77,6 +81,24 @@ async function fetchBars(sym, startISO, endISO) {
       out.push({ t: Math.floor(new Date(b.t).getTime()/1000), o:b.o,h:b.h,l:b.l,c:b.c,v:b.v });
     token = j && j.next_page_token;
   } while (token);
+  return out;
+}
+
+// Combine N consecutive bars into one. Round-trip cost is roughly FIXED per trade
+// while 1R = 2.2 × ATR grows with the bar size, so aggregating is the direct lever
+// on cost-as-a-fraction-of-risk — the ratio that decides whether a trade can pay.
+// Default tracks the live engine's DECISION_TIMEFRAME for the same reason
+// backtest.js does: a harness that samples a different bar size measures a
+// different bot than the one that runs.
+const LIVE_TF = /Hour/i.test(process.env.DECISION_TIMEFRAME || '1Hour') ? 60 : 1;
+const TF = Math.max(1, parseInt(arg('--tf', String(LIVE_TF)), 10));
+function aggregate(bars, n) {
+  const out = [];
+  for (let i = 0; i + n <= bars.length; i += n) {
+    const g = bars.slice(i, i + n);
+    out.push({ t: g[g.length-1].t, o: g[0].o, h: Math.max(...g.map(b=>b.h)),
+               l: Math.min(...g.map(b=>b.l)), c: g[g.length-1].c, v: g.reduce((s,b)=>s+(b.v||0),0) });
+  }
   return out;
 }
 
@@ -129,18 +151,18 @@ function scan(hist, usable) {
         const a = pos.atrFrac;
         const stopPx = pos.dir==='LONG' ? pos.entry*(1-S.ATR_STOP_MULT*a) : pos.entry*(1+S.ATR_STOP_MULT*a);
         const tgtPx  = pos.dir==='LONG' ? pos.entry*(1+S.ATR_TARGET_MULT*a) : pos.entry*(1-S.ATR_TARGET_MULT*a);
-        let exit=null, fill=null;
-        if (pos.dir==='LONG' && bar.l<=stopPx)      { exit='stop';   fill=stopPx*(1-(halfSpread+gapSlip)); }
-        else if (pos.dir==='SHORT'&&bar.h>=stopPx)  { exit='stop';   fill=stopPx*(1+(halfSpread+gapSlip)); }
-        else if (pos.dir==='LONG' && bar.h>=tgtPx)  { exit='target'; fill=tgtPx; }
-        else if (pos.dir==='SHORT'&&bar.l<=tgtPx)   { exit='target'; fill=tgtPx; }
+        let exit=null, fill=null, exitPx=null;
+        if (pos.dir==='LONG' && bar.l<=stopPx)      { exit='stop';   exitPx=stopPx; fill=stopPx*(1-(halfSpread+gapSlip)); }
+        else if (pos.dir==='SHORT'&&bar.h>=stopPx)  { exit='stop';   exitPx=stopPx; fill=stopPx*(1+(halfSpread+gapSlip)); }
+        else if (pos.dir==='LONG' && bar.h>=tgtPx)  { exit='target'; exitPx=tgtPx;  fill=tgtPx; }
+        else if (pos.dir==='SHORT'&&bar.l<=tgtPx)   { exit='target'; exitPx=tgtPx;  fill=tgtPx; }
         else {
           const pnlPct = pos.dir==='LONG' ? (bar.c-pos.entry)/pos.entry : (pos.entry-bar.c)/pos.entry;
           pos.peak = Math.max(pos.peak, pnlPct);
           // trail arm defaults to 1.0R, matching backtest.js's --arm default.
           const armAt = TRAIL_ARM_R * S.ATR_STOP_MULT * a, giveBack = S.ATR_TRAIL_MULT * a;
           if (pos.peak >= armAt && pnlPct <= pos.peak - giveBack) {
-            exit='trail';
+            exit='trail'; exitPx = bar.c;
             fill = pos.dir==='LONG' ? bar.c*(1-halfSpread) : bar.c*(1+halfSpread);
           }
         }
@@ -149,6 +171,16 @@ function scan(hist, usable) {
           const riskPerShare = S.ATR_STOP_MULT * pos.atrFrac * pos.entry;
           // R-MULTIPLE: the outcome expressed in units of risk taken. Size-free.
           pos.feat.R = riskPerShare > 0 ? perShare / riskPerShare : 0;
+          // GROSS R: the SAME trade, same entry bar, same exit bar, same trigger —
+          // only the friction removed from both fills. This is the honest way to ask
+          // "how much of the loss is costs?". Flipping backtest.js --costs 0 does NOT
+          // answer it: that also disables the economic gates, taking 1922 trades where
+          // the real config takes 69. Different strategy, not the same one untaxed.
+          const grossExit  = exitPx;                       // trigger price, unslipped
+          const grossEntry = pos.grossEntry;
+          const grossPer = pos.dir==='LONG' ? grossExit-grossEntry : grossEntry-grossExit;
+          const grossRisk = S.ATR_STOP_MULT * pos.atrFrac * grossEntry;
+          pos.feat.Rgross = grossRisk > 0 ? grossPer / grossRisk : 0;
           pos.feat.exit = exit;
           rows.push(pos.feat);
           delete open[sym];
@@ -193,7 +225,7 @@ function scan(hist, usable) {
       };
 
       const entry = dir==='LONG' ? refPx*(1+halfSpread*2) : refPx*(1-halfSpread*2);
-      open[sym] = { dir, entry, atrFrac: plan.atrFrac, peak: 0, feat };
+      open[sym] = { dir, entry, grossEntry: refPx, atrFrac: plan.atrFrac, peak: 0, feat };
     }
   }
   return rows;
@@ -242,6 +274,7 @@ async function loadWindow(endDate) {
     else { hist[s] = await fetchBars(s, start.toISOString(), end.toISOString());
            try { fs.writeFileSync(cf, JSON.stringify(hist[s])); } catch {} }
   }
+  if (TF > 1) for (const s of SYMBOLS) hist[s] = aggregate(hist[s], TF);
   const usable = SYMBOLS.filter(s => hist[s].length >= WARMUP+20);
   return { hist, usable, start: start.toISOString().slice(0,10) };
 }
@@ -278,10 +311,33 @@ const MULTI_ENDS = ['2025-04-04','2025-06-30','2025-09-23','2025-12-16','2026-03
   if (rows.length < 50) { console.error(`\n✖ Only ${rows.length} trades — too few to bucket.\n`); process.exit(1); }
 
   const allR = rows.map(r=>r.R);
+  const allG = rows.map(r=>r.Rgross);
   console.log(`\n  POOLED: ${rows.length} trades, mean ${mean(allR)>=0?'+':''}${mean(allR).toFixed(3)}R, ` +
               `win ${(rows.filter(r=>r.R>0).length/rows.length*100).toFixed(1)}%, t=${tstat(allR).toFixed(2)}`);
   console.log(`  (mean R > 0 means the average trade makes money after costs. This is the`);
   console.log(`   number that has to be positive before ANY sizing scheme can help.)`);
+
+  // ── FRICTION DECOMPOSITION ───────────────────────────────────────────────
+  // Identical trades, identical entry/exit bars and triggers — the only difference
+  // is whether spread + slippage are charged. Anything left in the GROSS column is
+  // the signal's own contribution; the difference is what the broker and the spread
+  // take. Separating these says whether the problem is the idea or the tax on it.
+  console.log(`\n  FRICTION — same ${rows.length} trades, same entries and exits, fees on vs off:`);
+  console.log(`    GROSS (no spread/slippage):  ${mean(allG)>=0?'+':''}${mean(allG).toFixed(3)}R   t=${tstat(allG).toFixed(2)}`);
+  console.log(`    NET   (real fills):          ${mean(allR)>=0?'+':''}${mean(allR).toFixed(3)}R   t=${tstat(allR).toFixed(2)}`);
+  console.log(`    cost of trading:             ${(mean(allG)-mean(allR)).toFixed(3)}R per trade`);
+  // A positive gross mean is NOT enough — it has to clear both noise AND the toll.
+  // Reporting "the signal works, costs kill it" off an insignificant gross figure is
+  // how a coin-flip gets promoted to an edge.
+  const gm = mean(allG), gt = tstat(allG), toll = gm - mean(allR);
+  if (Math.abs(gt) < 2)
+    console.log(`    → gross is statistically INDISTINGUISHABLE FROM ZERO (|t|=${Math.abs(gt).toFixed(2)} < 2).\n` +
+                `      Even taken at face value, +${gm.toFixed(3)}R does not cover the ${toll.toFixed(3)}R toll:\n` +
+                `      the signal would have to be ~${(toll/Math.max(gm,1e-9)).toFixed(1)}× stronger just to break even.`);
+  else if (gm > 0)
+    console.log(`    → the raw signal is significantly positive; friction is what sinks it.`);
+  else
+    console.log(`    → the raw signal is significantly NEGATIVE before costs. Friction is not the problem.`);
 
   const FEATURES = [
     ['adx','ADX — trend strength'], ['rsi','RSI'], ['atr','ATR % — volatility'],
