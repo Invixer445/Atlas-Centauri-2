@@ -310,6 +310,13 @@ const MULTI_ENDS = ['2025-04-04','2025-06-30','2025-09-23','2025-12-16','2026-03
   }
   if (rows.length < 50) { console.error(`\n✖ Only ${rows.length} trades — too few to bucket.\n`); process.exit(1); }
 
+  // --dump writes the raw per-trade record out so downstream tools (project.js)
+  // can model from MEASURED outcomes rather than from a summary statistic.
+  if (arg('--dump', null)) {
+    fs.writeFileSync(arg('--dump'), JSON.stringify(rows, null, 0));
+    console.log(`\n  wrote ${rows.length} trade records to ${arg('--dump')}`);
+  }
+
   const allR = rows.map(r=>r.R);
   const allG = rows.map(r=>r.Rgross);
   console.log(`\n  POOLED: ${rows.length} trades, mean ${mean(allR)>=0?'+':''}${mean(allR).toFixed(3)}R, ` +
