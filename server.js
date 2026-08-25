@@ -1507,11 +1507,32 @@ function createJupiter(config = {}) {
     if (riskFraction <= 0) return 0;
 
     const equity = Math.max(0, T.capitalSystem.tradingCapital);
-    let shares = Math.floor((equity * riskFraction) / stopDistance);
-    if (!Number.isFinite(shares)) return 0;
-    const maxShares = Math.floor((equity * 0.60) / price);
-    if (maxShares >= 0) shares = Math.min(shares, maxShares);
-    return Math.max(0, shares);
+    const exact  = (equity * riskFraction) / stopDistance;      // the size risk math WANTS
+    if (!Number.isFinite(exact)) return 0;
+    const maxByNotional = (equity * 0.60) / price;
+
+    // FRACTIONAL SIZING (v11.28).
+    // Whole-share rounding is not a rounding error on a small account, it is a
+    // systematic distortion. With ~$700 and a $119 stock the sizer wants 1.47 shares
+    // and floors to 1 — risking 0.56% where 1.5% was intended, under-risking by ~3x.
+    // Above roughly $175 a share it floors to ZERO and the trade is rejected outright
+    // ("size below 1 share"), which is why the watchlist kept filling with names that
+    // could never trade. Fractional removes the price bias completely: notional works
+    // out to risk / stop%, so the position is the same economic size whether the share
+    // costs $9 or $967.
+    //
+    // Whole shares are still PREFERRED when they are available, because fractional
+    // orders must be market orders at Alpaca (see broker.js) and a market order pays
+    // the full spread instead of half. Cost is the dominant drag on this strategy, so
+    // fractional is used to RECOVER trades that would otherwise be refused, never to
+    // replace a whole-share fill that was already possible.
+    let size = Math.min(exact, maxByNotional);
+    if (size >= 1) return Math.max(0, Math.floor(size));        // whole-share path, cheaper
+    if (!FRACTIONAL_ENABLED) return 0;                          // legacy behaviour
+    // Alpaca accepts up to 9dp; 6 is far more than enough and avoids float noise.
+    size = Math.floor(size * 1e6) / 1e6;
+    if (size * price < MIN_FRACTIONAL_NOTIONAL) return 0;       // no dust positions
+    return Math.max(0, size);
   }
 
   // ── Terra calls this the instant a position opens (any trade, AI-sourced or
@@ -1899,7 +1920,13 @@ let portfolio = {
   longPositions:  {},   // { SYMBOL: [{ qty, entryPrice, highestPnL, openedAt }] }
   shortPositions: {},
   trades:       [],
-  closedTrades: []
+  closedTrades: [],
+  // The core holding lives OUTSIDE longPositions on purpose. Every exit path —
+  // stops, trailing, take-profit rungs, kill switches, loss halts — iterates
+  // longPositions, and a long-term holding must be invisible to all of them. Keeping
+  // it in its own field makes that structural rather than a rule someone must
+  // remember. See CORE_HOLD_FRACTION.
+  coreHolding: null     // { symbol, qty, avgPrice, investedCash, openedAt }
 };
 
 // ─── CAPITAL MANAGEMENT ──────────────────────────────────────────────────
@@ -1984,6 +2011,7 @@ let riskSystem = {
   dailyTradeCount:  0,
   dailyResetDate:   null,
   peakValue:        START_CAPITAL,
+  peakTotalValue:   START_CAPITAL,   // account-wide peak incl. core (see the emergency backstop)
   consecutiveLosses:0,           // kill-switch counter
   maxConsecutiveLosses: 4,       // halt after 4 straight losses
   lossHaltUntil:    0            // v11.19: when that halt actually expires (see LOSS_HALT_MS)
@@ -2162,11 +2190,14 @@ function simulatePartialFill(symbol, requestedQty, direction) {
   const jitter = (Math.random() - 0.5) * 0.10;
   const fillRate = Math.max(0.50, Math.min(1.0, baseFillRate + jitter));
 
-  const filled = Math.floor(requestedQty * fillRate);
+  // Preserve fractional quantities: flooring a 0.18-share order to 0 (or forcing it
+  // up to 1) would silently misreport the position by orders of magnitude.
+  const raw = requestedQty * fillRate;
+  const filled = isFractionalQty(requestedQty) ? Math.floor(raw * 1e6) / 1e6 : Math.floor(raw);
   if (filled < requestedQty) {
     console.log(`[FILL] ${direction} ${symbol} partial fill: ${filled}/${requestedQty} (${(fillRate*100).toFixed(0)}%, RVOL ${calculateRVOL(symbol).toFixed(2)}×)`);
   }
-  return Math.max(1, filled);
+  return isFractionalQty(requestedQty) ? Math.max(0, filled) : Math.max(1, filled);
 }
 
 // ─── MARKET IMPACT COST ───────────────────────────────────────────────────
@@ -2216,6 +2247,47 @@ const PRICE_HISTORY_LEN  = 60;   // indicator series length — 60 gives RSI(14)
 // money to roughly break-even at about half the market's exposure (beta 0.53). It
 // is not a demonstrated edge, and it is not a reason to expect profit.
 const DECISION_TIMEFRAME = (process.env.DECISION_TIMEFRAME || '1Hour');
+
+// ── FRACTIONAL SIZING (v11.28) ──────────────────────────────────────────────
+// Alpaca supports fractional quantities on fractionable US equities. Constraints
+// that matter here: fractional orders must be MARKET orders with day time-in-force,
+// and fractional shorting is not supported (irrelevant while LONG_ONLY is on).
+// Because a market order pays the full spread rather than half, fractional is used
+// only to rescue trades that whole-share sizing would reject outright.
+// ── CORE HOLDING (v11.28) ───────────────────────────────────────────────────
+// The one thing this project ever measured as reliably profitable is OWNING the
+// asset rather than trading it. Across every window, universe and benchmark run
+// here, buy-and-hold beat the strategy — most recently 20.9%/yr against a best
+// active variant of 12.1%/yr on the same data, and +$825 vs +$593 pooled across
+// seven 60-session windows.
+//
+// This lets a slice of capital simply hold a broad index while the rest keeps
+// trading, so the account is not relying solely on an edge that measured +0.005R
+// on stocks the bot was not built around.
+//
+// DEFAULT IS 0 — OFF. Deciding how much of your money sits in a long-term holding
+// is your call, not the bot's, so nothing is allocated unless you set it. Set
+// CORE_HOLD_FRACTION=0.5 to put half the account in the core.
+//
+// It is a HOLD: the bot buys toward the target and never trims on signals. Trading
+// kill switches deliberately do NOT liquidate it — they exist to stop bad trading,
+// and panic-selling a long-term position on a trading halt is precisely the
+// behaviour that destroys buy-and-hold returns. The admin emergency stop still
+// closes everything.
+const CORE_HOLD_SYMBOL   = (process.env.CORE_HOLD_SYMBOL || 'SPY').toUpperCase();
+const CORE_HOLD_FRACTION = Math.max(0, Math.min(0.9, parseFloat(process.env.CORE_HOLD_FRACTION || '0')));
+const CORE_HOLD_ON       = CORE_HOLD_FRACTION > 0;
+// Only top up when meaningfully below target, so a drifting price does not generate
+// a stream of tiny orders that pay spread for nothing.
+const CORE_REBALANCE_BAND = 0.10;
+
+const FRACTIONAL_ENABLED = process.env.FRACTIONAL_ENABLED !== 'false';
+// Floor on position value, so a rescued trade is worth the spread it pays. Alpaca's
+// own minimum is $1; $5 keeps the book free of dust that costs more to exit than it
+// can return.
+const MIN_FRACTIONAL_NOTIONAL = Math.max(1, parseFloat(process.env.MIN_FRACTIONAL_NOTIONAL || '5'));
+// Shared helper: is this quantity a fraction rather than a whole number of shares?
+const isFractionalQty = (q) => Number.isFinite(q) && q > 0 && Math.abs(q - Math.round(q)) > 1e-9;
 // Stale-data guard: don't trade a symbol whose price hasn't updated in >90s
 const MAX_PRICE_AGE_MS   = 90000;
 // Don't trade in the first 5 or last 5 minutes of a session (high noise)
@@ -2496,8 +2568,14 @@ function getMarketStatus() {
 }
 
 function symbolsForMarket(market) {
-  if (market === 'nasdaq') return [...WATCHLISTS.nasdaq, ...WATCHLISTS.nyse];
-  return [];
+  if (market !== 'nasdaq') return [];
+  const core = [...WATCHLISTS.nasdaq, ...WATCHLISTS.nyse];
+  // The core-holding symbol must be in the priced/subscribed universe even if it is
+  // not on a watchlist, or maintainCoreHolding() never sees a price and silently
+  // never buys. The entry scan skips it separately, so including it here cannot
+  // cause it to be traded.
+  if (CORE_HOLD_ON && !core.includes(CORE_HOLD_SYMBOL)) core.push(CORE_HOLD_SYMBOL);
+  return core;
 }
 
 // Time-of-day filter — skip the chaotic first and last N minutes of a session.
@@ -3346,7 +3424,13 @@ async function runIntelCycle() {
 // Scales automatically as the account grows, so this stops being a constraint once
 // the balance can support it.
 const MAX_SINGLE_SHARE_FRACTION = 0.25;   // 1 share ≤ 25% of the trading book
-function affordableMaxPrice() {
+function affordableMaxPrice(fractional = FRACTIONAL_ENABLED) {
+  // With fractional sizing the share price stops mattering: the sizer buys 0.18 of a
+  // $967 share just as happily as 20 shares of $9, and lands on the SAME notional
+  // (risk / stop%). The affordability ceiling only exists because whole-share rounding
+  // made expensive stocks unsizeable, so it is lifted when that constraint is gone.
+  // It remains as the fallback for non-fractional operation.
+  if (fractional) return DYNAMIC_MAX_PRICE;
   const tv = getTotalValue();
   const trading = Math.max(0, tv * (1 - capitalSystem.reserveRatio));
   return Math.max(DYNAMIC_MIN_PRICE, Math.min(DYNAMIC_MAX_PRICE, trading * MAX_SINGLE_SHARE_FRACTION));
@@ -4119,6 +4203,10 @@ function detectMarketRegime() {
 
 function getTotalValue() {
   let value = portfolio.cash;
+  // The core holding is real equity and must count, or every percentage the engine
+  // computes off total value (risk sizing, drawdown, exposure) is wrong the moment
+  // a core position exists.
+  value += coreHoldingValue();
   Object.entries(portfolio.longPositions).forEach(([ticker, positions]) => {
     const price = marketData[ticker]?.price;
     positions.forEach(pos => {
@@ -4142,6 +4230,15 @@ function getTotalValue() {
     });
   });
   return Number.isFinite(value) ? value : portfolio.cash;
+}
+
+// Equity the TRADING engine manages: everything except the core holding. Risk limits
+// are fractions of this, never of total equity — a core position must not be able to
+// dilute a safety threshold. Every one of these three consumers was measurably
+// weakened by counting it: the daily-loss brake tripped later, portfolio heat read
+// lower than reality, and the profit vault drained trading cash on index gains.
+function tradableValue() {
+  return Math.max(0, getTotalValue() - coreHoldingValue());
 }
 
 function getNotionalExposure() {
@@ -4178,7 +4275,15 @@ function rebalanceCapital() {
   // reserveCash is a SOFT target for display — it does not represent money locked
   // in a separate account. All cash is in portfolio.cash; reserve is a fraction of
   // total equity we track to show the user what "should" stay untouched.
-  capitalSystem.reserveCash = tv * capitalSystem.reserveRatio;
+  // The core holding is INVESTED equity, not a cash buffer, so it must be excluded
+  // before the reserve is computed. Including it inflated both the reserve target and
+  // the free-capital cap: at a 50% core the cap stopped binding entirely and the
+  // reserve was quietly no longer honoured. The trading engine reasons only about the
+  // slice of the account it actually manages.
+  const coreVal   = coreHoldingValue();
+  const tradableEquity = Math.max(0, tv - coreVal);
+  capitalSystem.coreValue = coreVal;                    // surfaced for the dashboard
+  capitalSystem.reserveCash = tradableEquity * capitalSystem.reserveRatio;
 
   // tradingCapital = cash that is genuinely free to deploy.
   // We cap it at tv*(1-reserveRatio) to honour the reserve intent.
@@ -4186,7 +4291,7 @@ function rebalanceCapital() {
   // deducted from portfolio.cash when processProfitVault deposited them, so
   // subtracting them here would double-penalise — reducing tradingCapital by
   // $1 for every $1 vaulted even though that cash is already gone.
-  const freeCapitalCap = Math.max(0, tv * (1 - capitalSystem.reserveRatio));
+  const freeCapitalCap = Math.max(0, tradableEquity * (1 - capitalSystem.reserveRatio));
   capitalSystem.tradingCapital = Math.min(portfolio.cash, freeCapitalCap);
   capitalSystem.tradingCapital = Math.max(0, capitalSystem.tradingCapital);
 
@@ -4199,8 +4304,87 @@ function rebalanceCapital() {
   }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+//  CORE HOLDING — buy the index and leave it alone
+//  Deliberately minimal: it buys toward a target weight and never sells on a
+//  signal. No stop, no target, no trail. That is the entire point — the measured
+//  advantage of holding comes precisely from not reacting.
+// ════════════════════════════════════════════════════════════════════════════
+function coreHoldingValue() {
+  const c = portfolio.coreHolding;
+  if (!c || !(c.qty > 0)) return 0;
+  const px = marketData[c.symbol]?.price;
+  return Number.isFinite(px) && px > 0 ? c.qty * px : c.investedCash;
+}
+
+// How many shares to add to reach the target weight — a PURE function, split out from
+// maintainCoreHolding so the sizing decision is testable without a live market. The
+// gating (market open, fresh price, broker) stays in the caller.
+// Returns 0 when no purchase is warranted. TOP-UP ONLY: never returns a sell.
+function coreTopUpQty(price, totalValue, currentCoreValue, cash) {
+  if (!CORE_HOLD_ON) return 0;
+  if (!Number.isFinite(price) || price <= 0) return 0;
+  const target = totalValue * CORE_HOLD_FRACTION;
+  const gap    = target - currentCoreValue;
+  // Band keeps ordinary price drift from generating a stream of tiny spread-paying buys.
+  if (gap <= target * CORE_REBALANCE_BAND) return 0;
+  const spend = Math.min(gap, Math.max(0, cash - 1));      // leave $1 so cash never hits 0
+  if (spend < Math.max(MIN_FRACTIONAL_NOTIONAL, 1)) return 0;
+  let qty = spend / price;
+  qty = FRACTIONAL_ENABLED ? Math.floor(qty * 1e6) / 1e6 : Math.floor(qty);
+  return qty > 0 ? qty : 0;
+}
+
+function maintainCoreHolding() {
+  if (!CORE_HOLD_ON) return;
+  if (!getCurrentMarket()) return;                       // only during market hours
+  const px = marketData[CORE_HOLD_SYMBOL]?.price;
+  if (!Number.isFinite(px) || px <= 0) return;
+  if (marketData[CORE_HOLD_SYMBOL].lastUpdate &&
+      (Date.now() - marketData[CORE_HOLD_SYMBOL].lastUpdate) > MAX_PRICE_AGE_MS) return;
+
+  const qty = coreTopUpQty(px, getTotalValue(), coreHoldingValue(), portfolio.cash);
+  if (!(qty > 0)) return;
+
+  const cost = qty * px;
+  if (cost > portfolio.cash) return;
+  portfolio.cash -= cost;
+  const c = portfolio.coreHolding;
+  if (c && c.qty > 0) {
+    c.avgPrice = (c.avgPrice * c.qty + cost) / (c.qty + qty);
+    c.qty += qty;
+    c.investedCash += cost;
+  } else {
+    portfolio.coreHolding = { symbol: CORE_HOLD_SYMBOL, qty, avgPrice: px,
+                              investedCash: cost, openedAt: Date.now() };
+  }
+  console.log(`[CORE] 🏛  Bought ${qty.toFixed(6)} ${CORE_HOLD_SYMBOL} @ $${px.toFixed(2)} ` +
+              `($${cost.toFixed(2)}) — core now $${coreHoldingValue().toFixed(2)} of $${target.toFixed(2)} target`);
+  if (LIVE_TRADING && broker && broker.configured) {
+    // The ledger was debited above. If the broker refuses the order, that debit is a
+    // lie — roll it back rather than letting ATLAS believe it owns shares it does not.
+    const rollback = (why) => {
+      portfolio.cash += cost;
+      const h = portfolio.coreHolding;
+      if (h) {
+        h.qty -= qty; h.investedCash -= cost;
+        if (h.qty <= 1e-9) portfolio.coreHolding = null;
+      }
+      console.warn(`[CORE] core buy failed (${why}) — ledger rolled back $${cost.toFixed(2)}`);
+      queueSaveState();
+    };
+    broker.submitOrder({ symbol: CORE_HOLD_SYMBOL, side: 'buy', qty, type: 'market',
+                         tif: 'day', refPrice: px })
+      .then(r => { if (!r.ok) rollback(r.error); })
+      .catch(e => rollback(e.message));
+  }
+  queueSaveState();
+}
+
 function processProfitVault() {
-  const tv = getTotalValue();
+  // Trading equity only: vaulting because the held index rose would siphon trading
+  // cash out on a gain the trading engine never made.
+  const tv = tradableValue();
   if (capitalSystem.lastVaultValue <= 0) { capitalSystem.lastVaultValue = tv; return; }
   const growth = (tv - capitalSystem.lastVaultValue) / capitalSystem.lastVaultValue;
   if (growth >= capitalSystem.vaultTrigger) {
@@ -4254,7 +4438,10 @@ function computeDrawdown(peakValue, totalValue) {
 }
 
 function wouldExceedHeat(price, qty) {
-  const tv = getTotalValue();
+  // getNotionalExposure() counts only traded positions, so the divisor must match.
+  // Mixing a core-inclusive denominator with a core-exclusive numerator understated
+  // heat and let the book take on more exposure than the cap intends.
+  const tv = tradableValue();
   if (tv <= 0) return true;
   return (getNotionalExposure() + price * qty) / tv > riskSystem.maxPortfolioHeat;
 }
@@ -4429,7 +4616,11 @@ function submitBrokerOrder(meta) {
   // order is cancelled after ORDER_TIMEOUT_MS and the scan re-evaluates.
   // EVERY OTHER kind — exits, stops, partials — stays a MARKET order. Getting out must
   // never depend on a resting limit being reached.
-  const useLimit = LIMIT_ENTRIES && meta.kind === 'entry' && Number(refPrice) > 0;
+  // A fractional quantity cannot be a limit order at Alpaca, so such an entry must go
+  // out as market. broker.js coerces this too; deciding it here as well keeps the
+  // engine's own cost model honest about which side of the spread it will pay.
+  const useLimit = LIMIT_ENTRIES && meta.kind === 'entry' && Number(refPrice) > 0
+                   && !isFractionalQty(qty);
   const orderType = useLimit ? 'limit' : 'market';
   const limitPrice = useLimit ? +Number(refPrice).toFixed(2) : null;
   broker.submitOrder({ symbol: ticker, side, qty, type: orderType, limitPrice, tif: 'day', refPrice })
@@ -4546,7 +4737,10 @@ async function syncFromBroker() {
         const dir  = bp.side === 'short' || bp.qty < 0 ? 'SHORT' : 'LONG';
         const book = dir === 'LONG' ? portfolio.longPositions : portfolio.shortPositions;
         const qty  = Math.abs(bp.qty);
-        if ((book[bp.symbol] || []).length > 0 || qty < 1) continue;   // internal already tracks it
+        // `qty < 1` here silently ignored every FRACTIONAL broker position, leaving it
+        // untracked by ATLAS and therefore with no stop-loss attached. Adopt anything
+        // that is a real position; only a true zero is skipped.
+        if ((book[bp.symbol] || []).length > 0 || qty <= 0) continue;   // internal already tracks it
         const frac = Math.min(0.15, Math.max(0.02, 2.2 * (atrPct(bp.symbol) || 0.02)));
         const stopPrice = dir === 'LONG' ? bp.avg_entry_price * (1 - frac) : bp.avg_entry_price * (1 + frac);
         const tgtPrice  = dir === 'LONG' ? bp.avg_entry_price * (1 + frac * 2.1) : bp.avg_entry_price * (1 - frac * 2.1);
@@ -4589,7 +4783,7 @@ function executionDriftPct() {
 function routeToBroker(symbol, side, qty) {
   if (!LIVE_TRADING) return;
   if (EXEC_BROKER_AUTH) return;   // v11.18: fire-and-forget retired — the pending-order lifecycle owns all orders
-  if (!qty || qty < 1) return;
+  if (!Number.isFinite(qty) || qty <= 0) return;   // fractional quantities are valid orders
   // side: 'buy' (open long / cover short) or 'sell' (open short / exit long)
   broker.submitOrder({ symbol, side, qty, type: 'market', tif: 'day' })
     .then(r => {
@@ -4621,9 +4815,38 @@ function routeToBroker(symbol, side, qty) {
 
 const tradeRejections = [];   // rolling log of plans Terra rejected (surfaced at /api/portfolio)
 const _rejectionLogGate = {};  // console dedupe only — the record above captures everything
+// Rolling tally of WHY trades did not happen today, so a zero-trade day is
+// diagnosable instead of silent. Keyed by the leading words of the reason, since the
+// tail carries per-symbol numbers that would otherwise fragment the count.
+let _dailyRejectTally = {}, _dailyRejectDay = '';
+function rejectionBucket(reason) {
+  return String(reason).replace(/\$?[\d.]+%?/g, 'N').replace(/\s+/g, ' ').trim().slice(0, 60);
+}
+function noteDailyRejection(reason) {
+  const day = getEasternTimeParts().dateStr || new Date().toISOString().slice(0, 10);
+  if (day !== _dailyRejectDay) { _dailyRejectDay = day; _dailyRejectTally = {}; }
+  const b = rejectionBucket(reason);
+  _dailyRejectTally[b] = (_dailyRejectTally[b] || 0) + 1;
+}
+// Called at the session close. If the bot did not trade, this says what stopped it.
+function logDailyTradeDigest() {
+  const day = _dailyRejectDay || new Date().toISOString().slice(0, 10);
+  const traded = portfolio.trades.filter(t => String(t.openedAt || t.at || '').slice(0, 10) === day).length;
+  const top = Object.entries(_dailyRejectTally).sort((a, b) => b[1] - a[1]).slice(0, 4);
+  if (traded > 0) {
+    console.log(`[DAY] ${day}: ${traded} trade(s) opened.` +
+                (top.length ? `  Most common block: ${top[0][0]} (${top[0][1]}×)` : ''));
+  } else {
+    console.log(`[DAY] ${day}: NO TRADES. The goal is to trade daily within profit parameters — here is what stopped it:`);
+    if (!top.length) console.log(`       nothing was even evaluated (market closed, data missing, or entries halted).`);
+    top.forEach(([r, n]) => console.log(`       ${String(n).padStart(4)}×  ${r}`));
+  }
+}
+
 function recordRejection(plan, reason) {
   tradeRejections.push({ at: new Date().toISOString(), ticker: plan.ticker, direction: plan.direction, reason });
   if (tradeRejections.length > 50) tradeRejections.shift();
+  noteDailyRejection(reason);
   // The 10s scan re-attempts the same rejected candidates, which floods the console
   // with identical lines (seen live: dozens of "size below 1 share" repeats/minute).
   // Log each unique symbol+direction+reason at most once per 60s; the full stream is
@@ -4680,7 +4903,16 @@ function terraValidateTrade(plan) {
   if (entryPrice > DYNAMIC_MAX_PRICE)                             return reject(`price $${entryPrice.toFixed(2)} above $${DYNAMIC_MAX_PRICE} max`);
 
   // RULE 3 — Jupiter must have produced a real size
-  if (!Number.isFinite(shares) || shares < 1)                     return reject('size below 1 share');
+  // Size must be a real, tradeable quantity. With fractional sizing on, anything at or
+  // above the dust floor is tradeable; without it, the broker's whole-share minimum
+  // applies. Checking the NOTIONAL rather than the share count is the honest test —
+  // "is this position big enough to be worth opening?" — and it no longer punishes a
+  // stock merely for having a high share price.
+  if (!Number.isFinite(shares) || shares <= 0)                    return reject('size below 1 share');
+  if (FRACTIONAL_ENABLED) {
+    if (shares * entryPrice < MIN_FRACTIONAL_NOTIONAL)
+      return reject(`position $${(shares * entryPrice).toFixed(2)} below the $${MIN_FRACTIONAL_NOTIONAL} minimum`);
+  } else if (shares < 1)                                          return reject('size below 1 share');
 
   // RULE 3.5 — THE ECONOMIC GATE (v11.20). Rules 1-3 establish the plan is well-formed;
   // these establish it can actually PAY. Gross R:R is geometry; this is money. Without
@@ -4739,7 +4971,10 @@ function terraExecutePlan(plan) {
   const { ticker, direction, entryPrice } = plan;
   const side = direction === 'LONG' ? 'buy' : 'sell';
   const filledSize = simulatePartialFill(ticker, plan.shares, direction);
-  if (filledSize < 1) { console.log(`[TERRA] ${direction} ${ticker} not filled (thin market)`); return false; }
+  // A fractional order fills fractionally. The old `< 1` test read a perfectly good
+  // 0.18-share fill as "thin market" and discarded EVERY fractional trade.
+  const minFill = isFractionalQty(plan.shares) ? 1e-6 : 1;
+  if (filledSize < minFill) { console.log(`[TERRA] ${direction} ${ticker} not filled (thin market)`); return false; }
   // Entries are limit orders (see LIMIT_ENTRIES) — model them as not crossing the spread.
   const fillPrice = simulateFillPrice(entryPrice, side, ticker, filledSize, { limit: LIMIT_ENTRIES });
   return applyEntryFill(plan, fillPrice, filledSize, false);
@@ -4951,8 +5186,12 @@ function partialClose(ticker, direction, fraction, rung, opts = {}) {
     positions.forEach(p => {
       p.partialsTaken = p.partialsTaken || {};
       if (p.partialsTaken[rung]) return;
-      const q = Math.floor(p.qty * fraction);
-      if (q < 1) { p.partialsTaken[rung] = true; return; }            // too small to ladder
+      // Fractional lots must ladder fractionally, else Math.floor turns every partial
+      // on a 0.18-share position into 0 and the rung is silently marked "taken".
+      const q = isFractionalQty(p.qty) ? Math.floor(p.qty * fraction * 1e6) / 1e6
+                                       : Math.floor(p.qty * fraction);
+      const minQ = isFractionalQty(p.qty) ? 1e-6 : 1;
+      if (q < minQ) { p.partialsTaken[rung] = true; return; }         // too small to ladder
       sells.push({ lotId: p.lotId, qty: q });
       p._pendingRung = rung;
     });
@@ -4996,9 +5235,11 @@ function partialClose(ticker, direction, fraction, rung, opts = {}) {
       sellQty = sellFor[pos.lotId];
       delete pos._pendingRung;                  // consumed
     } else {
-      sellQty = Math.floor(pos.qty * fraction);
+      sellQty = isFractionalQty(pos.qty) ? Math.floor(pos.qty * fraction * 1e6) / 1e6
+                                         : Math.floor(pos.qty * fraction);
     }
-    if (sellQty < 1) { pos.partialsTaken[rung] = true; return; }  // too small to ladder
+    const minSell = isFractionalQty(pos.qty) ? 1e-6 : 1;
+    if (sellQty < minSell) { pos.partialsTaken[rung] = true; return; }  // too small to ladder
 
     if (direction === 'LONG') {
       realizedPnL += (exitPrice - pos.entryPrice) * sellQty;
@@ -5239,6 +5480,7 @@ function buildStateObject() {
     longPositions:  portfolio.longPositions,
     shortPositions: portfolio.shortPositions,
     trades:         portfolio.trades.slice(-500),
+    coreHolding:    portfolio.coreHolding,
     closedTrades:   portfolio.closedTrades.slice(-500),
     marketTransition: marketTransitionData,
     capitalSystem,
@@ -5274,6 +5516,7 @@ function buildStateObject() {
       dailyTradeCount:   riskSystem.dailyTradeCount,
       dailyResetDate:    riskSystem.dailyResetDate,
       peakValue:         riskSystem.peakValue,
+      peakTotalValue:    riskSystem.peakTotalValue,
       consecutiveLosses: riskSystem.consecutiveLosses,
       lossHaltUntil:     riskSystem.lossHaltUntil    // persisted so a restart can't skip the cool-off
     },
@@ -5380,6 +5623,12 @@ function loadState() {
     portfolio.shortPositions  = state.shortPositions ?? {};
     portfolio.trades          = state.trades          ?? [];
     portfolio.closedTrades    = state.closedTrades    ?? [];
+    // Restore the core holding, but validate it: a corrupt qty here would silently
+    // inflate total equity and therefore every risk calculation derived from it.
+    const ch = state.coreHolding;
+    portfolio.coreHolding = (ch && typeof ch === 'object' && Number.isFinite(ch.qty) && ch.qty > 0
+                             && typeof ch.symbol === 'string' && Number.isFinite(ch.avgPrice) && ch.avgPrice > 0)
+                            ? ch : null;
     marketTransitionData      = state.marketTransition ?? marketTransitionData;
     symbolCooldowns           = state.symbolCooldowns  ?? {};
     symbolLossCount           = state.symbolLossCount  ?? {};
@@ -5425,6 +5674,7 @@ function loadState() {
       riskSystem.dailyTradeCount    = state.riskSystem.dailyTradeCount    ?? 0;
       riskSystem.dailyResetDate     = state.riskSystem.dailyResetDate     ?? null;
       riskSystem.peakValue          = state.riskSystem.peakValue          ?? START_CAPITAL;
+      riskSystem.peakTotalValue     = state.riskSystem.peakTotalValue     ?? START_CAPITAL;
       riskSystem.consecutiveLosses  = state.riskSystem.consecutiveLosses  ?? 0;
       riskSystem.lossHaltUntil      = state.riskSystem.lossHaltUntil      ?? 0;
     }
@@ -5829,11 +6079,34 @@ function evaluateAndTrade() {
 
   // ── 2. RISK GATES ─────────────────────────────────────────────────────────
   const totalValue = getTotalValue();
-  const _dd = computeDrawdown(riskSystem.peakValue, totalValue);
+  // ATTRIBUTION: the trading kill switches exist to stop BAD TRADING, so they must
+  // measure the TRADING book. Once a core holding exists, totalValue moves with the
+  // index, and drawdown computed on it would halt entries because the market fell —
+  // not because the strategy misbehaved. Trading drawdown is therefore measured on
+  // equity excluding the core.
+  //
+  // The account-wide risk is NOT dropped: a separate total-equity emergency check
+  // below still halts entries if the whole account craters. Two distinct risks, two
+  // measurements, neither ignored.
+  const coreValue    = coreHoldingValue();
+  const tradingValue = Math.max(0, totalValue - coreValue);
+  const _dd = computeDrawdown(riskSystem.peakValue, tradingValue);
   riskSystem.peakValue       = _dd.peak;
   riskSystem.currentDrawdown = _dd.drawdown;
-  riskSystem.peakValue       = Math.max(riskSystem.peakValue, totalValue);
-  riskSystem.portfolioHeat   = totalValue > 0 ? Math.max(0, getNotionalExposure() / totalValue) : 0;
+  riskSystem.peakValue       = Math.max(riskSystem.peakValue, tradingValue);
+  riskSystem.portfolioHeat   = tradingValue > 0 ? Math.max(0, getNotionalExposure() / tradingValue) : 0;
+
+  // Account-wide backstop, including the core. Deliberately a wider threshold than the
+  // trading one — a held index position is expected to swing, and reacting to that is
+  // the behaviour the core exists to avoid. This catches genuine catastrophe only.
+  const _ddTotal = computeDrawdown(riskSystem.peakTotalValue || totalValue, totalValue);
+  riskSystem.peakTotalValue    = Math.max(riskSystem.peakTotalValue || 0, _ddTotal.peak, totalValue);
+  riskSystem.totalDrawdown     = _ddTotal.drawdown;
+  if (CORE_HOLD_ON && riskSystem.totalDrawdown >= Math.min(0.5, capitalSystem.emergencyDrawdown * 2)) {
+    if (!capitalSystem.emergencyStop)
+      console.log(`[EMERGENCY] Account-wide drawdown ${(riskSystem.totalDrawdown*100).toFixed(1)}% — halting entries`);
+    capitalSystem.emergencyStop = true;
+  }
 
   if (riskSystem.currentDrawdown >= capitalSystem.safeModeDrawdown)       capitalSystem.safeMode = true;
   // Auto-release only applies to the AUTOMATIC trigger. A manually-activated Safe Mode
@@ -5854,7 +6127,7 @@ function evaluateAndTrade() {
   // reads as a bigger % and trips the brake sooner. (Deliberately NOT
   // max(START_CAPITAL, equity): that variant would loosen the brake exactly when the
   // account is losing, which is backwards for a survival-first bot.)
-  const dailyLossPct = riskSystem.dailyRealizedLoss / Math.max(1, getTotalValue());
+  const dailyLossPct = riskSystem.dailyRealizedLoss / Math.max(1, tradableValue());
   riskSystem.checksPassing = [];
   if (riskSystem.currentDrawdown <= riskSystem.maxDrawdown)      riskSystem.checksPassing.push('drawdown');
   if (riskSystem.portfolioHeat   <= riskSystem.maxPortfolioHeat) riskSystem.checksPassing.push('heat');
@@ -5962,6 +6235,10 @@ function evaluateAndTrade() {
   });
 
   for (const symbol of rankedSymbols) {
+    // Never trade the core holding's symbol. Both books would map to ONE broker
+    // position, so a trading exit could sell shares the core believes it still owns —
+    // ledger and broker would diverge with no way to tell which side is wrong.
+    if (CORE_HOLD_ON && symbol === CORE_HOLD_SYMBOL) continue;
     const q = marketData[symbol];
     if (!q || !q.price || !q.prevClose) continue;
     // Per-symbol staleness guard: the kill switch above only halts NEW entries
@@ -6538,6 +6815,10 @@ if (require.main === module) app.listen(PORT, async () => {
               `${LONG_ONLY ? 'LONG-ONLY' : 'long+short'} | stop ${STRATEGY.ATR_STOP_MULT}xATR target ${STRATEGY.ATR_TARGET_MULT}xATR`);
   console.log(`[CONFIG] risk ${(STRATEGY.RISK_PER_TRADE_BASE*100).toFixed(1)}%/trade | ATR floor ${(STRATEGY.MIN_ATR_ENTRY*100).toFixed(2)}% | ` +
               `net R:R >= ${STRATEGY.MIN_RR_NET} | cost ceiling ${(STRATEGY.MAX_ROUND_TRIP_COST*100).toFixed(2)}%`);
+  console.log(`[CONFIG] fractional sizing ${FRACTIONAL_ENABLED ? `ON (min $${MIN_FRACTIONAL_NOTIONAL} position)` : 'OFF'} | ` +
+              (CORE_HOLD_ON
+                ? `core holding ${(CORE_HOLD_FRACTION*100).toFixed(0)}% ${CORE_HOLD_SYMBOL}`
+                : `core holding OFF (set CORE_HOLD_FRACTION=0.5 to hold half in ${CORE_HOLD_SYMBOL})`));
 
   // ── Wire JUPITER to Terra's live state + indicator helpers ──
   // (Objects are shared by reference, so Jupiter always reads current values.)
@@ -6636,6 +6917,19 @@ if (require.main === module) app.listen(PORT, async () => {
     evaluateAndTrade();
   }, 2000);
 
+  // 5a. End-of-session digest. Fires once, on the open->closed transition, so a
+  //     zero-trade day reports its cause the same day rather than vanishing.
+  let _wasOpen = false;
+  setInterval(() => {
+    const openNow = !!getCurrentMarket();
+    if (_wasOpen && !openNow) logDailyTradeDigest();
+    _wasOpen = openNow;
+  }, 60000);
+
+  // 5b. Core holding — top up toward target weight. Every 5 min is ample for a
+  //     position that is never meant to be traded.
+  if (CORE_HOLD_ON) setInterval(maintainCoreHolding, 300000);
+
   // 6. Profit vault — every 5 min
   setInterval(processProfitVault, 300000);
 
@@ -6701,9 +6995,12 @@ module.exports = {
     LONG_ONLY,
     marketCalendar: () => marketCalendar, getCurrentMarket, getEasternTimeParts, resolveSession,
     atrQuality, hasReliableVolatility, MIN_CANDLES_FOR_ATR,
-    releaseExpiredLossHalt, LOSS_HALT_MS, getKillSwitchReason, lossHaltReason, priceFeedHalt,
+    releaseExpiredLossHalt, LOSS_HALT_MS, getKillSwitchReason, lossHaltReason, priceFeedHalt, riskSystem, aiSystem,
     institutionalScore, ideaDirection, EFFECTIVE_MIN_DAY_VOL, FEED_VOLUME_FACTOR, DYNAMIC_MIN_DAY_VOL,
     extractJsonArray, extractJsonObject, affordableMaxPrice, MAX_SINGLE_SHARE_FRACTION, fetchBars,
+    FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
+    CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_FRACTION, coreHoldingValue, maintainCoreHolding, coreTopUpQty,
+    logDailyTradeDigest, rejectionBucket, noteDailyRejection, tradableValue, wouldExceedHeat,
     estimateRoundTripCost, netRewardRisk, sideCost, LIMIT_ENTRIES, estimateDynamicSpread,
     evaluateStrategyGate, calculateADX, calculateRVOL, getCandleTrend, priceMidpoint, detectMarketRegime,
     setPendingOrders: (o) => { pendingOrders = o; } }

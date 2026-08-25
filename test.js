@@ -1252,26 +1252,296 @@ check('the backtest harness defaults to the live decision timeframe', () => {
 // ════════════════════════════════════════════════════════════════════════════
 group('Small-account affordability and feed health');
 
-check('unaffordable share prices are screened out', () => {
+check('without fractional sizing, unaffordable prices are screened out', () => {
   // Live: Venus spent watchlist slots on NVDA $215, CEG $273 and MU $967 against a
   // ~$700 trading book. One MU share is 138% of the book; all three then failed with
   // "size below 1 share" on every cycle forever.
-  const ceiling = I.affordableMaxPrice();
+  const ceiling = I.affordableMaxPrice(false);
   const tv = I.getTotalValue();
   ok(ceiling > 0 && ceiling < tv, `ceiling ${ceiling} must be a real fraction of ${tv}`);
   ok(ceiling < 966.54, `MU at $966.54 must be excluded on a $${tv.toFixed(0)} account (ceiling $${ceiling.toFixed(2)})`);
   ok(ceiling < 215.24, `NVDA at $215.24 must be excluded (ceiling $${ceiling.toFixed(2)})`);
 });
 
-check('the affordability ceiling scales with the account', () => {
-  // It must stop constraining once the balance can genuinely support the position,
-  // rather than being a permanent hardcoded cap.
-  const before = I.affordableMaxPrice();
+check('without fractional sizing, the ceiling scales with the account', () => {
+  const before = I.affordableMaxPrice(false);
   const saved = I.portfolio.cash;
   I.portfolio.cash = saved + 100000;
-  const after = I.affordableMaxPrice();
+  const after = I.affordableMaxPrice(false);
   I.portfolio.cash = saved;
   ok(after > before, `ceiling should rise with equity: ${before.toFixed(2)} -> ${after.toFixed(2)}`);
+});
+
+check('with fractional sizing the price ceiling is lifted entirely', () => {
+  // Fractional sizing buys 0.18 of a $967 share and lands on the same notional as
+  // 20 shares of $9, so share price stops being a constraint at all.
+  ok(I.affordableMaxPrice(true) >= 966.54,
+     `fractional mode must not exclude high-priced names, got ${I.affordableMaxPrice(true)}`);
+});
+
+check('fractional sizing produces a real size at any share price', () => {
+  // Calls the ENGINE's own sizer, not a re-implementation of its arithmetic — the
+  // first version of this test recomputed the formula inline and therefore passed
+  // even with fractional sizing ripped out of server.js. Vacuous; caught by mutation.
+  const eng = require('./server.js');
+  const jup = eng.jupiter;
+  // Jupiter is wired to Terra during startup, which a test process never runs — an
+  // un-wired Jupiter returns 0 for EVERY size, which would make this test pass for
+  // entirely the wrong reason. Wire it the same way startup does.
+  jup.init({
+    strategy: I.STRATEGY,
+    venus: eng.venus,
+    capitalSystem: I.capitalSystem, riskSystem: I.riskSystem, aiSystem: I.aiSystem,
+    helpers: {
+      atrPct: I.atrPct, calculateATR: I.calculateATR, calculateRVOL: I.calculateRVOL,
+      calculateMarketStress: () => 0,
+      getGapSizeAdjust: I.getGapSizeAdjust, calculateTradeExpectancy: I.calculateTradeExpectancy,
+      isHighVolatility: () => false,
+      closedTradeCount: () => 0,
+      adx: I.calculateADX, rsi: (s) => I.rsi(I.marketData[s]?.history || [], I.STRATEGY.RSI_PERIOD),
+      regimeNumeric: () => 0, sessionFraction: () => 0.5,
+      spread: I.estimateDynamicSpread,
+      quote: (s) => { const m = I.marketData[s]; return m ? { price: m.price, prevClose: m.prevClose } : null; }
+    }
+  });
+  const saved = I.capitalSystem.tradingCapital;
+  I.capitalSystem.tradingCapital = 700;
+  const sizes = {};
+  [9.10, 119.33, 215.24, 966.54].forEach(price => {
+    const sym = 'FRAC_' + Math.round(price);
+    // Seed enough state for atrPct() to resolve to a real volatility.
+    I.marketData[sym] = { price, prevClose: price, dayOpen: price, high: price * 1.01,
+                          low: price * 0.99, dailyVolume: 5e6, lastUpdate: Date.now(),
+                          history: Array.from({ length: 40 }, (_, i) => price * (1 + (i % 5 - 2) * 0.002)) };
+    sizes[price] = jup.computeSize(sym, price, 'LONG');
+  });
+  I.capitalSystem.tradingCapital = saved;
+  if (!I.FRACTIONAL_ENABLED) {
+    // Legacy whole-share mode: expensive names are SUPPOSED to size to zero. Assert
+    // the old behaviour rather than the new one, so this run still proves something.
+    ok(sizes[966.54] === 0, `whole-share mode must floor a $966 share to 0, got ${sizes[966.54]}`);
+    ok(sizes[9.10] > 0, 'a cheap share must still be tradeable in whole-share mode');
+    return;
+  }
+  Object.entries(sizes).forEach(([price, q]) => {
+    ok(q > 0, `$${price} must produce a tradeable size, got ${q} (whole-share rounding would give 0)`);
+  });
+  // The expensive names are exactly the ones whole-share sizing floored to zero.
+  ok(sizes[966.54] > 0 && sizes[966.54] < 1,
+     `a $966 share on a $700 book must size fractionally, got ${sizes[966.54]}`);
+  ok(sizes[215.24] > 0, `a $215 share must be tradeable, got ${sizes[215.24]}`);
+});
+
+check('dust positions are refused', () => {
+  // Fractional sizing makes it possible to open a $0.40 position, which costs more in
+  // spread to exit than it can ever return. The gate must reject on NOTIONAL.
+  const S = I.STRATEGY;
+  const plan = {
+    ticker: 'DUST', direction: 'LONG', entryPrice: 50, shares: 0.002,   // $0.10 position
+    stop: { price: 49, frac: 0.02 }, target: { price: 52, frac: 0.04 },
+    rewardRisk: 2.0, atrFrac: S.MIN_ATR_ENTRY * 2, cost: S.MAX_ROUND_TRIP_COST * 0.5,
+    netRewardRisk: S.MIN_RR_NET * 2, targetCostRatio: 99
+  };
+  const v = I.terraValidateTrade(plan);
+  ok(!v.approved, 'a $0.10 position must be rejected');
+  ok(/minimum|below/i.test(v.reason), `reason should cite the minimum, got: "${v.reason}"`);
+});
+
+check('a fractional quantity is never sent as a limit order', () => {
+  // Alpaca refuses fractional limit / extended-hours orders. broker.js must coerce
+  // to market+day rather than submit an order the API will reject.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'broker.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/fractional && \(type !== 'market' \|\| tif !== 'day'\)/.test(src),
+     'broker.js must force fractional orders to market/day');
+  ok(!/qty\s*<\s*1\s*\)\s*return\s*\{\s*ok:\s*false/.test(src),
+     'broker.js must no longer reject every quantity below 1 share');
+});
+
+check('fractional positions can still take partial profits', () => {
+  // Math.floor(0.18 * 0.5) is 0, which silently marked the rung "taken" and meant a
+  // fractional position could never ladder out.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  // Both partial-close sites must compute the fractional quantity, not just the whole-
+  // share one. The whole-share expression legitimately survives as the ELSE branch, so
+  // assert the fractional branch exists at each site rather than banning the pattern.
+  const fracBranches = (src.match(/Math\.floor\((?:p|pos)\.qty \* fraction \* 1e6\) \/ 1e6/g) || []);
+  ok(fracBranches.length === 2,
+     `expected both partial-close sites to have a fractional branch, found ${fracBranches.length}`);
+  const guards = (src.match(/isFractionalQty\((?:p|pos)\.qty\)/g) || []);
+  ok(guards.length >= 2, `partial closes must branch on fractional lots, found ${guards.length} guard(s)`);
+  // And the "too small to ladder" floor must scale with the lot type, or a fractional
+  // position is instantly marked as having taken every rung.
+  ok(/minQ = isFractionalQty/.test(src) && /minSell = isFractionalQty/.test(src),
+     'the minimum-ladder threshold must adapt to fractional lots');
+});
+
+check('no whole-share assumptions remain on the fractional paths', () => {
+  // Four separate `qty < 1` guards silently broke fractional trading end to end:
+  //   · a 0.18-share fill read as "not filled (thin market)" — every fractional
+  //     trade discarded before it opened
+  //   · broker reconciliation SKIPPING fractional positions — a real position left
+  //     untracked by ATLAS and therefore with no stop-loss attached
+  //   · routeToBroker dropping fractional orders on the floor
+  //   · the sizer/validator floors, fixed earlier
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(!/filledSize < 1\b/.test(src), 'fill check must not assume whole shares');
+  ok(/minFill = isFractionalQty/.test(src), 'fill threshold must adapt to fractional orders');
+  ok(!/\|\| qty < 1\) continue;/.test(src),
+     'broker reconciliation must not skip fractional positions — they would go unstopped');
+  ok(!/if \(!qty \|\| qty < 1\) return;/.test(src), 'routeToBroker must accept fractional quantities');
+});
+
+check('a failed core buy rolls the ledger back', () => {
+  // The ledger is debited before the broker confirms. If the order is refused and the
+  // debit stands, ATLAS believes it owns shares it does not — the exact ledger/broker
+  // divergence the broker-authoritative design exists to prevent.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fn = src.slice(src.indexOf('function maintainCoreHolding'),
+                       src.indexOf('function processProfitVault'));
+  ok(/rollback/.test(fn), 'a rejected core buy must roll back the cash debit');
+  ok(/portfolio\.cash \+= cost/.test(fn), 'rollback must restore the exact cost');
+  ok(/h\.qty -= qty/.test(fn), 'rollback must also unwind the share count');
+});
+
+check('rejection reasons bucket together for the daily digest', () => {
+  // Reasons carry per-symbol numbers ("net R:R 1.12 < 1.35 after 0.31% costs"). Without
+  // normalising them, a zero-trade day produces 200 unique reasons and the digest is
+  // useless — the whole point is to name the ONE thing blocking trading.
+  const a = I.rejectionBucket('net R:R 1.12 < 1.35 after 0.31% costs');
+  const b = I.rejectionBucket('net R:R 1.44 < 1.35 after 0.28% costs');
+  ok(a === b, `equivalent reasons must bucket together:\n  "${a}"\n  "${b}"`);
+  const c = I.rejectionBucket('ATR 0.62% below the 1.00% floor');
+  ok(c !== a, 'genuinely different reasons must stay separate');
+});
+
+check('core top-up sizing buys the gap, never churns, never sells', () => {
+  // coreTopUpQty is pure, so the sizing decision is testable without a live market —
+  // the live path is gated on market hours and would otherwise go unverified.
+  const px = 600;
+  const q = (equity, core, cash) => I.coreTopUpQty(px, equity, core, cash);
+  if (!I.CORE_HOLD_ON) {
+    ok(q(1000, 0, 1000) === 0, 'with the core disabled it must never buy anything');
+    return;                                    // default config: OFF, nothing more to assert
+  }
+  ok(Math.abs(q(1000, 0, 1000) * px - 500) < 1, 'an empty book must buy up to the target weight');
+  ok(q(1000, 500, 500) === 0, 'at target it must not churn');
+  ok(q(1000, 480, 520) === 0, 'inside the rebalance band it must not churn');
+  ok(q(1000, 200, 800) > 0,   'well below target it must top up');
+  ok(q(1000, 0, 0) === 0,     'with no cash it must not buy');
+  ok(q(1000, 700, 300) === 0, 'ABOVE target it must return 0 — a hold never sells');
+});
+
+check('the core holding is invisible to every trading exit path', () => {
+  // The whole point of a hold is that stops, trails, take-profit rungs, kill switches
+  // and loss halts cannot touch it. That is guaranteed structurally by keeping it out
+  // of longPositions — every exit path iterates that object. If it ever moves in,
+  // the first stop-loss sweep would liquidate the long-term position.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  ok(/coreHolding: null/.test(src), 'coreHolding must be its own field on portfolio');
+  ok(!/longPositions\[\s*CORE_HOLD_SYMBOL\s*\]/.test(src),
+     'the core holding must never be written into longPositions');
+  // And it must never be sold on a signal — top-up only.
+  // Scan from coreTopUpQty (the sizing decision) through maintainCoreHolding (the
+  // execution) — the rebalance band lives in the former after the v11.28 split.
+  const fn = src.slice(src.indexOf('function coreTopUpQty'),
+                       src.indexOf('function processProfitVault'));
+  ok(!/closeLong|submitOrder\([^)]*'sell'/.test(fn), 'the core path must never sell');
+  ok(/gap <= target \* CORE_REBALANCE_BAND/.test(fn), 'it must only act when meaningfully under target');
+  ok(/side: 'buy'/.test(fn), 'the only broker order on this path is a buy');
+});
+
+check('the core holding does not inflate trading capital', () => {
+  // Reserve and free-capital caps are fractions of equity. Counting an INVESTED core
+  // position as if it were deployable cash inflated both: at a 50% core the cap
+  // stopped binding and the reserve was silently no longer honoured.
+  const savedCash = I.portfolio.cash, savedCore = I.portfolio.coreHolding;
+  I.portfolio.cash = 1000; I.portfolio.coreHolding = null;
+  I.rebalanceCapital();
+  const baseTrading = I.capitalSystem.tradingCapital, baseReserve = I.capitalSystem.reserveCash;
+
+  I.marketData.__CORETEST = { price: 100, prevClose: 100, lastUpdate: Date.now() };
+  I.portfolio.cash = 500;
+  I.portfolio.coreHolding = { symbol: '__CORETEST', qty: 5, avgPrice: 100, investedCash: 500 };
+  I.rebalanceCapital();
+  const coreTrading = I.capitalSystem.tradingCapital, coreReserve = I.capitalSystem.reserveCash;
+
+  I.portfolio.cash = savedCash; I.portfolio.coreHolding = savedCore;
+  delete I.marketData.__CORETEST;
+  I.rebalanceCapital();
+
+  ok(Math.abs(coreTrading - baseTrading / 2) < 1,
+     `moving half the book into the core should halve trading capital: ${baseTrading.toFixed(0)} -> ${coreTrading.toFixed(0)}`);
+  ok(Math.abs(coreReserve - baseReserve / 2) < 1,
+     `the reserve must scale with the tradable slice: ${baseReserve.toFixed(0)} -> ${coreReserve.toFixed(0)}`);
+});
+
+check('a core drawdown does not halt trading, but a catastrophe still does', () => {
+  // Trading kill switches must measure the TRADING book. With a core holding,
+  // drawdown on total equity would halt entries because the index fell — the exact
+  // reaction the core exists to avoid. The account-wide backstop must survive though.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  ok(/computeDrawdown\(riskSystem\.peakValue, tradingValue\)/.test(src),
+     'trading drawdown must be measured on equity EXCLUDING the core');
+  ok(/riskSystem\.totalDrawdown/.test(src) && /Account-wide drawdown/.test(src),
+     'an account-wide emergency backstop must still exist');
+  ok(/peakTotalValue:\s+riskSystem\.peakTotalValue/.test(src),
+     'the account-wide peak must persist, or a restart resets the backstop');
+  // Portfolio heat is a TRADING measure too — dividing by an equity figure inflated
+  // by the core would understate how exposed the trading book really is.
+  ok(/portfolioHeat\s+= tradingValue > 0/.test(src),
+     'portfolio heat must be measured against tradable equity');
+});
+
+check('a core holding cannot dilute any risk limit', () => {
+  // Every risk threshold is a fraction of equity. Counting an untraded core position
+  // in the denominator quietly loosens all of them. Behavioural check: portfolio heat
+  // must read the SAME whether or not a core exists, because the core is not exposure.
+  const savedCash = I.portfolio.cash, savedCore = I.portfolio.coreHolding;
+  I.marketData.__HEAT = { price: 10, prevClose: 10, lastUpdate: Date.now() };
+  // Cap is 50%. Pick a position that is UNDER the cap on total equity but OVER it on
+  // tradable equity, so the two denominators give opposite answers — otherwise the
+  // test passes either way and proves nothing (this exact size mistake let a mutation
+  // through on the first attempt).
+  I.portfolio.cash = 1000; I.portfolio.coreHolding = null;
+  const heatNoCore = I.wouldExceedHeat(10, 40);          // $400 of $1000 tradable = 40%, OK
+
+  I.portfolio.cash = 500;
+  I.portfolio.coreHolding = { symbol: '__HEAT', qty: 50, avgPrice: 10, investedCash: 500 };
+  // Total equity is still $1000 ($500 cash + $500 core) so a core-inclusive divisor
+  // reads 40% and allows it; the tradable divisor is $500 and reads 80%, which breaches.
+  const heatWithCore = I.wouldExceedHeat(10, 40);
+
+  I.portfolio.cash = savedCash; I.portfolio.coreHolding = savedCore;
+  delete I.marketData.__HEAT;
+  ok(heatNoCore === false, `$400 of a $1000 tradable book is 40% and must be allowed, got ${heatNoCore}`);
+  ok(heatWithCore === true,
+     '$400 against $500 tradable is 80% and must breach the 50% cap — a core-inclusive divisor would allow it');
+
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  ok(/dailyRealizedLoss \/ Math\.max\(1, tradableValue\(\)\)/.test(src),
+     'the daily-loss brake must divide by tradable equity or it trips too late');
+});
+
+check('core holding counts toward equity', () => {
+  // If it did not, every percentage derived from total value — risk sizing, drawdown,
+  // exposure — would be computed against a book that ignores real money.
+  const saved = I.portfolio.coreHolding;
+  const before = I.getTotalValue();
+  I.marketData.__CORE = { price: 100, prevClose: 100, lastUpdate: Date.now() };
+  I.portfolio.coreHolding = { symbol: '__CORE', qty: 2, avgPrice: 100, investedCash: 200 };
+  const after = I.getTotalValue();
+  I.portfolio.coreHolding = saved;
+  delete I.marketData.__CORE;
+  ok(Math.abs((after - before) - 200) < 0.01,
+     `equity should rise by the core's $200 value, rose by ${(after - before).toFixed(2)}`);
+});
+
+check('the core symbol is never also traded', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  ok(/CORE_HOLD_ON && symbol === CORE_HOLD_SYMBOL\) continue;/.test(src),
+     'the entry scan must skip the core symbol — one broker position cannot back two books');
 });
 
 check('bar fetching follows pagination', () => {

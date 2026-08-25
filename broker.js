@@ -127,8 +127,21 @@ function makeAlpacaBroker() {
     configured,
     async submitOrder({ symbol, side, qty, type = 'market', limitPrice = null, tif = 'day' }) {
       const g = guard(); if (g) return g;
-      if (!symbol || !side || !qty || qty < 1) return { ok: false, error: 'bad-order-params' };
-      const body = { symbol, qty: String(qty), side, type, time_in_force: tif };
+      // FRACTIONAL (v11.28): the old `qty < 1` floor rejected every fractional order
+      // outright. Alpaca accepts fractional quantities on fractionable US equities,
+      // but ONLY as market orders with day time-in-force — a fractional limit or
+      // extended-hours order is refused by the API. Coerce here rather than at the
+      // call site so no future caller can construct an invalid combination.
+      const n = Number(qty);
+      if (!symbol || !side || !Number.isFinite(n) || n <= 0) return { ok: false, error: 'bad-order-params' };
+      const fractional = Math.abs(n - Math.round(n)) > 1e-9;
+      if (fractional && side === 'sell_short') return { ok: false, error: 'fractional-short-unsupported' };
+      if (fractional && (type !== 'market' || tif !== 'day')) {
+        type = 'market'; tif = 'day'; limitPrice = null;
+      }
+      // 9dp is Alpaca's limit; trim float noise so the API never sees 0.30000000000000004.
+      const qtyStr = fractional ? String(Math.floor(n * 1e6) / 1e6) : String(Math.round(n));
+      const body = { symbol, qty: qtyStr, side, type, time_in_force: tif };
       if (type === 'limit' && limitPrice) body.limit_price = String(limitPrice);
       const r = await httpsJson('POST', `${base}/v2/orders`, headers, body);
       if (!r.ok) return { ok: false, error: r.error, status: r.status };

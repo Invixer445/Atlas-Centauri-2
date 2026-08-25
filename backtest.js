@@ -50,6 +50,9 @@ const COSTS_ON = arg('--costs', '1') !== '0';
 // that does not exist. 1Hour => 60. Daily bars are already the decision unit.
 const LIVE_TF  = /Hour/i.test(process.env.DECISION_TIMEFRAME || '1Hour') ? 60 : 1;
 const TF       = Math.max(1, parseInt(arg('--tf', DAILY ? '1' : String(LIVE_TF)), 10));
+const FRACTIONAL      = arg('--fractional', '1') !== '0';
+const MIN_FRAC_NOTIONAL = parseFloat(arg('--minfrac', '5'));
+const LIMIT_MODE      = I.LIMIT_ENTRIES;
 const MIN_ATR  = parseFloat(arg('--minatr', '0'));                   // require this much volatility
 const MAX_ATR  = parseFloat(arg('--maxatr', '0'));                   // diagnostic: ONLY the quiet names
 const WARMUP   = 32;                                                 // bars of history before any decision
@@ -266,10 +269,23 @@ function replay(hist, usable, cfg, capital, verbose = false) {
       const refPx = bar.o;
       const plan = I.buildTradePlan(sym, dir, refPx, 5, 'backtest');
       const stopDist = plan.stop.frac * refPx;
-      let qty = Math.max(0, Math.floor((cash * S.RISK_PER_TRADE_BASE) / (stopDist || 1e9)));
-      const maxShares = Math.floor((cash * 0.60) / refPx);
-      if (qty > maxShares) { rej.notionalCap++; qty = maxShares; }
-      if (qty < 1) { rej.sizeBelow1++; continue; }
+      // Mirror the engine's fractional sizing (v11.28). Whole shares when available
+      // (cheaper: limit order), fractional to rescue trades that would otherwise be
+      // refused outright. A harness that floors to whole shares measures a bot that
+      // turns away every stock above ~$175 on a small account — not the one that runs.
+      const exactQty  = (cash * S.RISK_PER_TRADE_BASE) / (stopDist || 1e9);
+      const maxShares = (cash * 0.60) / refPx;
+      let qty = Math.min(exactQty, maxShares);
+      if (exactQty > maxShares) rej.notionalCap++;      // clipped by the 60% notional cap
+      if (qty >= 1) qty = Math.floor(qty);
+      else if (FRACTIONAL) {
+        qty = Math.floor(qty * 1e6) / 1e6;
+        // Fractional entries must be market orders, so they pay the FULL spread rather
+        // than half. Charged below via fracExtraCost; ignoring it would flatter them.
+        if (qty * refPx < MIN_FRAC_NOTIONAL) { rej.sizeBelow1++; continue; }
+      } else { rej.sizeBelow1++; continue; }
+      if (qty <= 0) { rej.sizeBelow1++; continue; }
+      const isFrac = Math.abs(qty - Math.round(qty)) > 1e-9;
 
       if (cfg.costsOn) {
         if (plan.atrFrac < S.MIN_ATR_ENTRY) { rej.minAtrGate++; continue; }
@@ -282,7 +298,10 @@ function replay(hist, usable, cfg, capital, verbose = false) {
       if (plan.rewardRisk < S.MIN_RR) { rej.grossRR++; continue; }
       rej.accepted++;
 
-      const entryCostPct = cfg.costsOn ? (halfSpread + adverse) : 0;
+      // A fractional entry is a market order: it crosses the spread instead of resting
+      // on it, so it pays halfSpread MORE than a limit entry would have.
+      const fracExtraCost = (cfg.costsOn && isFrac && LIMIT_MODE) ? halfSpread : 0;
+      const entryCostPct = cfg.costsOn ? (halfSpread + adverse + fracExtraCost) : 0;
       const entry = dir === 'LONG' ? refPx * (1 + entryCostPct) : refPx * (1 - entryCostPct);
       open[sym] = { dir, entry, qty, atrFrac: plan.atrFrac, peak: 0, entryCost: entry * entryCostPct };
     }
