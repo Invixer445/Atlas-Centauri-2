@@ -124,8 +124,15 @@ run(`A. IF the measured edge is real and persists  (best case, assumes we got it
 // B: the honest predictive case — propagates estimation uncertainty.
 run(`B. HONEST CASE — edge drawn from its real uncertainty range each future`,
     () => m + norm() * se);
-// C: the null. The apparent edge is noise; only costs and variance remain.
-run(`C. IF the edge is actually zero  (what the t-stat cannot rule out)`,
+// C: zero edge. This is NO LONGER a hypothetical null. Running the identical strategy
+// over 20 fresh symbols — picked for liquidity and affordability, never used to tune
+// anything — gives +0.005R at t = 0.08 over 562 trades. That is zero to three decimal
+// places, on a LARGER sample than the +0.113R that scenarios A and B are built on.
+// The measured edge appears only on the original 20-name watchlist, which is a
+// high-beta basket that returned 34.6% in a window where the neutral set returned 8.4%.
+// Read C as "what happens on stocks the bot was not built around", i.e. the honest
+// out-of-sample case — not as a pessimistic what-if.
+run(`C. ZERO EDGE — measured on 20 fresh symbols (+0.005R, t=0.08). The real out-of-sample case.`,
     () => 0);
 // D: the one that matters most. Every measured window sits inside a strong bull
 // run: the bot's per-window edge correlates 0.67 with the market's own return, and

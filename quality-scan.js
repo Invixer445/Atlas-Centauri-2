@@ -182,6 +182,7 @@ function scan(hist, usable) {
           const grossRisk = S.ATR_STOP_MULT * pos.atrFrac * grossEntry;
           pos.feat.Rgross = grossRisk > 0 ? grossPer / grossRisk : 0;
           pos.feat.exit = exit;
+          pos.feat.heldSec = t - pos.feat.openedAt;
           rows.push(pos.feat);
           delete open[sym];
         }
@@ -225,6 +226,11 @@ function scan(hist, usable) {
       };
 
       const entry = dir==='LONG' ? refPx*(1+halfSpread*2) : refPx*(1-halfSpread*2);
+      // Track when the position opened and how crowded the book was, so we can
+      // measure SPEED (trades/session, holding time) and CAPITAL UTILISATION —
+      // "how fast is it working?" is a measurable question, not a feeling.
+      feat.openedAt = t;
+      feat.concurrent = Object.keys(open).length + 1;
       open[sym] = { dir, entry, grossEntry: refPx, atrFrac: plan.atrFrac, peak: 0, feat };
     }
   }
