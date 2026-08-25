@@ -1402,7 +1402,7 @@ check('a failed core buy rolls the ledger back', () => {
                        src.indexOf('function processProfitVault'));
   ok(/rollback/.test(fn), 'a rejected core buy must roll back the cash debit');
   ok(/portfolio\.cash \+= cost/.test(fn), 'rollback must restore the exact cost');
-  ok(/h\.qty -= qty/.test(fn), 'rollback must also unwind the share count');
+  ok(/l\.qty -= qty/.test(fn), 'rollback must also unwind the share count');
 });
 
 check('rejection reasons bucket together for the daily digest', () => {
@@ -1414,6 +1414,63 @@ check('rejection reasons bucket together for the daily digest', () => {
   ok(a === b, `equivalent reasons must bucket together:\n  "${a}"\n  "${b}"`);
   const c = I.rejectionBucket('ATR 0.62% below the 1.00% floor');
   ok(c !== a, 'genuinely different reasons must stay separate');
+});
+
+check('the edge register cannot score a hypothesis on pre-registration data', () => {
+  // The entire value of the register is that a claim is scored ONLY on data that did
+  // not exist when it was written. If that filter is ever dropped, it degenerates into
+  // the same re-cut-the-same-history exercise that produced six false discoveries.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'edge-research.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/filter\(d => d > from\)/.test(src), 'scorers must filter to dates after registration');
+  ok(/registeredAt/.test(src) && /e\.registeredAt/.test(src), 'scoring must read the registration date');
+  ok(/e\.results\.push\(res\)/.test(src), 'results must be APPENDED so decay stays visible');
+  ok(!/e\.results = \[res\]/.test(src), 'results must never be overwritten');
+});
+
+check('the edge register demands significance, sign-consistency and sample size', () => {
+  // Any one of these alone has already produced a false positive in this project.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'edge-research.js'), 'utf8');
+  const fn = src.slice(src.indexOf('function verdict'), src.indexOf('(async function main'));
+  ok(/Math\.abs\(last\.t\) > 2/.test(fn), 'must require |t| > 2');
+  ok(/last\.n < 60/.test(fn), 'must require a minimum sample');
+  ok(/Math\.sign\(r\.mean\) === Math\.sign\(last\.mean\)/.test(fn),
+     'must require the sign to hold across scoring runs');
+  ok(/SUPPORTED/.test(fn) && !/PROVEN/.test(fn), 'a hypothesis is supported, never proven');
+});
+
+check('the core is a diversified basket, not a single name', () => {
+  // Measured: 1 name gives 0.59 return per unit of risk, 5+ names gives ~1.35 for the
+  // same return. Holding one symbol gives up the only free improvement available.
+  ok(I.CORE_HOLD_SYMBOLS.length >= 5,
+     `core should spread across several names, got ${I.CORE_HOLD_SYMBOLS.length}`);
+  ok(new Set(I.CORE_HOLD_SYMBOLS).size === I.CORE_HOLD_SYMBOLS.length, 'no duplicate names');
+});
+
+check('new core money goes to the most underweight name', () => {
+  // Rebalancing frequency measured as worth ~nothing (1.30-1.41 across weekly→never),
+  // so the basket is balanced by DIRECTING NEW MONEY, never by selling.
+  const savedCore = I.portfolio.coreHolding;
+  const [a, b] = I.CORE_HOLD_SYMBOLS;
+  I.marketData[a] = { price: 100, prevClose: 100, lastUpdate: Date.now() };
+  I.marketData[b] = { price: 100, prevClose: 100, lastUpdate: Date.now() };
+  // `a` is already heavily held, `b` holds nothing — new money must go to `b`.
+  I.portfolio.coreHolding = { [a]: { qty: 10, avgPrice: 100, investedCash: 1000 } };
+  const pick = I.mostUnderweightCore();
+  I.portfolio.coreHolding = savedCore;
+  ok(pick && pick.sym !== a, `must not add to the already-overweight name (${a}), picked ${pick && pick.sym}`);
+});
+
+check('a stale-priced core member is never bought', () => {
+  const savedCore = I.portfolio.coreHolding;
+  const saved = {};
+  I.CORE_HOLD_SYMBOLS.forEach(s => { saved[s] = I.marketData[s];
+    I.marketData[s] = { price: 100, prevClose: 100, lastUpdate: Date.now() - 10 * 60000 }; });
+  I.portfolio.coreHolding = {};
+  const pick = I.mostUnderweightCore();
+  I.CORE_HOLD_SYMBOLS.forEach(s => { if (saved[s]) I.marketData[s] = saved[s]; else delete I.marketData[s]; });
+  I.portfolio.coreHolding = savedCore;
+  ok(pick === null, 'with every price stale it must buy nothing, got ' + JSON.stringify(pick));
 });
 
 check('core top-up sizing buys the gap, never churns, never sells', () => {
@@ -1439,7 +1496,7 @@ check('the core holding is invisible to every trading exit path', () => {
   // of longPositions — every exit path iterates that object. If it ever moves in,
   // the first stop-loss sweep would liquidate the long-term position.
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
-  ok(/coreHolding: null/.test(src), 'coreHolding must be its own field on portfolio');
+  ok(/coreHolding: \{\}/.test(src), 'coreHolding must be its own field on portfolio');
   ok(!/longPositions\[\s*CORE_HOLD_SYMBOL\s*\]/.test(src),
      'the core holding must never be written into longPositions');
   // And it must never be sold on a signal — top-up only.
@@ -1463,7 +1520,7 @@ check('the core holding does not inflate trading capital', () => {
 
   I.marketData.__CORETEST = { price: 100, prevClose: 100, lastUpdate: Date.now() };
   I.portfolio.cash = 500;
-  I.portfolio.coreHolding = { symbol: '__CORETEST', qty: 5, avgPrice: 100, investedCash: 500 };
+  I.portfolio.coreHolding = { __CORETEST: { qty: 5, avgPrice: 100, investedCash: 500 } };
   I.rebalanceCapital();
   const coreTrading = I.capitalSystem.tradingCapital, coreReserve = I.capitalSystem.reserveCash;
 
@@ -1508,7 +1565,7 @@ check('a core holding cannot dilute any risk limit', () => {
   const heatNoCore = I.wouldExceedHeat(10, 40);          // $400 of $1000 tradable = 40%, OK
 
   I.portfolio.cash = 500;
-  I.portfolio.coreHolding = { symbol: '__HEAT', qty: 50, avgPrice: 10, investedCash: 500 };
+  I.portfolio.coreHolding = { __HEAT: { qty: 50, avgPrice: 10, investedCash: 500 } };
   // Total equity is still $1000 ($500 cash + $500 core) so a core-inclusive divisor
   // reads 40% and allows it; the tradable divisor is $500 and reads 80%, which breaches.
   const heatWithCore = I.wouldExceedHeat(10, 40);
@@ -1530,7 +1587,7 @@ check('core holding counts toward equity', () => {
   const saved = I.portfolio.coreHolding;
   const before = I.getTotalValue();
   I.marketData.__CORE = { price: 100, prevClose: 100, lastUpdate: Date.now() };
-  I.portfolio.coreHolding = { symbol: '__CORE', qty: 2, avgPrice: 100, investedCash: 200 };
+  I.portfolio.coreHolding = { __CORE: { qty: 2, avgPrice: 100, investedCash: 200 } };
   const after = I.getTotalValue();
   I.portfolio.coreHolding = saved;
   delete I.marketData.__CORE;
@@ -1540,8 +1597,8 @@ check('core holding counts toward equity', () => {
 
 check('the core symbol is never also traded', () => {
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
-  ok(/CORE_HOLD_ON && symbol === CORE_HOLD_SYMBOL\) continue;/.test(src),
-     'the entry scan must skip the core symbol — one broker position cannot back two books');
+  ok(/CORE_HOLD_ON && CORE_HOLD_SYMBOLS\.includes\(symbol\)\) continue;/.test(src),
+     'the entry scan must skip EVERY core basket member — one broker position cannot back two books');
 });
 
 check('bar fetching follows pagination', () => {

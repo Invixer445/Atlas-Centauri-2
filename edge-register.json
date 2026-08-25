@@ -1,0 +1,22 @@
+{
+  "entries": {
+    "overnight-beats-intraday": {
+      "claim": "Close-to-open returns exceed open-to-close returns on a broad equity basket.",
+      "why": "Measured 2020-2024: overnight positive in 5/5 years (t up to 6.93), intraday negative in 3/5. Strongest effect found in this project. Tracked for DECAY — if it fades, the reason the bot holds rather than day-trades weakens.",
+      "registeredAt": "2026-08-25",
+      "results": []
+    },
+    "atlas-live-trading-edge": {
+      "claim": "ATLAS trades, as configured, have positive expectancy net of costs.",
+      "why": "The central claim of the whole bot. Measured +0.113R (t=1.52) on the original watchlist and +0.005R (t=0.08) on symbols it was not built around. Scored here against the bot's OWN closed trades as they accumulate live.",
+      "registeredAt": "2026-08-25",
+      "results": []
+    },
+    "momentum-beats-hold": {
+      "claim": "12-month cross-sectional momentum, monthly rebalance, beats equal-weight buy-and-hold.",
+      "why": "Documented anomaly, low turnover so friction is not the obstacle. Measured 44.4%/yr net against buy-and-hold 54.3% — i.e. it LOST on the in-sample run. Registered to see whether that reverses out of sample.",
+      "registeredAt": "2026-08-25",
+      "results": []
+    }
+  }
+}

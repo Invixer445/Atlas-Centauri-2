@@ -1926,7 +1926,7 @@ let portfolio = {
   // longPositions, and a long-term holding must be invisible to all of them. Keeping
   // it in its own field makes that structural rather than a rule someone must
   // remember. See CORE_HOLD_FRACTION.
-  coreHolding: null     // { symbol, qty, avgPrice, investedCash, openedAt }
+  coreHolding: {}       // { SYMBOL: { qty, avgPrice, investedCash, openedAt } }
 };
 
 // ─── CAPITAL MANAGEMENT ──────────────────────────────────────────────────
@@ -2274,7 +2274,21 @@ const DECISION_TIMEFRAME = (process.env.DECISION_TIMEFRAME || '1Hour');
 // and panic-selling a long-term position on a trading halt is precisely the
 // behaviour that destroys buy-and-hold returns. The admin emergency stop still
 // closes everything.
-const CORE_HOLD_SYMBOL   = (process.env.CORE_HOLD_SYMBOL || 'SPY').toUpperCase();
+// A BASKET, not one ticker. Measured over a common 4.3-year window, spreading the
+// same money across names is the only free improvement available:
+//        names     CAGR    vol    return/risk
+//            1    16.7%   28.1%      0.59
+//            5    20.9%   15.4%      1.36
+//           10    16.9%   12.8%      1.32
+//           20    17.6%   13.4%      1.31
+// Roughly the same return for half the volatility. Holding a single symbol gives up
+// that improvement for nothing. Defaults to a broad, liquid, sector-spread set chosen
+// for BREADTH rather than past performance — picking last cycle's winners is how the
+// trading side already fooled itself once.
+const CORE_HOLD_SYMBOLS = (process.env.CORE_HOLD_SYMBOLS ||
+  'SPY,AAPL,MSFT,JNJ,JPM,XOM,PG,KO,WMT,CVX')
+  .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+const CORE_HOLD_SYMBOL   = CORE_HOLD_SYMBOLS[0];   // back-compat for single-name callers
 const CORE_HOLD_FRACTION = Math.max(0, Math.min(0.9, parseFloat(process.env.CORE_HOLD_FRACTION || '0')));
 const CORE_HOLD_ON       = CORE_HOLD_FRACTION > 0;
 // Only top up when meaningfully below target, so a drifting price does not generate
@@ -2574,7 +2588,7 @@ function symbolsForMarket(market) {
   // not on a watchlist, or maintainCoreHolding() never sees a price and silently
   // never buys. The entry scan skips it separately, so including it here cannot
   // cause it to be traded.
-  if (CORE_HOLD_ON && !core.includes(CORE_HOLD_SYMBOL)) core.push(CORE_HOLD_SYMBOL);
+  if (CORE_HOLD_ON) for (const s of CORE_HOLD_SYMBOLS) if (!core.includes(s)) core.push(s);
   return core;
 }
 
@@ -4310,23 +4324,28 @@ function rebalanceCapital() {
 //  signal. No stop, no target, no trail. That is the entire point — the measured
 //  advantage of holding comes precisely from not reacting.
 // ════════════════════════════════════════════════════════════════════════════
+// Total market value of the core basket.
 function coreHoldingValue() {
-  const c = portfolio.coreHolding;
-  if (!c || !(c.qty > 0)) return 0;
-  const px = marketData[c.symbol]?.price;
-  return Number.isFinite(px) && px > 0 ? c.qty * px : c.investedCash;
+  const h = portfolio.coreHolding;
+  if (!h || typeof h !== 'object') return 0;
+  let v = 0;
+  for (const [sym, lot] of Object.entries(h)) {
+    if (!lot || !(lot.qty > 0)) continue;
+    const px = marketData[sym]?.price;
+    v += (Number.isFinite(px) && px > 0) ? lot.qty * px : (lot.investedCash || 0);
+  }
+  return v;
 }
 
-// How many shares to add to reach the target weight — a PURE function, split out from
-// maintainCoreHolding so the sizing decision is testable without a live market. The
-// gating (market open, fresh price, broker) stays in the caller.
-// Returns 0 when no purchase is warranted. TOP-UP ONLY: never returns a sell.
+// How much to add IN TOTAL to reach the target weight. Pure, so the sizing decision is
+// testable without a live market. TOP-UP ONLY: never returns a sell, because the
+// measured advantage of holding comes precisely from not reacting.
 function coreTopUpQty(price, totalValue, currentCoreValue, cash) {
   if (!CORE_HOLD_ON) return 0;
   if (!Number.isFinite(price) || price <= 0) return 0;
   const target = totalValue * CORE_HOLD_FRACTION;
   const gap    = target - currentCoreValue;
-  // Band keeps ordinary price drift from generating a stream of tiny spread-paying buys.
+  // Band keeps ordinary drift from generating a stream of tiny spread-paying buys.
   if (gap <= target * CORE_REBALANCE_BAND) return 0;
   const spend = Math.min(gap, Math.max(0, cash - 1));      // leave $1 so cash never hits 0
   if (spend < Math.max(MIN_FRACTIONAL_NOTIONAL, 1)) return 0;
@@ -4335,46 +4354,69 @@ function coreTopUpQty(price, totalValue, currentCoreValue, cash) {
   return qty > 0 ? qty : 0;
 }
 
+// Which basket member is furthest below its equal-weight share. Buying the most
+// underweight name each cycle walks the basket toward balance without ever selling —
+// the measured rebalance-frequency table showed frequent rebalancing earns nothing
+// back, so drift is tolerated and only NEW money is directed.
+function mostUnderweightCore() {
+  const h = portfolio.coreHolding || {};
+  const perName = coreHoldingValue() / Math.max(1, CORE_HOLD_SYMBOLS.length);
+  let pick = null, worst = Infinity;
+  for (const sym of CORE_HOLD_SYMBOLS) {
+    const px = marketData[sym]?.price;
+    if (!Number.isFinite(px) || px <= 0) continue;
+    const upd = marketData[sym].lastUpdate;
+    if (upd && (Date.now() - upd) > MAX_PRICE_AGE_MS) continue;   // never buy on a stale price
+    const lot = h[sym];
+    const val = lot && lot.qty > 0 ? lot.qty * px : 0;
+    const short = val - perName;
+    if (short < worst) { worst = short; pick = { sym, px }; }
+  }
+  return pick;
+}
+
 function maintainCoreHolding() {
   if (!CORE_HOLD_ON) return;
   if (!getCurrentMarket()) return;                       // only during market hours
-  const px = marketData[CORE_HOLD_SYMBOL]?.price;
-  if (!Number.isFinite(px) || px <= 0) return;
-  if (marketData[CORE_HOLD_SYMBOL].lastUpdate &&
-      (Date.now() - marketData[CORE_HOLD_SYMBOL].lastUpdate) > MAX_PRICE_AGE_MS) return;
+  const pick = mostUnderweightCore();
+  if (!pick) return;                                     // no fresh price on any member
 
-  const qty = coreTopUpQty(px, getTotalValue(), coreHoldingValue(), portfolio.cash);
+  const totalValue = getTotalValue();
+  const qty = coreTopUpQty(pick.px, totalValue, coreHoldingValue(), portfolio.cash);
   if (!(qty > 0)) return;
 
-  const cost = qty * px;
+  const cost = qty * pick.px;
   if (cost > portfolio.cash) return;
+  const target = totalValue * CORE_HOLD_FRACTION;
+
   portfolio.cash -= cost;
-  const c = portfolio.coreHolding;
-  if (c && c.qty > 0) {
-    c.avgPrice = (c.avgPrice * c.qty + cost) / (c.qty + qty);
-    c.qty += qty;
-    c.investedCash += cost;
+  portfolio.coreHolding = portfolio.coreHolding || {};
+  const lot = portfolio.coreHolding[pick.sym];
+  if (lot && lot.qty > 0) {
+    lot.avgPrice = (lot.avgPrice * lot.qty + cost) / (lot.qty + qty);
+    lot.qty += qty;
+    lot.investedCash += cost;
   } else {
-    portfolio.coreHolding = { symbol: CORE_HOLD_SYMBOL, qty, avgPrice: px,
-                              investedCash: cost, openedAt: Date.now() };
+    portfolio.coreHolding[pick.sym] = { qty, avgPrice: pick.px, investedCash: cost, openedAt: Date.now() };
   }
-  console.log(`[CORE] 🏛  Bought ${qty.toFixed(6)} ${CORE_HOLD_SYMBOL} @ $${px.toFixed(2)} ` +
-              `($${cost.toFixed(2)}) — core now $${coreHoldingValue().toFixed(2)} of $${target.toFixed(2)} target`);
+  console.log(`[CORE] 🏛  Bought ${qty.toFixed(6)} ${pick.sym} @ $${pick.px.toFixed(2)} ` +
+              `($${cost.toFixed(2)}) — core now $${coreHoldingValue().toFixed(2)} of $${target.toFixed(2)} target ` +
+              `across ${Object.keys(portfolio.coreHolding).length}/${CORE_HOLD_SYMBOLS.length} names`);
   if (LIVE_TRADING && broker && broker.configured) {
     // The ledger was debited above. If the broker refuses the order, that debit is a
     // lie — roll it back rather than letting ATLAS believe it owns shares it does not.
     const rollback = (why) => {
       portfolio.cash += cost;
-      const h = portfolio.coreHolding;
-      if (h) {
-        h.qty -= qty; h.investedCash -= cost;
-        if (h.qty <= 1e-9) portfolio.coreHolding = null;
+      const l = (portfolio.coreHolding || {})[pick.sym];
+      if (l) {
+        l.qty -= qty; l.investedCash -= cost;
+        if (l.qty <= 1e-9) delete portfolio.coreHolding[pick.sym];
       }
       console.warn(`[CORE] core buy failed (${why}) — ledger rolled back $${cost.toFixed(2)}`);
       queueSaveState();
     };
-    broker.submitOrder({ symbol: CORE_HOLD_SYMBOL, side: 'buy', qty, type: 'market',
-                         tif: 'day', refPrice: px })
+    broker.submitOrder({ symbol: pick.sym, side: 'buy', qty, type: 'market',
+                         tif: 'day', refPrice: pick.px })
       .then(r => { if (!r.ok) rollback(r.error); })
       .catch(e => rollback(e.message));
   }
@@ -5625,10 +5667,23 @@ function loadState() {
     portfolio.closedTrades    = state.closedTrades    ?? [];
     // Restore the core holding, but validate it: a corrupt qty here would silently
     // inflate total equity and therefore every risk calculation derived from it.
+    // Accepts BOTH shapes. The original single-name form was { symbol, qty, ... };
+    // the basket form is { SYM: { qty, ... } }. Reading the old shape as a basket would
+    // silently value the core at 0 and understate total equity, so migrate explicitly.
     const ch = state.coreHolding;
-    portfolio.coreHolding = (ch && typeof ch === 'object' && Number.isFinite(ch.qty) && ch.qty > 0
-                             && typeof ch.symbol === 'string' && Number.isFinite(ch.avgPrice) && ch.avgPrice > 0)
-                            ? ch : null;
+    portfolio.coreHolding = {};
+    if (ch && typeof ch === 'object') {
+      if (typeof ch.symbol === 'string' && Number.isFinite(ch.qty) && ch.qty > 0) {
+        portfolio.coreHolding[ch.symbol] = { qty: ch.qty, avgPrice: ch.avgPrice,
+                                             investedCash: ch.investedCash, openedAt: ch.openedAt };
+        console.log(`[LOAD] Migrated single-name core holding (${ch.symbol}) to basket form`);
+      } else {
+        for (const [sym, lot] of Object.entries(ch)) {
+          if (lot && typeof lot === 'object' && Number.isFinite(lot.qty) && lot.qty > 0
+              && Number.isFinite(lot.avgPrice) && lot.avgPrice > 0) portfolio.coreHolding[sym] = lot;
+        }
+      }
+    }
     marketTransitionData      = state.marketTransition ?? marketTransitionData;
     symbolCooldowns           = state.symbolCooldowns  ?? {};
     symbolLossCount           = state.symbolLossCount  ?? {};
@@ -6238,7 +6293,7 @@ function evaluateAndTrade() {
     // Never trade the core holding's symbol. Both books would map to ONE broker
     // position, so a trading exit could sell shares the core believes it still owns —
     // ledger and broker would diverge with no way to tell which side is wrong.
-    if (CORE_HOLD_ON && symbol === CORE_HOLD_SYMBOL) continue;
+    if (CORE_HOLD_ON && CORE_HOLD_SYMBOLS.includes(symbol)) continue;
     const q = marketData[symbol];
     if (!q || !q.price || !q.prevClose) continue;
     // Per-symbol staleness guard: the kill switch above only halts NEW entries
@@ -6817,8 +6872,8 @@ if (require.main === module) app.listen(PORT, async () => {
               `net R:R >= ${STRATEGY.MIN_RR_NET} | cost ceiling ${(STRATEGY.MAX_ROUND_TRIP_COST*100).toFixed(2)}%`);
   console.log(`[CONFIG] fractional sizing ${FRACTIONAL_ENABLED ? `ON (min $${MIN_FRACTIONAL_NOTIONAL} position)` : 'OFF'} | ` +
               (CORE_HOLD_ON
-                ? `core holding ${(CORE_HOLD_FRACTION*100).toFixed(0)}% ${CORE_HOLD_SYMBOL}`
-                : `core holding OFF (set CORE_HOLD_FRACTION=0.5 to hold half in ${CORE_HOLD_SYMBOL})`));
+                ? `core holding ${(CORE_HOLD_FRACTION*100).toFixed(0)}% across ${CORE_HOLD_SYMBOLS.length} names (${CORE_HOLD_SYMBOLS.slice(0,4).join(',')}${CORE_HOLD_SYMBOLS.length>4?'…':''})`
+                : `core holding OFF (set CORE_HOLD_FRACTION=0.5 to hold half across ${CORE_HOLD_SYMBOLS.length} names)`));
 
   // ── Wire JUPITER to Terra's live state + indicator helpers ──
   // (Objects are shared by reference, so Jupiter always reads current values.)
@@ -6999,7 +7054,7 @@ module.exports = {
     institutionalScore, ideaDirection, EFFECTIVE_MIN_DAY_VOL, FEED_VOLUME_FACTOR, DYNAMIC_MIN_DAY_VOL,
     extractJsonArray, extractJsonObject, affordableMaxPrice, MAX_SINGLE_SHARE_FRACTION, fetchBars,
     FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
-    CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_FRACTION, coreHoldingValue, maintainCoreHolding, coreTopUpQty,
+    CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore, coreHoldingValue, maintainCoreHolding, coreTopUpQty,
     logDailyTradeDigest, rejectionBucket, noteDailyRejection, tradableValue, wouldExceedHeat,
     estimateRoundTripCost, netRewardRisk, sideCost, LIMIT_ENTRIES, estimateDynamicSpread,
     evaluateStrategyGate, calculateADX, calculateRVOL, getCandleTrend, priceMidpoint, detectMarketRegime,
