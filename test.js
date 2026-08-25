@@ -1247,6 +1247,71 @@ check('the backtest harness defaults to the live decision timeframe', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+//  SMALL-ACCOUNT REALITY + FEED HEALTH (v11.27)
+//  Every case here was observed blocking a live session.
+// ════════════════════════════════════════════════════════════════════════════
+group('Small-account affordability and feed health');
+
+check('unaffordable share prices are screened out', () => {
+  // Live: Venus spent watchlist slots on NVDA $215, CEG $273 and MU $967 against a
+  // ~$700 trading book. One MU share is 138% of the book; all three then failed with
+  // "size below 1 share" on every cycle forever.
+  const ceiling = I.affordableMaxPrice();
+  const tv = I.getTotalValue();
+  ok(ceiling > 0 && ceiling < tv, `ceiling ${ceiling} must be a real fraction of ${tv}`);
+  ok(ceiling < 966.54, `MU at $966.54 must be excluded on a $${tv.toFixed(0)} account (ceiling $${ceiling.toFixed(2)})`);
+  ok(ceiling < 215.24, `NVDA at $215.24 must be excluded (ceiling $${ceiling.toFixed(2)})`);
+});
+
+check('the affordability ceiling scales with the account', () => {
+  // It must stop constraining once the balance can genuinely support the position,
+  // rather than being a permanent hardcoded cap.
+  const before = I.affordableMaxPrice();
+  const saved = I.portfolio.cash;
+  I.portfolio.cash = saved + 100000;
+  const after = I.affordableMaxPrice();
+  I.portfolio.cash = saved;
+  ok(after > before, `ceiling should rise with equity: ${before.toFixed(2)} -> ${after.toFixed(2)}`);
+});
+
+check('bar fetching follows pagination', () => {
+  // Alpaca's `limit` is the TOTAL across all symbols, so a multi-symbol request comes
+  // back partial with a next_page_token. Dropping that token returned 3 of 25 symbols
+  // and paused entries on the other 22 for entire sessions — misread for a long time
+  // as a thin IEX feed. Measured after the fix: 12/12 symbols, 60 bars each.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fn = src.slice(src.indexOf('async function fetchBars('), src.indexOf('async function fetchBars(') + 2200)
+                .split('\n').filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');   // strip comments
+  // Assert the ASSIGNMENT, not a mention. A first version of this test matched the
+  // explanatory comment above the code and survived `token = null` — vacuous.
+  ok(/token\s*=\s*j\.next_page_token/.test(fn), 'fetchBars must assign token from j.next_page_token');
+  ok(/page_token=\$\{/.test(fn), 'fetchBars must send page_token on later requests');
+  ok(/while\s*\(\s*token\s*&&/.test(fn), 'fetchBars must loop while a page token remains');
+});
+
+check('a thin tape does not halt entries, but a dead feed does', () => {
+  const now = Date.now();
+  const syms = ['FEED_A','FEED_B','FEED_C','FEED_D','FEED_E'];
+  syms.forEach(s => { I.marketData[s] = { price: 10, lastUpdate: now }; });
+
+  // THIN TAPE: 4 of 5 quiet for 10 minutes, but one is still printing. The feed is
+  // alive; the quiet names are skipped individually by the entry scan. Live logs
+  // showed "12/20 prices stale" halting entire sessions on a healthy IEX feed.
+  syms.forEach((s, i) => { I.marketData[s].lastUpdate = i === 0 ? now : now - 10 * 60000; });
+  ok(I.priceFeedHalt(syms, now) === null,
+     `a live-but-quiet tape must not halt entries, got: ${I.priceFeedHalt(syms, now)}`);
+
+  // DEAD FEED: nothing at all has printed. This is the real danger and MUST halt.
+  syms.forEach(s => { I.marketData[s].lastUpdate = now - 10 * 60000; });
+  ok(/silent/i.test(String(I.priceFeedHalt(syms, now))),
+     `a silent feed MUST halt entries, got: ${I.priceFeedHalt(syms, now)}`);
+
+  // NO DATA AT ALL also halts.
+  syms.forEach(s => { delete I.marketData[s]; });
+  ok(/no price data/i.test(String(I.priceFeedHalt(syms, now))), 'missing data must halt');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 console.log(`\n${'─'.repeat(60)}`);
 console.log(`${passed} passed, ${failed} failed`);
 if (failed) {

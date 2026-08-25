@@ -2908,20 +2908,46 @@ async function fetchInitialPrices() {
 
 // Fetch multi-symbol bars for one timeframe. Returns { SYM: [{t,o,h,l,c,v}], ... }.
 // `t` is normalised to epoch SECONDS to match the rest of the engine.
-async function fetchBars(symbols, timeframe, startISO, limitPerSym) {
-  const qs = `symbols=${symbols.join(',')}&timeframe=${timeframe}` +
-             `&start=${encodeURIComponent(startISO)}&limit=${limitPerSym}` +
-             `&adjustment=raw&feed=${ALPACA_DATA_FEED}&sort=asc`;
-  const j = await alpacaDataGet(`/v2/stocks/bars?${qs}`);
-  const raw = (j && j.bars) || {};
+const MAX_BAR_PAGES = 12;   // safety stop; 12 x 10k bars covers any watchlist we run
+
+async function fetchBars(symbols, timeframe, startISO, keepPerSymbol) {
+  // PAGINATION IS MANDATORY, NOT AN OPTIMISATION.
+  // Alpaca's `limit` is the TOTAL number of bars across every requested symbol — not
+  // per symbol, which is what the old parameter name assumed. Asking for 25 symbols
+  // with limit=400 returns ONE page holding whichever symbols come first, plus a
+  // next_page_token; the old code dropped that token on the floor. Measured live:
+  //   PLTR alone, 1Hour, 21 days  -> 118 bars
+  //   12 symbols, limit=400       -> 3 symbols (BAC, BBAI, CIFR), token unfollowed
+  // The engine then logged "[CANDLES] Updated 3/25" and "[DATA] 23/25 symbols lack
+  // candle-grade ATR", paused entries on all 23, and traded nothing for whole
+  // sessions. This was misdiagnosed for a long time as a thin IEX tape. It was not
+  // the feed — the request was truncated and the remainder thrown away.
   const out = {};
-  Object.keys(raw).forEach(sym => {
-    const arr = Array.isArray(raw[sym]) ? raw[sym] : [];
-    out[sym] = arr.map(b => ({
-      t: Math.floor(new Date(b.t).getTime() / 1000),
-      o: b.o, h: b.h, l: b.l, c: b.c, v: b.v
-    })).filter(c => c.h > 0 && c.l > 0 && c.c > 0);
-  });
+  let token = null, pages = 0;
+  do {
+    const qs = `symbols=${symbols.join(',')}&timeframe=${timeframe}` +
+               `&start=${encodeURIComponent(startISO)}&limit=10000` +
+               `&adjustment=raw&feed=${ALPACA_DATA_FEED}&sort=asc` +
+               (token ? `&page_token=${encodeURIComponent(token)}` : '');
+    const j = await alpacaDataGet(`/v2/stocks/bars?${qs}`);
+    if (!j) break;
+    const raw = j.bars || {};
+    Object.keys(raw).forEach(sym => {
+      const arr = Array.isArray(raw[sym]) ? raw[sym] : [];
+      const mapped = arr.map(b => ({
+        t: Math.floor(new Date(b.t).getTime() / 1000),
+        o: b.o, h: b.h, l: b.l, c: b.c, v: b.v
+      })).filter(c => c.h > 0 && c.l > 0 && c.c > 0);
+      if (out[sym]) out[sym].push(...mapped); else out[sym] = mapped;
+    });
+    token = j.next_page_token || null;
+    pages++;
+  } while (token && pages < MAX_BAR_PAGES);
+  if (token) console.warn(`[CANDLES] ${timeframe}: stopped at ${MAX_BAR_PAGES} pages with more available — widen the cap or narrow the window.`);
+  // Keep only the most recent N per symbol; sort=asc means those are at the tail.
+  if (keepPerSymbol > 0) {
+    Object.keys(out).forEach(s => { if (out[s].length > keepPerSymbol) out[s] = out[s].slice(-keepPerSymbol); });
+  }
   return out;
 }
 
@@ -3283,8 +3309,20 @@ async function runIntelCycle() {
       console.log(`[VENUS] 🔬 Research → ${ideas.length} idea(s) (${venus.getResearch().institutions} names with institutional interest) handed to Jupiter`);
     }
 
+    // LONG_ONLY: drop short ideas BEFORE they consume a watchlist slot. Terra will
+    // refuse every short anyway (the short book measured anti-predictive), so a short
+    // idea that reaches the watchlist occupies one of DYNAMIC_MAX_SYMBOLS slots
+    // permanently while producing nothing. Seen live: SHORT AAOI and SHORT BABA both
+    // added, then rejected on every single scan cycle thereafter.
+    let feed = ideas.length ? ideas : r.recommendations;
+    if (LONG_ONLY) {
+      const before = feed.length;
+      feed = feed.filter(x => String(x.direction || 'long').toUpperCase() !== 'SHORT');
+      if (before !== feed.length)
+        console.log(`[JUPITER] Skipped ${before - feed.length} short idea(s) — LONG_ONLY is on, they can never trade`);
+    }
     // JUPITER consumes Venus's research → sizes/decides; returns dynamic-watchlist candidates
-    const candidates = jupiter.consumeRecommendations(ideas.length ? ideas : r.recommendations);
+    const candidates = jupiter.consumeRecommendations(feed);
     for (const c of candidates) {
       const isCore = symbolsForMarket('nasdaq').includes(c.symbol) || c.symbol === 'SPY';
       if (!isCore && !dynamicSymbols[c.symbol]) {
@@ -3301,6 +3339,19 @@ async function runIntelCycle() {
 }
 
 // ── Dynamic watchlist management ────────────────────────────────────────────
+// The highest share price this account can actually hold a sensible position in.
+// A single share is the smallest tradeable unit, so if one share is already a large
+// slice of the book, the position cannot be risk-sized — the sizer either returns 0
+// shares or hands back a lumpy position whose real risk is whatever one share costs.
+// Scales automatically as the account grows, so this stops being a constraint once
+// the balance can support it.
+const MAX_SINGLE_SHARE_FRACTION = 0.25;   // 1 share ≤ 25% of the trading book
+function affordableMaxPrice() {
+  const tv = getTotalValue();
+  const trading = Math.max(0, tv * (1 - capitalSystem.reserveRatio));
+  return Math.max(DYNAMIC_MIN_PRICE, Math.min(DYNAMIC_MAX_PRICE, trading * MAX_SINGLE_SHARE_FRACTION));
+}
+
 async function addDynamicSymbol(sym, sig) {
   if (!DYNAMIC_WATCHLIST_ON) return false;
   if (Object.keys(dynamicSymbols).length >= DYNAMIC_MAX_SYMBOLS) {
@@ -3314,6 +3365,19 @@ async function addDynamicSymbol(sym, sig) {
   if (!q) { console.log(`[JUPITER] ${sym} rejected — no snapshot (bad/foreign/delisted symbol?)`); return false; }
   if (q.price < DYNAMIC_MIN_PRICE || q.price > DYNAMIC_MAX_PRICE) {
     console.log(`[JUPITER] ${sym} rejected — price $${q.price.toFixed(2)} outside [$${DYNAMIC_MIN_PRICE}, $${DYNAMIC_MAX_PRICE}]`);
+    return false;
+  }
+  // AFFORDABILITY. The $1000 static ceiling is meaningless on a small book: with
+  // ~$700 of trading capital and 1.5% risk, the position sizer can only reach 1 share
+  // once 2.2xATR fits inside the risk budget, which caps the tradeable price near
+  // $175. Venus was spending scarce watchlist slots (max DYNAMIC_MAX_SYMBOLS) on
+  // NVDA $215, CEG $273 and MU $967 — one MU share is 138% of the entire book — and
+  // every one of them then failed at "size below 1 share", forever. Screen them here,
+  // where the slot is actually allocated, instead of at the point of no return.
+  const affordCeiling = affordableMaxPrice();
+  if (q.price > affordCeiling) {
+    console.log(`[JUPITER] ${sym} rejected — $${q.price.toFixed(2)} unaffordable on a $${getTotalValue().toFixed(0)} account ` +
+                `(1 share must stay under $${affordCeiling.toFixed(2)}; it could never be sized)`);
     return false;
   }
   if ((q.volume || 0) < EFFECTIVE_MIN_DAY_VOL) {
@@ -4234,23 +4298,49 @@ function releaseExpiredLossHalt() {
   return false;
 }
 
-// Returns a non-null reason string if trading should be halted, null if safe.
-function getKillSwitchReason() {
-  // 1. WS disconnected: refuse to trade on potentially stale data
-  if (!wsConnected) return 'WS disconnected';
-
-  // 2. Stale price data: a symbol's price hasn't updated in MAX_PRICE_AGE_MS
-  //    This catches the "WS drops silently, prices freeze" failure mode.
-  const market  = getCurrentMarket();
-  const symbols = symbolsForMarket(market);
-  const now     = Date.now();
+// Price-feed health, split out from getKillSwitchReason so it is directly testable.
+// It sits behind the WS check in the real switch, which made it unreachable from a
+// test (no socket in a test process) — and an unreachable branch is an untested one.
+// Returns a reason string to halt, or null when the feed is usable.
+function priceFeedHalt(symbols, now = Date.now()) {
   let staleCount = 0;
   symbols.forEach(sym => {
     const d = marketData[sym];
     if (d && (now - d.lastUpdate) > MAX_PRICE_AGE_MS) staleCount++;
   });
-  // If more than half the watchlist is stale, halt new entries
-  if (staleCount > symbols.length / 2) return `${staleCount}/${symbols.length} prices stale`;
+  // HALT ONLY WHEN THE FEED IS ACTUALLY DEAD, NOT WHEN THE TAPE IS THIN.
+  // The old rule halted every entry once half the watchlist looked stale. On IEX —
+  // roughly 3% of consolidated volume — quiet names routinely go 90s without a print
+  // while the feed is perfectly healthy, so this fired constantly and blocked trading
+  // for whole sessions ("12/20 prices stale") with nothing wrong.
+  //
+  // This is NOT a weakened safety net: line ~5883 already refuses to trade ANY symbol
+  // whose own quote is stale, so a quiet name can never be traded on a stale price.
+  // What this switch must catch is the different, genuinely dangerous case — the whole
+  // stream is down and we are blind. If even the most recently updated symbol is stale,
+  // nothing at all is arriving. That is a dead feed, and that still halts everything.
+  let freshest = 0;
+  symbols.forEach(sym => {
+    const d = marketData[sym];
+    if (d && d.lastUpdate > freshest) freshest = d.lastUpdate;
+  });
+  if (freshest === 0) return 'no price data at all';
+  if ((now - freshest) > MAX_PRICE_AGE_MS)
+    return `data feed silent — no updates on ANY of ${symbols.length} symbols for ${Math.round((now - freshest)/1000)}s`;
+  if (staleCount > symbols.length / 2) {
+    console.log(`[DATA] ${staleCount}/${symbols.length} symbols quiet (thin ${ALPACA_DATA_FEED} tape) — feed is live, entries continue; stale symbols are skipped individually.`);
+  }
+  return null;   // feed usable
+}
+
+// Returns a non-null reason string if trading should be halted, null if safe.
+function getKillSwitchReason() {
+  // 1. WS disconnected: refuse to trade on potentially stale data
+  if (!wsConnected) return 'WS disconnected';
+
+  // 2. Price feed health — dead feed halts, merely thin tape does not.
+  const feed = priceFeedHalt(symbolsForMarket(getCurrentMarket()));
+  if (feed) return feed;
 
   // 3. Consecutive loss halt (see lossHaltReason)
   const lh = lossHaltReason();
@@ -6433,9 +6523,21 @@ app.post('/api/tradingview-webhook', (req, res) => {
 // Boot the execution engine only when run directly (`node server.js`). When
 // imported as a module, the engine stays dormant and only its brain is exposed.
 if (require.main === module) app.listen(PORT, async () => {
-  console.log(`\n🌌  ATLAS CENTAURI — Unified Engine v11.20 on port ${PORT}`);
+  // Version comes from package.json so it can never drift from what is deployed. The
+  // banner was hardcoded "v11.20" for six releases, which made a live log genuinely
+  // ambiguous about which code was running — exactly the question you cannot afford to
+  // guess at when diagnosing why nothing traded.
+  let VERSION = 'unknown';
+  try { VERSION = require('./package.json').version; } catch (_) {}
+  console.log(`\n🌌  ATLAS CENTAURI — Unified Engine v${VERSION} on port ${PORT}`);
   console.log(`   ♀ Venus (research AI: web + 13F + news) + 🔭 Jupiter (trading AI: sizes/decides/learns) + 🌍 Terra (execution gate)`);
   console.log(`[STARTUP] Alpaca data feed (${ALPACA_DATA_FEED}) — US markets (NASDAQ/NYSE) only`);
+  // Print the settings that actually decide whether a trade happens. Every one of
+  // these has silently blocked trading at some point in this project's history.
+  console.log(`[CONFIG] decisions on ${DECISION_TIMEFRAME} bars | trail ${STRATEGY.ATR_TRAIL_ARM_R >= 99 ? 'OFF' : 'arms at ' + STRATEGY.ATR_TRAIL_ARM_R + 'R'} | ` +
+              `${LONG_ONLY ? 'LONG-ONLY' : 'long+short'} | stop ${STRATEGY.ATR_STOP_MULT}xATR target ${STRATEGY.ATR_TARGET_MULT}xATR`);
+  console.log(`[CONFIG] risk ${(STRATEGY.RISK_PER_TRADE_BASE*100).toFixed(1)}%/trade | ATR floor ${(STRATEGY.MIN_ATR_ENTRY*100).toFixed(2)}% | ` +
+              `net R:R >= ${STRATEGY.MIN_RR_NET} | cost ceiling ${(STRATEGY.MAX_ROUND_TRIP_COST*100).toFixed(2)}%`);
 
   // ── Wire JUPITER to Terra's live state + indicator helpers ──
   // (Objects are shared by reference, so Jupiter always reads current values.)
@@ -6599,9 +6701,9 @@ module.exports = {
     LONG_ONLY,
     marketCalendar: () => marketCalendar, getCurrentMarket, getEasternTimeParts, resolveSession,
     atrQuality, hasReliableVolatility, MIN_CANDLES_FOR_ATR,
-    releaseExpiredLossHalt, LOSS_HALT_MS, getKillSwitchReason, lossHaltReason,
+    releaseExpiredLossHalt, LOSS_HALT_MS, getKillSwitchReason, lossHaltReason, priceFeedHalt,
     institutionalScore, ideaDirection, EFFECTIVE_MIN_DAY_VOL, FEED_VOLUME_FACTOR, DYNAMIC_MIN_DAY_VOL,
-    extractJsonArray, extractJsonObject,
+    extractJsonArray, extractJsonObject, affordableMaxPrice, MAX_SINGLE_SHARE_FRACTION, fetchBars,
     estimateRoundTripCost, netRewardRisk, sideCost, LIMIT_ENTRIES, estimateDynamicSpread,
     evaluateStrategyGate, calculateADX, calculateRVOL, getCandleTrend, priceMidpoint, detectMarketRegime,
     setPendingOrders: (o) => { pendingOrders = o; } }
