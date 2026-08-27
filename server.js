@@ -4260,6 +4260,31 @@ function tradableValue() {
   return Math.max(0, getTotalValue() - coreHoldingValue());
 }
 
+// Notional value of entry orders that are SUBMITTED but not yet booked.
+//
+// THE RACE THIS CLOSES. In broker-authoritative mode an entry is booked only when its
+// fill is polled back, and that poll runs every 3s while the entry scan runs every 2s.
+// Between submission and fill the order was invisible to getNotionalExposure(), so the
+// heat cap re-checked against a stale exposure figure and approved another entry, and
+// another. Each one passed the 50%-of-equity check independently; collectively they
+// blew straight through it. Measured live: an account went from $1000 to ~$80 of free
+// cash, which is what then produced 1,800 "insufficient buying power" rejections an
+// hour. The rejection loop was the symptom; this over-deployment was the disease.
+//
+// Counting in-flight entries makes the cap bind on COMMITTED capital rather than on
+// settled capital, which is the only version of the check that is safe to run faster
+// than fills arrive.
+function pendingEntryNotional() {
+  let n = 0;
+  for (const o of Object.values(pendingOrders)) {
+    if (!o || o.kind !== 'entry') continue;
+    const px = Number(o.refPrice) || marketData[o.ticker]?.price || 0;
+    const qty = Number(o.qty) || 0;
+    if (px > 0 && qty > 0) n += px * qty * (o.direction === 'SHORT' ? 1.3 : 1);
+  }
+  return n;
+}
+
 function getNotionalExposure() {
   let n = 0;
   Object.entries(portfolio.longPositions).forEach(([t, arr]) => {
@@ -4270,7 +4295,7 @@ function getNotionalExposure() {
     const price = marketData[t]?.price || 0;
     arr.forEach(p => { n += price * (p.qty || 0) * 1.3; });  // shorts weighted 1.3×
   });
-  return n;
+  return n + pendingEntryNotional();
 }
 
 // Sector exposure check — prevents correlated clusters
@@ -5031,7 +5056,10 @@ function terraValidateTrade(plan) {
   if (brokerMirror.ok && Number.isFinite(brokerMirror.cash) && mirrorAge < BROKER_MIRROR_MAX_AGE_MS) {
     const notional = shares * entryPrice;
     const bp = Number.isFinite(brokerMirror.buying_power) ? brokerMirror.buying_power : brokerMirror.cash;
-    const fundable = isFractionalQty(shares) ? brokerMirror.cash : Math.min(brokerMirror.cash, bp);
+    // Cash already committed to in-flight entries is spoken for, even though the
+    // broker snapshot still shows it — the same race as the heat cap above.
+    const committed = pendingEntryNotional();
+    const fundable = (isFractionalQty(shares) ? brokerMirror.cash : Math.min(brokerMirror.cash, bp)) - committed;
     // Small headroom so a tick between sizing and submission cannot tip it over.
     if (notional > fundable * 0.98)
       return reject(`broker cannot fund $${notional.toFixed(2)} (${isFractionalQty(shares) ? 'fractional needs cash' : 'available'} $${fundable.toFixed(2)})`);
@@ -7148,10 +7176,11 @@ module.exports = {
     FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
     CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore, coreHoldingValue, maintainCoreHolding, coreTopUpQty,
     logDailyTradeDigest, rejectionBucket, noteDailyRejection, tradableValue, wouldExceedHeat,
-    noteEntryRejection, entriesPausedByBroker, clearEntryRejectBackoff, entryPauseRemainingMs,
+    noteEntryRejection, entriesPausedByBroker, clearEntryRejectBackoff, entryPauseRemainingMs, pendingEntryNotional,
     onCooldown, clearSymbolCooldown: (s) => { delete symbolCooldowns[s]; }, EXEC_BROKER_AUTH,
     setBrokerMirror: (m) => { brokerMirror = m; },
     estimateRoundTripCost, netRewardRisk, sideCost, LIMIT_ENTRIES, estimateDynamicSpread,
     evaluateStrategyGate, calculateADX, calculateRVOL, getCandleTrend, priceMidpoint, detectMarketRegime,
-    setPendingOrders: (o) => { pendingOrders = o; } }
+    setPendingOrders: (o) => { pendingOrders = o; },
+    getPendingOrders: () => pendingOrders }
 };

@@ -1339,6 +1339,52 @@ check('fractional sizing produces a real size at any share price', () => {
 // ════════════════════════════════════════════════════════════════════════════
 group('Broker rejection must not loop');
 
+check('in-flight entries count toward exposure', () => {
+  // THE DISEASE BEHIND THE LIVE INCIDENT. Orders are booked only when their fill is
+  // polled back (every 3s) while the entry scan runs every 2s, so an in-flight entry
+  // was invisible to the heat cap and the next scan approved another against stale
+  // numbers. Each passed the 50% check alone; together they blew through it, draining
+  // $1000 to ~$80 of free cash.
+  const savedPending = { ...I.getPendingOrders() };
+  I.setPendingOrders({});
+  const base = I.getNotionalExposure();
+  I.setPendingOrders({
+    o1: { kind: 'entry', ticker: 'HOOD', direction: 'LONG', qty: 2, refPrice: 100 },
+    o2: { kind: 'exit',  ticker: 'HOOD', direction: 'LONG', qty: 9, refPrice: 100 }   // must NOT count
+  });
+  const withPending = I.getNotionalExposure();
+  I.setPendingOrders(savedPending);
+  ok(Math.abs((withPending - base) - 200) < 0.01,
+     `a $200 in-flight ENTRY must add to exposure; exits must not. Delta was ${(withPending - base).toFixed(2)}`);
+});
+
+check('committed cash is not offered twice', () => {
+  // Same race on the funding side: the broker snapshot still shows cash that an
+  // in-flight order has already spoken for.
+  const S = I.STRATEGY;
+  const savedMirror = I.brokerMirror();
+  const savedPending = { ...I.getPendingOrders() };
+  const plan = {
+    ticker: 'HOOD', direction: 'LONG', entryPrice: 100, shares: 0.9,   // $90 order
+    stop: { price: 97.8, frac: 0.022 }, target: { price: 104.6, frac: 0.046 },
+    rewardRisk: 2.09, atrFrac: S.MIN_ATR_ENTRY * 2, cost: S.MAX_ROUND_TRIP_COST * 0.5,
+    netRewardRisk: S.MIN_RR_NET * 2, targetCostRatio: 99
+  };
+  I.setBrokerMirror({ ok: true, cash: 150, equity: 1000, buying_power: 2000, positions: [], at: Date.now() });
+  I.setPendingOrders({});
+  const alone = I.terraValidateTrade(plan);                       // $90 of $150 — fine
+  I.setPendingOrders({ o1: { kind: 'entry', ticker: 'X', direction: 'LONG', qty: 1, refPrice: 100 } });
+  const withCommitted = I.terraValidateTrade(plan);               // $90 + $100 committed > $150
+  I.setBrokerMirror(savedMirror); I.setPendingOrders(savedPending);
+  if (!I.FRACTIONAL_ENABLED) { ok(true, 'fractional off — sizing path differs'); return; }
+  // Assert on the REASON, not on approval: the validator also gates on market hours,
+  // so `approved` is false in any evening test run and would prove nothing either way.
+  ok(!/cannot fund/i.test(String(alone.reason || '')),
+     `$90 against $150 cash must not be a funding rejection, got: "${alone.reason}"`);
+  ok(/cannot fund/i.test(String(withCommitted.reason || '')),
+     `with $100 already committed the same order must fail on funding, got: "${withCommitted.reason}"`);
+});
+
 check('a failed ENTRY is actually wired to the backoff handler', () => {
   // THE LIVE BUG ITSELF. The failure branch previously did nothing for entries, so the
   // 2s scan resubmitted an identical order ~1,800 times an hour. The other tests in
