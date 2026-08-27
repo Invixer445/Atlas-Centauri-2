@@ -1332,6 +1332,116 @@ check('fractional sizing produces a real size at any share price', () => {
   ok(sizes[215.24] > 0, `a $215 share must be tradeable, got ${sizes[215.24]}`);
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+//  BROKER REJECTION LOOP (v11.30)
+//  Reproduces the live incident: ~1,800 identical "insufficient buying power"
+//  submissions per hour against HOOD, because a failed ENTRY changed no state.
+// ════════════════════════════════════════════════════════════════════════════
+group('Broker rejection must not loop');
+
+check('a failed ENTRY is actually wired to the backoff handler', () => {
+  // THE LIVE BUG ITSELF. The failure branch previously did nothing for entries, so the
+  // 2s scan resubmitted an identical order ~1,800 times an hour. The other tests in
+  // this group call noteEntryRejection() directly, which leaves the WIRING untested —
+  // removing the call site passed the whole suite until this check existed.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/else noteEntryRejection\(ticker, r\.error\);/.test(src),
+     'the broker failure branch must call noteEntryRejection for entries');
+  ok(/if \(meta\.kind === 'entry'\) clearEntryRejectBackoff\(\);/.test(src),
+     'a successful entry must clear the backoff');
+  ok(/if \(entriesPausedByBroker\(\)\)/.test(src),
+     'the entry scan must actually honour the pause');
+});
+
+check('an unfundable order is refused before it reaches the broker', () => {
+  const S = I.STRATEGY;
+  const savedMirror = I.brokerMirror();
+  // Exactly the live case: a $48 fractional order against an account with $10 cash.
+  const plan = {
+    ticker: 'HOOD', direction: 'LONG', entryPrice: 100, shares: 0.48,
+    stop: { price: 97.8, frac: 0.022 }, target: { price: 104.6, frac: 0.046 },
+    rewardRisk: 2.09, atrFrac: S.MIN_ATR_ENTRY * 2, cost: S.MAX_ROUND_TRIP_COST * 0.5,
+    netRewardRisk: S.MIN_RR_NET * 2, targetCostRatio: 99
+  };
+  I.setBrokerMirror({ ok: true, cash: 10, equity: 1000, buying_power: 2000, positions: [], at: Date.now() });
+  const v = I.terraValidateTrade(plan);
+  I.setBrokerMirror(savedMirror);
+  ok(!v.approved, 'a $48 order against $10 cash must be refused BEFORE submission');
+  // In whole-share mode a 0.48 order is refused one rule earlier, for a different and
+  // equally valid reason — assert the funding reason only where it is the binding one.
+  if (I.FRACTIONAL_ENABLED) ok(/cannot fund/i.test(v.reason), `reason should name funding, got: "${v.reason}"`);
+  else ok(/below 1 share/i.test(v.reason), `whole-share mode should refuse on size, got: "${v.reason}"`);
+});
+
+check('a stale broker snapshot does not veto trading', () => {
+  // The mirror refreshes on a 60s timer. If a missed refresh let an old cash figure
+  // block entries, one network blip would silently stop the bot trading all day.
+  const S = I.STRATEGY;
+  const savedMirror = I.brokerMirror();
+  const plan = {
+    ticker: 'HOOD', direction: 'LONG', entryPrice: 100, shares: 0.48,
+    stop: { price: 97.8, frac: 0.022 }, target: { price: 104.6, frac: 0.046 },
+    rewardRisk: 2.09, atrFrac: S.MIN_ATR_ENTRY * 2, cost: S.MAX_ROUND_TRIP_COST * 0.5,
+    netRewardRisk: S.MIN_RR_NET * 2, targetCostRatio: 99
+  };
+  // Same $10-cash snapshot as the blocking test, but an hour old.
+  I.setBrokerMirror({ ok: true, cash: 10, equity: 1000, buying_power: 2000, positions: [], at: Date.now() - 3600000 });
+  const v = I.terraValidateTrade(plan);
+  I.setBrokerMirror(savedMirror);
+  ok(!/cannot fund/i.test(String(v.reason || '')),
+     `a stale snapshot must not be used to block, got: "${v.reason}"`);
+});
+
+check('fractional orders are checked against cash, not margin', () => {
+  // Alpaca does not extend margin to fractional shares. Sizing a fractional order
+  // against buying_power (which includes margin) is exactly how the live rejection
+  // loop got past every internal check.
+  const S = I.STRATEGY;
+  const savedMirror = I.brokerMirror();
+  const base = {
+    ticker: 'HOOD', direction: 'LONG', entryPrice: 100,
+    stop: { price: 97.8, frac: 0.022 }, target: { price: 104.6, frac: 0.046 },
+    rewardRisk: 2.09, atrFrac: S.MIN_ATR_ENTRY * 2, cost: S.MAX_ROUND_TRIP_COST * 0.5,
+    netRewardRisk: S.MIN_RR_NET * 2, targetCostRatio: 99
+  };
+  // $50 cash, $2000 buying power. A $150 order is fundable on margin, not on cash.
+  I.setBrokerMirror({ ok: true, cash: 50, equity: 1000, buying_power: 2000, positions: [], at: Date.now() });
+  const frac  = I.terraValidateTrade({ ...base, shares: 1.5 });   // fractional -> cash only
+  I.setBrokerMirror(savedMirror);
+  ok(!frac.approved, 'a fractional order above CASH must be refused even when margin would cover it');
+});
+
+check('a buying-power rejection pauses all entries, not just one symbol', () => {
+  // Cooling down only the rejected symbol would rotate the identical failure through
+  // the rest of the watchlist — the failure is account-wide, so the pause must be too.
+  I.clearEntryRejectBackoff();
+  ok(!I.entriesPausedByBroker(), 'should start unpaused');
+  I.noteEntryRejection('HOOD', 'insufficient buying power');
+  ok(I.entriesPausedByBroker(), 'a buying-power rejection must pause ALL entries');
+  I.clearEntryRejectBackoff();
+  ok(!I.entriesPausedByBroker(), 'a successful entry must clear the pause');
+});
+
+check('a symbol-specific rejection does not halt the whole book', () => {
+  I.clearEntryRejectBackoff();
+  I.noteEntryRejection('ZZZZ', 'asset not tradable');
+  ok(!I.entriesPausedByBroker(), 'a symbol-specific error must not pause every entry');
+  ok(I.onCooldown('ZZZZ'), 'the offending symbol should be cooled down instead');
+  I.clearSymbolCooldown('ZZZZ');
+});
+
+check('repeated rejections back off further each time', () => {
+  // Without escalation a persistent condition is just retried forever at a fixed rate.
+  I.clearEntryRejectBackoff();
+  I.noteEntryRejection('HOOD', 'insufficient buying power');
+  const first = I.entryPauseRemainingMs();
+  I.noteEntryRejection('HOOD', 'insufficient buying power');
+  const second = I.entryPauseRemainingMs();
+  I.clearEntryRejectBackoff();
+  ok(second > first * 1.5, `backoff must escalate: ${Math.round(first/1000)}s then ${Math.round(second/1000)}s`);
+});
+
 check('dust positions are refused', () => {
   // Fractional sizing makes it possible to open a $0.40 position, which costs more in
   // spread to exit than it can ever return. The gate must reject on NOTIONAL.

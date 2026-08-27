@@ -2295,6 +2295,11 @@ const CORE_HOLD_ON       = CORE_HOLD_FRACTION > 0;
 // a stream of tiny orders that pay spread for nothing.
 const CORE_REBALANCE_BAND = 0.10;
 
+// How old a broker snapshot may be before the funding gate stops trusting it. The
+// mirror refreshes every 60s; 5 minutes tolerates a couple of missed refreshes without
+// letting genuinely stale cash figures veto trading.
+const BROKER_MIRROR_MAX_AGE_MS = 5 * 60 * 1000;
+
 const FRACTIONAL_ENABLED = process.env.FRACTIONAL_ENABLED !== 'false';
 // Floor on position value, so a rescued trade is worth the spread it pays. Alpaca's
 // own minimum is $1; $5 keeps the book free of dust that costs more to exit than it
@@ -4669,6 +4674,7 @@ function submitBrokerOrder(meta) {
     .then(r => {
       if (r.ok) {
         pendingOrders[r.id] = { ...meta, id: r.id, submittedAt: Date.now() };
+        if (meta.kind === 'entry') clearEntryRejectBackoff();
         console.log(`[BROKER] ⏳ ${meta.kind} ${side} ${ticker} ×${qty} submitted (${r.id})`);
         recordLiveOrder({ symbol: ticker, side, qty, ok: true, status: r.status, id: r.id, error: null });
         queueSaveState();
@@ -4676,6 +4682,7 @@ function submitBrokerOrder(meta) {
         console.error(`[BROKER] ✗ ${meta.kind} ${side} ${ticker} ×${qty} submit FAILED: ${r.error}`);
         recordLiveOrder({ symbol: ticker, side, qty, ok: false, status: null, id: null, error: r.error });
         if (meta.kind !== 'entry') unmarkLots(ticker, meta.direction, meta.kind, meta.rung);
+        else noteEntryRejection(ticker, r.error);
       }
     })
     .catch(e => {
@@ -4683,6 +4690,57 @@ function submitBrokerOrder(meta) {
       if (meta.kind !== 'entry') unmarkLots(ticker, meta.direction, meta.kind, meta.rung);
     });
   return true;   // "accepted for execution" — the fill (or failure) books asynchronously
+}
+
+// ── BROKER-REJECTION BACKOFF (v11.30) ───────────────────────────────────────
+// A rejected ENTRY used to do nothing but print a line. The entry scan runs every 2s,
+// so the next pass recomputed an identical order and resubmitted it — measured live at
+// roughly 1,800 identical "insufficient buying power" attempts per hour against one
+// symbol. Three separate harms: it hammers the broker API toward its rate limit, it
+// buries every other log line, and if buying power freed up momentarily several
+// in-flight attempts could ALL fill and overshoot the intended position.
+//
+// The right response depends on WHY it failed:
+//   · insufficient buying power is an ACCOUNT-WIDE condition — cooling down one symbol
+//     just rotates the same failure through the rest of the watchlist, so this pauses
+//     all new entries and refreshes the broker mirror so sizing learns the real cash
+//   · anything else is treated as symbol-specific
+// Backoff escalates so a persistent condition stops being retried at speed.
+let _entryRejectStreak = 0;
+let entryPauseUntil = 0;
+const ENTRY_PAUSE_BASE_MS = 60000;      // 1 min, doubling to a 30 min ceiling
+
+function noteEntryRejection(ticker, error) {
+  const why = String(error || '').toLowerCase();
+  noteDailyRejection(`broker rejected entry: ${error}`);
+  const accountWide = /buying power|insufficient|cash|margin/.test(why);
+  if (accountWide) {
+    _entryRejectStreak++;
+    const wait = Math.min(30 * 60000, ENTRY_PAUSE_BASE_MS * Math.pow(2, _entryRejectStreak - 1));
+    entryPauseUntil = Date.now() + wait;
+    console.warn(`[BROKER] Account cannot fund new entries (${error}) — pausing ALL entries ${Math.round(wait/60000)}min ` +
+                 `(attempt ${_entryRejectStreak}). Exits and stops are UNAFFECTED.`);
+    // Re-read the broker so the next sizing pass works from real cash, not our ledger.
+    refreshBrokerMirror().catch(() => {});
+  } else {
+    symbolCooldowns[ticker] = Date.now() + Math.min(30 * 60000, ENTRY_PAUSE_BASE_MS);
+    console.warn(`[BROKER] ${ticker} entry rejected (${error}) — cooling that symbol 1min`);
+  }
+  queueSaveState();
+}
+
+// Cleared by any successful entry: the condition that caused it has demonstrably lifted.
+function clearEntryRejectBackoff() {
+  if (_entryRejectStreak || entryPauseUntil) { _entryRejectStreak = 0; entryPauseUntil = 0; }
+}
+
+function entriesPausedByBroker() {
+  return Date.now() < entryPauseUntil;
+}
+
+// How long the broker-imposed entry pause still has to run (0 when not paused).
+function entryPauseRemainingMs() {
+  return Math.max(0, entryPauseUntil - Date.now());
 }
 
 function submitEntryOrder(plan) {
@@ -4955,6 +5013,29 @@ function terraValidateTrade(plan) {
     if (shares * entryPrice < MIN_FRACTIONAL_NOTIONAL)
       return reject(`position $${(shares * entryPrice).toFixed(2)} below the $${MIN_FRACTIONAL_NOTIONAL} minimum`);
   } else if (shares < 1)                                          return reject('size below 1 share');
+
+  // RULE 3.2 — CAN THE BROKER ACTUALLY PAY FOR THIS? (v11.30)
+  // Every check above reasons about ATLAS's own ledger. None of them asks the broker,
+  // so the engine happily approved a $48 order against an account that could not fund
+  // it and then discovered the problem only on rejection — 1,800 times an hour.
+  //
+  // Alpaca does NOT extend margin to fractional shares: a fractional order must be
+  // fully covered by CASH, even when buying_power shows a larger margin figure. So
+  // fractional is checked against cash, and whole shares against the lesser of cash and
+  // buying power — conservative on a small account, where leaning on margin is not
+  // something this bot should be doing silently.
+  // STALENESS: the mirror refreshes on a 60s timer. Trusting an old snapshot could
+  // block every trade on cash figures that are minutes out of date, so an expired
+  // mirror is treated as "unknown" and the gate stands down rather than guessing.
+  const mirrorAge = Date.now() - (brokerMirror.at || 0);
+  if (brokerMirror.ok && Number.isFinite(brokerMirror.cash) && mirrorAge < BROKER_MIRROR_MAX_AGE_MS) {
+    const notional = shares * entryPrice;
+    const bp = Number.isFinite(brokerMirror.buying_power) ? brokerMirror.buying_power : brokerMirror.cash;
+    const fundable = isFractionalQty(shares) ? brokerMirror.cash : Math.min(brokerMirror.cash, bp);
+    // Small headroom so a tick between sizing and submission cannot tip it over.
+    if (notional > fundable * 0.98)
+      return reject(`broker cannot fund $${notional.toFixed(2)} (${isFractionalQty(shares) ? 'fractional needs cash' : 'available'} $${fundable.toFixed(2)})`);
+  }
 
   // RULE 3.5 — THE ECONOMIC GATE (v11.20). Rules 1-3 establish the plan is well-formed;
   // these establish it can actually PAY. Gross R:R is geometry; this is money. Without
@@ -6207,6 +6288,17 @@ function evaluateAndTrade() {
 
   // ── 3. KILL SWITCHES ──────────────────────────────────────────────────────
   releaseExpiredLossHalt();   // let a finished cool-off actually end before we test it
+  // The broker has told us it cannot fund new entries. Retrying at 2s intervals
+  // achieves nothing and hammers the API, so hold off until the backoff expires.
+  // EXITS AND STOPS ARE NOT AFFECTED — they run above this point.
+  if (entriesPausedByBroker()) {
+    if (Date.now() - (evaluateAndTrade._lastBrokerPauseLog || 0) > 60000) {
+      evaluateAndTrade._lastBrokerPauseLog = Date.now();
+      console.log(`[KILL] New entries paused: broker cannot fund them (retry in ${Math.ceil((entryPauseUntil-Date.now())/60000)}min)`);
+    }
+    return;
+  }
+
   const killReason = getKillSwitchReason();
   if (killReason) {
     if (Date.now() - evaluateAndTrade._lastKillLog > 60000) {
@@ -7056,6 +7148,9 @@ module.exports = {
     FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
     CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore, coreHoldingValue, maintainCoreHolding, coreTopUpQty,
     logDailyTradeDigest, rejectionBucket, noteDailyRejection, tradableValue, wouldExceedHeat,
+    noteEntryRejection, entriesPausedByBroker, clearEntryRejectBackoff, entryPauseRemainingMs,
+    onCooldown, clearSymbolCooldown: (s) => { delete symbolCooldowns[s]; }, EXEC_BROKER_AUTH,
+    setBrokerMirror: (m) => { brokerMirror = m; },
     estimateRoundTripCost, netRewardRisk, sideCost, LIMIT_ENTRIES, estimateDynamicSpread,
     evaluateStrategyGate, calculateADX, calculateRVOL, getCandleTrend, priceMidpoint, detectMarketRegime,
     setPendingOrders: (o) => { pendingOrders = o; } }
