@@ -3019,12 +3019,23 @@ async function fetchBars(symbols, timeframe, startISO, keepPerSymbol) {
   // candle-grade ATR", paused entries on all 23, and traded nothing for whole
   // sessions. This was misdiagnosed for a long time as a thin IEX tape. It was not
   // the feed — the request was truncated and the remainder thrown away.
+  // ASK FOR WHAT WE KEEP, NOT FOR EVERYTHING AND THEN DISCARD IT.
+  // We only ever retain the newest `keepPerSymbol` bars. Requesting a wide window
+  // ascending meant paging through the entire span to reach them: measured live at
+  // 12 pages / ~120,000 bars fetched to keep 1,380, which also tripped the page cap
+  // and printed a warning every refresh. Sorting DESCENDING puts the bars we want on
+  // the first page, so a normal refresh is one round trip; the rows are reversed back
+  // into chronological order below, because every indicator assumes oldest-first.
+  const wantNewestFirst = keepPerSymbol > 0;
+  const perPage = wantNewestFirst
+    ? Math.min(10000, Math.max(1000, Math.ceil(keepPerSymbol * symbols.length * 1.3)))
+    : 10000;
   const out = {};
   let token = null, pages = 0;
   do {
     const qs = `symbols=${symbols.join(',')}&timeframe=${timeframe}` +
-               `&start=${encodeURIComponent(startISO)}&limit=10000` +
-               `&adjustment=raw&feed=${ALPACA_DATA_FEED}&sort=asc` +
+               `&start=${encodeURIComponent(startISO)}&limit=${perPage}` +
+               `&adjustment=raw&feed=${ALPACA_DATA_FEED}&sort=${wantNewestFirst ? 'desc' : 'asc'}` +
                (token ? `&page_token=${encodeURIComponent(token)}` : '');
     const j = await alpacaDataGet(`/v2/stocks/bars?${qs}`);
     if (!j) break;
@@ -3039,11 +3050,19 @@ async function fetchBars(symbols, timeframe, startISO, keepPerSymbol) {
     });
     token = j.next_page_token || null;
     pages++;
+    // Descending: once every symbol has enough, more pages only fetch older bars we
+    // would immediately discard. Stop as soon as the requirement is met.
+    if (wantNewestFirst && symbols.every(sym => (out[sym] || []).length >= keepPerSymbol)) break;
   } while (token && pages < MAX_BAR_PAGES);
-  if (token) console.warn(`[CANDLES] ${timeframe}: stopped at ${MAX_BAR_PAGES} pages with more available — widen the cap or narrow the window.`);
-  // Keep only the most recent N per symbol; sort=asc means those are at the tail.
+  if (token && !wantNewestFirst)
+    console.warn(`[CANDLES] ${timeframe}: stopped at ${MAX_BAR_PAGES} pages with more available — widen the cap or narrow the window.`);
   if (keepPerSymbol > 0) {
-    Object.keys(out).forEach(s => { if (out[s].length > keepPerSymbol) out[s] = out[s].slice(-keepPerSymbol); });
+    Object.keys(out).forEach(s => {
+      // Descending pages arrive newest-first; restore chronological order, which every
+      // indicator (EMA, RSI, ATR, ADX) depends on.
+      if (wantNewestFirst) out[s].sort((a, b) => a.t - b.t);
+      if (out[s].length > keepPerSymbol) out[s] = out[s].slice(-keepPerSymbol);
+    });
   }
   return out;
 }

@@ -1757,6 +1757,20 @@ check('the core symbol is never also traded', () => {
      'the entry scan must skip EVERY core basket member — one broker position cannot back two books');
 });
 
+check('descending bar fetches are restored to chronological order', () => {
+  // The fetch asks newest-first so one round trip gets what we keep (it was paging
+  // 12 times for ~120,000 bars to retain 1,380). Those pages arrive REVERSED, and
+  // every indicator — EMA, RSI, ATR, ADX — assumes oldest-first. Forgetting the
+  // re-sort would silently invert every signal rather than fail loudly.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/sort=\$\{wantNewestFirst \? 'desc' : 'asc'\}/.test(src), 'fetch should request newest-first when trimming');
+  ok(/if \(wantNewestFirst\) out\[s\]\.sort\(\(a, b\) => a\.t - b\.t\);/.test(src),
+     'descending results MUST be re-sorted chronologically before use');
+  ok(/if \(wantNewestFirst && symbols\.every/.test(src),
+     'it must stop paging once every symbol has enough bars');
+});
+
 check('bar fetching follows pagination', () => {
   // Alpaca's `limit` is the TOTAL across all symbols, so a multi-symbol request comes
   // back partial with a next_page_token. Dropping that token returned 3 of 25 symbols
