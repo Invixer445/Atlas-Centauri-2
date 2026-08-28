@@ -1794,6 +1794,25 @@ check('the boot sync does not adopt core holdings as trades', () => {
      'and say so, because a silent skip is indistinguishable from a missed position');
 });
 
+check('venus basket mode buys nothing until Venus has actually proposed', () => {
+  // Venus can only propose inside the news window (weekdays 08:00-16:00 ET) while the
+  // core buys every 5 minutes regardless. Boot on a weekend in venus mode and the core
+  // would spend the whole allocation on the DEFAULT basket, Venus would then propose
+  // something else, every one of those names would become off-basket, and the trim
+  // would sell all of it. Buy $500, sell $500, pay spread twice, own nothing new.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/CORE_BASKET_SOURCE === 'venus' && !_venusBasketReceived/.test(src),
+     'venus mode must not buy before a proposal exists');
+  ok(/_venusBasketReceived = true;/.test(src), 'and must record when one arrives');
+  // The flag must be set where the basket is ACTUALLY swapped, not merely on a
+  // proposal being logged — a logged proposal that did not replace the list would
+  // leave the core buying the default basket while believing it had Venus's.
+  const idx = src.indexOf('CORE_HOLD_SYMBOLS.push(...prop.basket)');
+  ok(idx > 0 && src.slice(idx, idx + 120).includes('_venusBasketReceived = true'),
+     'the flag must be set at the point the basket is swapped');
+});
+
 check('an operator halt stops the core; an automatic one does not', () => {
   // Deliberate asymmetry. A threshold tripping during a dip must NOT pause a long-term
   // holding — that reaction is exactly what destroys buy-and-hold returns. A human
@@ -1810,8 +1829,16 @@ check('an operator halt stops the core; an automatic one does not', () => {
      'the automatic drawdown halt must NOT reach the core');
   // And assert the CALL SITES, not just that the helper exists — deleting both calls
   // passed this test until now, which is the third time that gap has appeared here.
-  const buy  = src.slice(src.indexOf('function maintainCoreHolding'), src.indexOf('function maintainCoreHolding') + 700);
-  const trim = src.slice(src.indexOf('function trimCoreHolding'), src.indexOf('function trimCoreHolding') + 700);
+  // Slice to the END of each function, never a fixed character count. A 700-char
+  // window broke the moment a comment was added above the line it checks — the second
+  // time that exact brittleness has produced a red suite over correct code.
+  const body = (name) => {
+    const i = src.indexOf('function ' + name);
+    const j = src.indexOf('\nfunction ', i + 1);
+    return src.slice(i, j > i ? j : i + 4000);
+  };
+  const buy  = body('maintainCoreHolding');
+  const trim = body('trimCoreHolding');
   ok(/if \(coreHaltedByOperator\(\)\) return;/.test(buy), 'core BUYING must honour the operator halt');
   ok(/if \(coreHaltedByOperator\(\)\) return;/.test(trim), 'core TRIMMING must honour the operator halt');
 });

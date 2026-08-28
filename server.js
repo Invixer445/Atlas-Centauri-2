@@ -2367,6 +2367,9 @@ const CORE_BASKET_SOURCE = (process.env.CORE_BASKET_SOURCE || 'fixed').toLowerCa
 // LLM budget for the news calls that actually decay.
 const BASKET_PROPOSAL_INTERVAL_MS = 24 * 3600 * 1000;
 let _lastBasketProposalAt = 0;
+// Set once Venus has actually delivered a basket. Until then, venus mode buys nothing.
+let _venusBasketReceived = false;
+let _coreWaitLogAt = 0;
 const BASKET_LOG = 'atlas-basket-proposals.json';
 
 // Append-only record of what Venus proposed and when. The timestamp is the whole point:
@@ -3531,6 +3534,7 @@ async function runIntelCycle() {
           if (CORE_BASKET_SOURCE === 'venus') {
             console.log(`[VENUS]    CORE_BASKET_SOURCE=venus — this proposal is now the live basket`);
             CORE_HOLD_SYMBOLS.length = 0; CORE_HOLD_SYMBOLS.push(...prop.basket);
+            _venusBasketReceived = true;
           }
         }
       } catch (e) { console.warn(`[VENUS] basket proposal failed: ${e.message}`); }
@@ -4639,10 +4643,21 @@ function trimCoreHolding() {
 function maintainCoreHolding() {
   if (!CORE_HOLD_ON) return;
   if (!getCurrentMarket()) return;                       // only during market hours
-  // An operator pressing stop means STOP — including the core. Note the asymmetry:
-  // the AUTOMATIC drawdown halt deliberately does not reach here, because pausing a
-  // long-term holding during a dip is precisely the reaction the core exists to avoid.
-  // A human deciding to halt is a different thing from a threshold tripping.
+  // CORE_BASKET_SOURCE=venus means the basket is whatever Venus proposes — but Venus
+  // can only propose inside the news window (weekdays 08:00-16:00 ET), and the core
+  // buys every 5 minutes regardless. Boot on a weekend or overnight and the core would
+  // spend the whole allocation on the DEFAULT basket, then Venus would propose
+  // something else, every one of those names would become off-basket, and the trim
+  // would sell all of it. Buy $500, sell $500, pay spread twice, own nothing new.
+  // So in venus mode: buy nothing until there is an actual proposal to buy.
+  if (CORE_BASKET_SOURCE === 'venus' && !_venusBasketReceived) {
+    if (Date.now() - (_coreWaitLogAt || 0) > 600000) {
+      _coreWaitLogAt = Date.now();
+      console.log('[CORE] Waiting for Venus to propose a basket (CORE_BASKET_SOURCE=venus) — ' +
+                  'buying nothing until then, to avoid buying the default basket and immediately selling it.');
+    }
+    return;
+  }
   if (coreHaltedByOperator()) return;
   const pick = mostUnderweightCore();
   if (!pick) return;                                     // no fresh price on any member
