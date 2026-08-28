@@ -1777,7 +1777,12 @@ check('bar fetching follows pagination', () => {
   // and paused entries on the other 22 for entire sessions — misread for a long time
   // as a thin IEX feed. Measured after the fix: 12/12 symbols, 60 bars each.
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
-  const fn = src.slice(src.indexOf('async function fetchBars('), src.indexOf('async function fetchBars(') + 2200)
+  // Anchor to the END of the function, not a fixed character count. A previous version
+  // sliced a fixed 2,200 chars and broke the moment a comment was added above the code
+  // it checks — a test that fails on documentation is worse than no test.
+  const start = src.indexOf('async function fetchBars(');
+  const after = src.indexOf('\nfunction ', start);
+  const fn = src.slice(start, after > start ? after : start + 4000)
                 .split('\n').filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');   // strip comments
   // Assert the ASSIGNMENT, not a mention. A first version of this test matched the
   // explanatory comment above the code and survived `token = null` — vacuous.
