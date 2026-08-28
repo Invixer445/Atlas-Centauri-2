@@ -1339,6 +1339,21 @@ check('fractional sizing produces a real size at any share price', () => {
 // ════════════════════════════════════════════════════════════════════════════
 group('Broker rejection must not loop');
 
+check('phantom positions are dropped, not just warned about', () => {
+  // After an account reset the broker holds nothing while the saved ledger still
+  // carries the old book. Warning and continuing left the engine valuing shares it
+  // did not own — and every percentage derives from total equity, so risk sizing,
+  // drawdown and the daily-loss brake would all be computed against roughly double
+  // the real balance.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/Dropped \$\{sym\}/.test(src), 'a position the broker does not hold must be removed');
+  ok(/delete book\[sym\]/.test(src), 'the phantom lots must actually be deleted from the book');
+  // The guard matters as much as the fix: a failed API call must not read as "you own nothing".
+  ok(/if \(pos\.ok && Array\.isArray\(pos\.positions\)\)/.test(src),
+     'dropping must be guarded on a SUCCESSFUL positions fetch, or a network blip deletes a real book');
+});
+
 check('in-flight entries count toward exposure', () => {
   // THE DISEASE BEHIND THE LIVE INCIDENT. Orders are booked only when their fill is
   // polled back (every 3s) while the entry scan runs every 2s, so an in-flight entry

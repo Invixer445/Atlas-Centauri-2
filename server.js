@@ -4896,10 +4896,39 @@ async function syncFromBroker() {
                                 market: getCurrentMarket(), signalScore: 0, stopPrice, targetPrice: tgtPrice });
         console.log(`[SYNC] Adopted broker position ${dir} ${bp.symbol} ×${qty} @ $${bp.avg_entry_price.toFixed(2)} (stops recomputed)`);
       }
-      const brokerSyms = new Set(pos.positions.map(x => x.symbol));
-      [...Object.keys(portfolio.longPositions), ...Object.keys(portfolio.shortPositions)]
-        .filter(sym => !brokerSyms.has(sym))
-        .forEach(sym => console.warn(`[SYNC] ⚠️ ledger holds ${sym} but broker does not — investigate (/api/reconcile)`));
+      // PHANTOM POSITIONS. The broker is authoritative — that is the entire premise of
+      // this execution mode — so a position the ledger holds and the broker does not is
+      // not a mystery to investigate later, it is wrong now. Warning and moving on left
+      // the engine valuing shares it does not own, and EVERY percentage derives from
+      // total equity: risk sizing, drawdown, exposure, the daily-loss brake. After an
+      // account reset the ledger would still carry the old book and size every position
+      // against roughly double the real balance.
+      //
+      // Guarded deliberately: only drop when the positions call actually SUCCEEDED and
+      // returned a usable list. A transient API failure must never be read as "you own
+      // nothing" — that would delete a real book on a network blip.
+      if (pos.ok && Array.isArray(pos.positions)) {
+        const brokerSyms = new Set(pos.positions.map(x => x.symbol));
+        let dropped = 0;
+        for (const book of [portfolio.longPositions, portfolio.shortPositions]) {
+          for (const sym of Object.keys(book)) {
+            if (brokerSyms.has(sym)) continue;
+            const qty = (book[sym] || []).reduce((a, l) => a + (l.qty || 0), 0);
+            delete book[sym];
+            // Mark any open trade rows closed at zero rather than leaving them dangling,
+            // and do NOT fabricate a P&L — the real exit price is unknown to us.
+            portfolio.trades.filter(t => t.ticker === sym && t.status === 'open')
+              .forEach(t => { t.status = 'closed'; t.closedAt = new Date().toISOString();
+                              t.reason = (t.reason || '') + ' | dropped: broker does not hold it'; });
+            dropped++;
+            console.warn(`[SYNC] ⚠️ Dropped ${sym} ×${qty} — ledger held it, broker does not. Broker is authoritative.`);
+          }
+        }
+        if (dropped) {
+          console.warn(`[SYNC] Removed ${dropped} phantom position(s). Equity and risk sizing now match the broker.`);
+          queueSaveState();
+        }
+      }
     }
   } catch (e) { console.error('[SYNC] failed:', e.message); }
 }
