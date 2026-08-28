@@ -90,6 +90,35 @@ const HYPOTHESES = [
     }
   },
   {
+    id: 'venus-basket-beats-fixed',
+    claim: 'A basket Venus screens beats a fixed liquidity-picked basket of the same size.',
+    why: 'Venus proposes a hold-basket daily and the proposal is logged with a timestamp. '
+       + 'The comparison that matters is NOT whether its picks went up — in a rising market '
+       + 'everything goes up — but whether they beat a boring control basket chosen for '
+       + 'breadth alone. Scored only on bars after each proposal date, so the picks cannot '
+       + 'be tuned to the outcome. Money stays on the control until this says otherwise.',
+    scoreBasket: (bars, from, log) => {
+      const props = (log || []).filter(p => p.at.slice(0, 10) >= from);
+      if (!props.length) return null;
+      const daily = [];
+      for (const p of props) {
+        const d0 = p.at.slice(0, 10);
+        const have = (syms) => syms.filter(x => bars[x] && bars[x].rows.some(r => r.t > d0));
+        const v = have(p.basket), c = have(p.control || []);
+        if (v.length < 3 || c.length < 3) continue;
+        const dates = commonDates(bars).filter(x => x > d0);
+        for (let i = 1; i < dates.length; i++) {
+          const vr = mean(v.map(s2 => dayRet(bars, s2, dates[i-1], dates[i])));
+          const cr = mean(c.map(s2 => dayRet(bars, s2, dates[i-1], dates[i])));
+          daily.push(vr - cr);                    // EXCESS over the control, not raw return
+        }
+      }
+      if (daily.length < 30) return null;
+      return { n: daily.length, mean: mean(daily), t: tstat(daily),
+               note: `${props.length} proposal(s) scored as excess over the control basket` };
+    }
+  },
+  {
     id: 'momentum-beats-hold',
     claim: '12-month cross-sectional momentum, monthly rebalance, beats equal-weight buy-and-hold.',
     why: 'Documented anomaly, low turnover so friction is not the obstacle. Measured '
@@ -239,6 +268,12 @@ function verdict(entry) {
     if (h.score) {
       const subset = {}; have.forEach(s => subset[s] = bars[s]);
       try { res = h.score(subset, e.registeredAt); } catch (err) { console.log(`  ${h.id}: scoring error — ${err.message}`); continue; }
+    } else if (h.scoreBasket) {
+      let log = [];
+      try { log = JSON.parse(fs.readFileSync(path.join(__dirname, 'atlas-basket-proposals.json'), 'utf8')); } catch {}
+      const subset = {}; have.forEach(s2 => subset[s2] = bars[s2]);
+      try { res = h.scoreBasket(subset, e.registeredAt, log); }
+      catch (err) { console.log(`  ${h.id}: scoring error — ${err.message}`); continue; }
     } else if (h.scoreLive) {
       // Score against the bot's own closed trades, if any have accumulated.
       let trades = [];

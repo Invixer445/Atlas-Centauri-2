@@ -2,20 +2,26 @@
   "entries": {
     "overnight-beats-intraday": {
       "claim": "Close-to-open returns exceed open-to-close returns on a broad equity basket.",
-      "why": "Measured 2020-2024: overnight positive in 5/5 years (t up to 6.93), intraday negative in 3/5. Strongest effect found in this project. Tracked for DECAY — if it fades, the reason the bot holds rather than day-trades weakens.",
-      "registeredAt": "2026-08-25",
+      "why": "Measured 2020-2024: overnight positive in 5/5 years (t up to 6.93), intraday negative in 3/5. Strongest effect found in this project. BUT a backdated check over 2024-2026 alone scored only t=0.58 (overnight 22.0%/yr vs intraday 12.6%) — still positive, no longer significant. That is exactly why this is registered rather than believed: it may be decaying, or the recent window may just be short.",
+      "registeredAt": "2026-08-28",
       "results": []
     },
     "atlas-live-trading-edge": {
       "claim": "ATLAS trades, as configured, have positive expectancy net of costs.",
       "why": "The central claim of the whole bot. Measured +0.113R (t=1.52) on the original watchlist and +0.005R (t=0.08) on symbols it was not built around. Scored here against the bot's OWN closed trades as they accumulate live.",
-      "registeredAt": "2026-08-25",
+      "registeredAt": "2026-08-28",
+      "results": []
+    },
+    "venus-basket-beats-fixed": {
+      "claim": "A basket Venus screens beats a fixed liquidity-picked basket of the same size.",
+      "why": "Venus proposes a hold-basket daily and the proposal is logged with a timestamp. The comparison that matters is NOT whether its picks went up — in a rising market everything goes up — but whether they beat a boring control basket chosen for breadth alone. Scored only on bars after each proposal date, so the picks cannot be tuned to the outcome. Money stays on the control until this says otherwise.",
+      "registeredAt": "2026-08-28",
       "results": []
     },
     "momentum-beats-hold": {
       "claim": "12-month cross-sectional momentum, monthly rebalance, beats equal-weight buy-and-hold.",
       "why": "Documented anomaly, low turnover so friction is not the obstacle. Measured 44.4%/yr net against buy-and-hold 54.3% — i.e. it LOST on the in-sample run. Registered to see whether that reverses out of sample.",
-      "registeredAt": "2026-08-25",
+      "registeredAt": "2026-08-28",
       "results": []
     }
   }

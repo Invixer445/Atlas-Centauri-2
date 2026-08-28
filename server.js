@@ -1175,6 +1175,54 @@ function getResearchFor(sym)  { return researchData.bySymbol[sym] || null; }
 //    ideas — including the discipline to say "stand aside" when conditions are poor.
 //    Purely advisory: it can sharpen or veto an idea and set a cautious posture, but
 //    its convictions still flow through Jupiter's sizing and Terra's risk gate.
+// ── BASKET SCREENING (v11.34) ───────────────────────────────────────────────
+// A DIFFERENT JOB FROM EVERYTHING ELSE VENUS DOES. Its trading work asks "which way
+// will this move" — prediction, and measured at ~zero across 400+ trades. This asks
+// "which of these is worth owning for months" — screening, which is a filter over
+// slow-moving facts rather than a forecast.
+//
+// The prompt is deliberately hostile to prediction: no price targets, no timing, no
+// catalysts, no news. Those are exactly the inputs that produce a basket of whatever
+// was in the headlines last week, and headlines decay in days while a holding is meant
+// to last. What it is asked for instead is size, liquidity, sector spread and the
+// absence of obvious distress.
+//
+// Returns an array of symbols, or null when unavailable — callers keep the fixed
+// basket in that case, which is also the default until the register says otherwise.
+async function proposeBasket(candidates, size = 10) {
+  if (!Array.isArray(candidates) || candidates.length < size) return null;
+  const list = candidates.slice(0, 60).join(', ');
+  const prompt =
+`You are VENUS. Choose a basket of ${size} US-listed stocks to HOLD for months, not to trade.
+
+This is a SCREENING task, not a prediction task. Do not attempt to forecast returns,
+pick winners, time entries, or reason from news — those inputs decay in days and this
+basket is meant to last. Judge only durable characteristics.
+
+Choose for:
+  • LIQUIDITY — large, heavily traded companies whose shares are cheap to buy and sell
+  • DIVERSIFICATION — spread across unrelated industries, so one bad sector cannot sink it
+  • DURABILITY — established businesses, profitable, not obviously distressed
+  • NO CONCENTRATION — never more than 3 names from any single industry
+
+Explicitly do NOT choose for: recent price moves, momentum, news, hype, or your view of
+what will outperform. A boring, well-spread basket is the correct answer.
+
+Candidates: ${list}
+
+Output ONLY JSON:
+{"basket":["SYM", ...${size} symbols],"sectors":{"SYM":"sector"},"reasoning":"one sentence on the spread achieved"}`;
+
+  const r = await llmReason(prompt);
+  if (!r || !Array.isArray(r.basket)) return null;
+  const picked = r.basket
+    .map(x => String(x || '').toUpperCase().trim())
+    .filter(x => /^[A-Z.]{1,6}$/.test(x) && candidates.includes(x));
+  const unique = [...new Set(picked)];
+  if (unique.length < Math.min(5, size)) return null;      // too thin to be a basket
+  return { basket: unique.slice(0, size), sectors: r.sectors || {}, reasoning: r.reasoning || '' };
+}
+
 async function assess(ctx = {}) {
   const names = researchData.watchlist.slice(0, 12).map(w =>
     `${w.symbol}: 13F=${(w.institutional||0).toFixed(2)} (${w.institutionalFilings||0} filings), news=${(w.newsConviction||0).toFixed(2)}${w.catalyst?` [${w.catalyst}]`:''}, RVOL=${(w.rvol||0).toFixed(1)}`
@@ -1238,7 +1286,7 @@ const venus = {
   // list at boot, so a copied value here would report the stale configured name.
   get AI_MODEL() { return AI_MODEL; },
   resolveAiModel,
-  analyze, research, assess, researchRecommendations, getResearch, getResearchFor, institutionalInterest,
+  analyze, research, assess, proposeBasket, researchRecommendations, getResearch, getResearchFor, institutionalInterest,
   learn, calibrateConviction, getCalibration, getState, serialize, loadState: venusLoadState,
   MECHANISMS, TRADEABLE_MECHANISMS, validateRec, isTradeableIdea, recsFromParsed,
   trainOffline, ingestCalibrationData, getTrainStats
@@ -2294,6 +2342,47 @@ const CORE_HOLD_ON       = CORE_HOLD_FRACTION > 0;
 // Only top up when meaningfully below target, so a drifting price does not generate
 // a stream of tiny orders that pay spread for nothing.
 const CORE_REBALANCE_BAND = 0.10;
+// TRIM BAND — how far above its slice a holding may drift before the excess is sold.
+// This is how the core BANKS PROFIT without anyone deciding a stock is "high". A name
+// that runs turns into cash automatically; a name that lags gets bought with it. That
+// is buy-low/sell-high as bookkeeping rather than as a judgement call, which matters
+// because every judgement-based exit measured in this project destroyed value (the
+// trailing stop turned a 2.09:1 payoff into 1.2:1).
+// 0.25 is deliberately wide: trimming costs spread every time, and measured rebalance
+// frequency was worth almost nothing (1.30-1.41 return/risk from weekly to never), so
+// the band is set to act rarely and only on genuine drift.
+const CORE_TRIM_BAND = Math.max(0.05, parseFloat(process.env.CORE_TRIM_BAND || '0.25'));
+
+// Where the core basket's MEMBERSHIP comes from. 'fixed' uses CORE_HOLD_SYMBOLS.
+// 'venus' uses whatever Venus proposes.
+//
+// DEFAULT IS 'fixed', AND THAT IS DELIBERATE. Venus proposing a basket is a hypothesis,
+// not an improvement, until it has beaten the fixed basket on data that arrived after
+// the proposal. Every apparent edge in this project that was adopted before that test
+// turned out to be luck — six times. So Venus proposes on every research cycle and the
+// proposal is LOGGED and SCORED, while the money stays on the control basket until the
+// register says otherwise.
+const CORE_BASKET_SOURCE = (process.env.CORE_BASKET_SOURCE || 'fixed').toLowerCase();
+// One proposal a day is plenty for a decision measured in months, and it keeps the
+// LLM budget for the news calls that actually decay.
+const BASKET_PROPOSAL_INTERVAL_MS = 24 * 3600 * 1000;
+let _lastBasketProposalAt = 0;
+const BASKET_LOG = 'atlas-basket-proposals.json';
+
+// Append-only record of what Venus proposed and when. The timestamp is the whole point:
+// it is what lets the proposal be scored later on data that did not exist when it was
+// made, which is the only kind of evidence this project now accepts.
+function recordBasketProposal(prop) {
+  try {
+    let log = [];
+    try { log = JSON.parse(fs.readFileSync(BASKET_LOG, 'utf8')); } catch {}
+    if (!Array.isArray(log)) log = [];
+    log.push({ at: new Date().toISOString(), basket: prop.basket,
+               sectors: prop.sectors || {}, reasoning: prop.reasoning || '',
+               control: [...CORE_HOLD_SYMBOLS] });
+    fs.writeFileSync(BASKET_LOG, JSON.stringify(log.slice(-400), null, 2));
+  } catch (e) { console.warn(`[VENUS] could not record basket proposal: ${e.message}`); }
+}
 
 // How old a broker snapshot may be before the funding gate stops trusting it. The
 // mirror refreshes every 60s; 5 minutes tolerates a couple of missed refreshes without
@@ -3425,6 +3514,28 @@ async function runIntelCycle() {
       console.log(`[VENUS] 🔬 Research → ${ideas.length} idea(s) (${venus.getResearch().institutions} names with institutional interest) handed to Jupiter`);
     }
 
+    // BASKET PROPOSAL. Runs alongside the trading research, costs one LLM call, and
+    // does NOT move money: the proposal is recorded so the register can score it
+    // against the fixed basket on data that arrives later. Adopting first and checking
+    // afterwards is how six false edges got believed in this project.
+    if (CORE_HOLD_ON && Date.now() - _lastBasketProposalAt > BASKET_PROPOSAL_INTERVAL_MS) {
+      _lastBasketProposalAt = Date.now();
+      const pool = [...new Set([...symbolsForMarket('nasdaq'), ...Object.keys(dynamicSymbols)])];
+      try {
+        const prop = await venus.proposeBasket(pool, CORE_HOLD_SYMBOLS.length);
+        if (prop) {
+          const overlap = prop.basket.filter(x => CORE_HOLD_SYMBOLS.includes(x)).length;
+          console.log(`[VENUS] 🧺 Basket proposal: ${prop.basket.join(',')}`);
+          console.log(`[VENUS]    ${overlap}/${prop.basket.length} overlap with the live basket · ${prop.reasoning}`);
+          recordBasketProposal(prop);
+          if (CORE_BASKET_SOURCE === 'venus') {
+            console.log(`[VENUS]    CORE_BASKET_SOURCE=venus — this proposal is now the live basket`);
+            CORE_HOLD_SYMBOLS.length = 0; CORE_HOLD_SYMBOLS.push(...prop.basket);
+          }
+        }
+      } catch (e) { console.warn(`[VENUS] basket proposal failed: ${e.message}`); }
+    }
+
     // LONG_ONLY: drop short ideas BEFORE they consume a watchlist slot. Terra will
     // refuse every short anyway (the short book measured anti-predictive), so a short
     // idea that reaches the watchlist occupies one of DYNAMIC_MAX_SYMBOLS slots
@@ -4434,6 +4545,77 @@ function mostUnderweightCore() {
     if (short < worst) { worst = short; pick = { sym, px }; }
   }
   return pick;
+}
+
+// Which basket member has run furthest ABOVE its slice, and by how many shares.
+// Returns null when nothing has drifted past the trim band. Never sells a whole
+// position — only the excess above target, so the holding itself is never exited.
+function mostOverweightCore(totalValue) {
+  const h = portfolio.coreHolding || {};
+  const perNameTarget = (totalValue * CORE_HOLD_FRACTION) / Math.max(1, CORE_HOLD_SYMBOLS.length);
+  if (!(perNameTarget > 0)) return null;
+  let pick = null, most = 0;
+  for (const [sym, lot] of Object.entries(h)) {
+    if (!lot || !(lot.qty > 0)) continue;
+    const px = marketData[sym]?.price;
+    if (!Number.isFinite(px) || px <= 0) continue;
+    const upd = marketData[sym].lastUpdate;
+    if (upd && (Date.now() - upd) > MAX_PRICE_AGE_MS) continue;   // never sell on a stale price
+    const val = lot.qty * px;
+    const excess = val - perNameTarget;
+    if (excess <= perNameTarget * CORE_TRIM_BAND) continue;       // inside the band, leave it alone
+    if (excess > most) {
+      let qty = excess / px;
+      qty = FRACTIONAL_ENABLED ? Math.floor(qty * 1e6) / 1e6 : Math.floor(qty);
+      if (qty > 0 && qty < lot.qty && qty * px >= MIN_FRACTIONAL_NOTIONAL) {
+        most = excess; pick = { sym, px, qty, excess };
+      }
+    }
+  }
+  return pick;
+}
+
+// Sell the excess of whichever holding has run furthest past its slice. This is the
+// core's ONLY seller, and it is arithmetic: no view is taken on whether the price is
+// high, only on whether the position has outgrown its share of the basket.
+function trimCoreHolding() {
+  if (!CORE_HOLD_ON) return;
+  if (!getCurrentMarket()) return;
+  const pick = mostOverweightCore(getTotalValue());
+  if (!pick) return;
+
+  const lot = portfolio.coreHolding[pick.sym];
+  const proceeds = pick.qty * pick.px;
+  const costBasis = lot.avgPrice * pick.qty;
+  const gain = proceeds - costBasis;
+
+  lot.qty -= pick.qty;
+  lot.investedCash = Math.max(0, lot.investedCash - costBasis);
+  if (lot.qty <= 1e-9) delete portfolio.coreHolding[pick.sym];
+  portfolio.cash += proceeds;
+
+  console.log(`[CORE] 💰 Trimmed ${pick.qty.toFixed(6)} ${pick.sym} @ $${pick.px.toFixed(2)} ` +
+              `= $${proceeds.toFixed(2)} banked (${gain >= 0 ? '+' : ''}$${gain.toFixed(2)} vs cost) — ` +
+              `it had grown ${((pick.excess / (pick.excess + pick.qty * pick.px)) * 100).toFixed(0)}% past its slice`);
+
+  if (LIVE_TRADING && broker && broker.configured) {
+    // Mirror of the buy-side rollback: if the broker refuses, the ledger must not keep
+    // claiming the sale happened.
+    const rollback = (why) => {
+      portfolio.cash -= proceeds;
+      const l = (portfolio.coreHolding = portfolio.coreHolding || {})[pick.sym];
+      if (l) { l.qty += pick.qty; l.investedCash += costBasis; }
+      else portfolio.coreHolding[pick.sym] = { qty: pick.qty, avgPrice: lot.avgPrice,
+                                               investedCash: costBasis, openedAt: Date.now() };
+      console.warn(`[CORE] trim failed (${why}) — ledger rolled back $${proceeds.toFixed(2)}`);
+      queueSaveState();
+    };
+    broker.submitOrder({ symbol: pick.sym, side: 'sell', qty: pick.qty, type: 'market',
+                         tif: 'day', refPrice: pick.px })
+      .then(r => { if (!r.ok) rollback(r.error); })
+      .catch(e => rollback(e.message));
+  }
+  queueSaveState();
 }
 
 function maintainCoreHolding() {
@@ -7166,6 +7348,8 @@ if (require.main === module) app.listen(PORT, async () => {
   // 5b. Core holding — top up toward target weight. Every 5 min is ample for a
   //     position that is never meant to be traded.
   if (CORE_HOLD_ON) setInterval(maintainCoreHolding, 300000);
+  // Trim runs on its own timer, offset so a buy and a sell never fire in the same tick.
+  if (CORE_HOLD_ON) setInterval(trimCoreHolding, 300000);
 
   // 6. Profit vault — every 5 min
   setInterval(processProfitVault, 300000);
@@ -7236,7 +7420,8 @@ module.exports = {
     institutionalScore, ideaDirection, EFFECTIVE_MIN_DAY_VOL, FEED_VOLUME_FACTOR, DYNAMIC_MIN_DAY_VOL,
     extractJsonArray, extractJsonObject, affordableMaxPrice, MAX_SINGLE_SHARE_FRACTION, fetchBars,
     FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
-    CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore, coreHoldingValue, maintainCoreHolding, coreTopUpQty,
+    CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore,
+    mostOverweightCore, trimCoreHolding, CORE_TRIM_BAND, coreHoldingValue, maintainCoreHolding, coreTopUpQty,
     logDailyTradeDigest, rejectionBucket, noteDailyRejection, tradableValue, wouldExceedHeat,
     noteEntryRejection, entriesPausedByBroker, clearEntryRejectBackoff, entryPauseRemainingMs, pendingEntryNotional,
     onCooldown, clearSymbolCooldown: (s) => { delete symbolCooldowns[s]; }, EXEC_BROKER_AUTH,

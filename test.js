@@ -1644,6 +1644,93 @@ check('a stale-priced core member is never bought', () => {
   ok(pick === null, 'with every price stale it must buy nothing, got ' + JSON.stringify(pick));
 });
 
+check('Venus screens the basket rather than predicting it', () => {
+  // The whole justification for letting Venus choose what to hold is that screening is
+  // a different job from forecasting. If the prompt drifts back toward "pick winners",
+  // the basket becomes whatever was in the news last week — which decays in days, while
+  // a holding is meant to last months.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fn = src.slice(src.indexOf('async function proposeBasket'), src.indexOf('async function assess'));
+  ok(/SCREENING task, not a prediction task/i.test(fn), 'the prompt must frame this as screening');
+  ok(/LIQUIDITY/.test(fn) && /DIVERSIFICATION/.test(fn), 'it must screen on liquidity and spread');
+  ok(/Do not attempt to forecast returns/i.test(fn), 'it must explicitly forbid forecasting');
+  ok(/candidates\.includes\(x\)/.test(fn), 'proposed symbols must be validated against the real universe');
+});
+
+check('a Venus basket proposal does not move money by default', () => {
+  // Adopting first and checking afterwards is how six false edges got believed here.
+  // The proposal is recorded for scoring; the money stays on the control basket.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  ok(/CORE_BASKET_SOURCE \|\| 'fixed'/.test(src), 'the default basket source must be the fixed control');
+  ok(/CORE_BASKET_SOURCE === 'venus'/.test(src), 'switching must require an explicit opt-in');
+  // Match the CALL SITE, not the definition — `function recordBasketProposal(prop)`
+  // satisfies a naive pattern, so deleting the call passed this test until now.
+  ok(/\n\s+recordBasketProposal\(prop\);/.test(src), 'every proposal must be recorded for later scoring');
+  // The timestamp is the entire point — without it the proposal cannot be scored
+  // out-of-sample, and the register degenerates into re-cutting the same history.
+  const recStart = src.indexOf('function recordBasketProposal');
+  const rec = src.slice(recStart, src.indexOf('\n}', recStart));
+  ok(/log\.push\(\{ at: new Date\(\)\.toISOString\(\)/.test(rec),
+     'the pushed record must carry a real timestamp — without it nothing can be scored out-of-sample');
+  ok(/control: \[\.\.\.CORE_HOLD_SYMBOLS\]/.test(rec), 'the control basket must be recorded alongside it');
+});
+
+check('the core banks profit by trimming winners back to target', () => {
+  // This is the core's ONLY seller, and it is arithmetic rather than judgement. Every
+  // judgement-based exit measured in this project destroyed value — the trailing stop
+  // turned a 2.09:1 payoff into 1.2:1 — so nothing here forms a view on price.
+  if (!I.CORE_HOLD_ON) { ok(I.mostOverweightCore(1000) === null, 'disabled core must never trim'); return; }
+  const savedCore = I.portfolio.coreHolding, savedCash = I.portfolio.cash;
+  const saved = {};
+  const setup = () => {
+    I.portfolio.cash = 500; I.portfolio.coreHolding = {};
+    I.CORE_HOLD_SYMBOLS.forEach(s => {
+      saved[s] = I.marketData[s];
+      I.marketData[s] = { price: 100, prevClose: 100, lastUpdate: Date.now() };
+      I.portfolio.coreHolding[s] = { qty: 0.5, avgPrice: 100, investedCash: 50 };
+    });
+  };
+  const [a, b] = I.CORE_HOLD_SYMBOLS;
+
+  setup();
+  ok(I.mostOverweightCore(I.getTotalValue()) === null, 'a balanced basket must not be trimmed');
+
+  setup(); I.marketData[b].price = 105;                       // +5%, inside the band
+  ok(I.mostOverweightCore(I.getTotalValue()) === null, 'small drift must not trigger a spread-paying trade');
+
+  setup(); I.marketData[a].price = 140;                       // +40%, past the band
+  const pick = I.mostOverweightCore(I.getTotalValue());
+  ok(pick && pick.sym === a, `a name well past its slice must be trimmed, got ${pick && pick.sym}`);
+  ok(pick.qty < 0.5, 'it must sell only the EXCESS — a hold is never fully exited');
+
+  // Dust guard: on a tiny account the "excess" can be worth less than the spread costs
+  // to sell. Trimming $0.40 is a pure loss. (Note: the `qty < lot.qty` half of that
+  // same condition is unreachable — excess is always below the position's value — so
+  // it is dead defensive code, not something a test can pin.)
+  setup();
+  I.CORE_HOLD_SYMBOLS.forEach(s => { I.portfolio.coreHolding[s] = { qty: 0.004, avgPrice: 100, investedCash: 0.4 }; });
+  I.portfolio.cash = 1;
+  I.marketData[a].price = 200;                              // doubled, but still pennies
+  const dust = I.mostOverweightCore(I.getTotalValue());
+  ok(dust === null, `an excess worth less than $${I.MIN_FRACTIONAL_NOTIONAL} must not be traded, got ${dust && (dust.qty*dust.px).toFixed(2)}`);
+
+  setup(); I.marketData[a].price = 60;                        // -40%
+  const loser = I.mostOverweightCore(I.getTotalValue());
+  ok(loser === null, 'a FALLING name must never be sold — trimming is not a stop-loss');
+
+  I.portfolio.coreHolding = savedCore; I.portfolio.cash = savedCash;
+  I.CORE_HOLD_SYMBOLS.forEach(s => { if (saved[s]) I.marketData[s] = saved[s]; else delete I.marketData[s]; });
+});
+
+check('a failed trim rolls the ledger back', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fn = src.slice(src.indexOf('function trimCoreHolding'), src.indexOf('function maintainCoreHolding'));
+  ok(/rollback/.test(fn), 'a rejected trim must roll back');
+  ok(/portfolio\.cash -= proceeds/.test(fn), 'rollback must remove the un-received proceeds');
+  ok(/l\.qty \+= pick\.qty/.test(fn), 'rollback must restore the shares');
+  ok(/never sell on a stale price/.test(src), 'a stale-priced holding must not be trimmed');
+});
+
 check('the core builds a basket, not one big position', () => {
   // Sizing against the WHOLE-basket gap put the entire allocation into whichever name
   // came first — $500 of a $1000 account into a single stock, which is exactly the
@@ -1696,10 +1783,18 @@ check('the core holding is invisible to every trading exit path', () => {
   // execution) — the rebalance band lives in the former after the v11.28 split.
   const fn = src.slice(src.indexOf('function coreTopUpQty'),
                        src.indexOf('function processProfitVault'));
-  ok(!/closeLong|submitOrder\([^)]*'sell'/.test(fn), 'the core path must never sell');
+  // The core now HAS a seller — the trim — so "never sells" is no longer the invariant.
+  // What must still hold is that no TRADING exit can reach it: stops, trailing exits,
+  // take-profit rungs and kill switches all iterate longPositions, which the core is
+  // deliberately not part of.
+  ok(!/closeLong|closeShort/.test(fn), 'no trading exit function may touch the core');
   ok(/gap <= perNameTarget \* CORE_REBALANCE_BAND/.test(fn),
      'it must only act when a NAME is meaningfully under its own slice of the target');
-  ok(/side: 'buy'/.test(fn), 'the only broker order on this path is a buy');
+  ok(/side: 'buy'/.test(fn), 'the top-up path buys');
+  // And the only sell that exists is the arithmetic trim, never a signal-driven exit.
+  const trim = src.slice(src.indexOf('function trimCoreHolding'), src.indexOf('function maintainCoreHolding'));
+  ok(/excess <= perNameTarget \* CORE_TRIM_BAND/.test(src),
+     'the trim must be gated on drift past the band, not on a view about price');
 });
 
 check('the core holding does not inflate trading capital', () => {
