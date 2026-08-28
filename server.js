@@ -4562,12 +4562,21 @@ function mostOverweightCore(totalValue) {
     const upd = marketData[sym].lastUpdate;
     if (upd && (Date.now() - upd) > MAX_PRICE_AGE_MS) continue;   // never sell on a stale price
     const val = lot.qty * px;
-    const excess = val - perNameTarget;
-    if (excess <= perNameTarget * CORE_TRIM_BAND) continue;       // inside the band, leave it alone
+    // A holding that is no longer part of the basket has a target of ZERO, so it is
+    // trimmed all the way out rather than parked at target weight forever. Without
+    // this, switching the basket (CORE_BASKET_SOURCE=venus, or an edited symbol list)
+    // would leave every old name permanently diluting the new one — they are never
+    // topped up again, so nothing else would ever remove them.
+    const inBasket = CORE_HOLD_SYMBOLS.includes(sym);
+    const nameTarget = inBasket ? perNameTarget : 0;
+    const excess = val - nameTarget;
+    if (excess <= nameTarget * CORE_TRIM_BAND) continue;          // inside the band, leave it alone
+    if (!inBasket && val < MIN_FRACTIONAL_NOTIONAL) continue;     // dust, not worth the spread
     if (excess > most) {
       let qty = excess / px;
       qty = FRACTIONAL_ENABLED ? Math.floor(qty * 1e6) / 1e6 : Math.floor(qty);
-      if (qty > 0 && qty < lot.qty && qty * px >= MIN_FRACTIONAL_NOTIONAL) {
+      if (qty > lot.qty) qty = lot.qty;                           // off-basket: exit completely
+      if (qty > 0 && qty * px >= MIN_FRACTIONAL_NOTIONAL) {
         most = excess; pick = { sym, px, qty, excess };
       }
     }

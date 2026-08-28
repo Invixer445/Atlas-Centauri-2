@@ -1718,6 +1718,17 @@ check('the core banks profit by trimming winners back to target', () => {
   const loser = I.mostOverweightCore(I.getTotalValue());
   ok(loser === null, 'a FALLING name must never be sold — trimming is not a stop-loss');
 
+  // A holding no longer in the basket must be exited COMPLETELY, not parked at target
+  // weight. Nothing else can remove it — only basket members are ever topped up — so
+  // switching the basket would otherwise leave every old name diluting the new one.
+  setup();
+  I.portfolio.coreHolding.__ORPHAN = { qty: 5, avgPrice: 10, investedCash: 50 };
+  I.marketData.__ORPHAN = { price: 30, prevClose: 30, lastUpdate: Date.now() };
+  const orphan = I.mostOverweightCore(I.getTotalValue());
+  ok(orphan && orphan.sym === '__ORPHAN', 'an off-basket holding must be trimmed first');
+  ok(orphan.qty >= 5, `an off-basket holding must be exited fully, got ${orphan.qty} of 5`);
+  delete I.portfolio.coreHolding.__ORPHAN; delete I.marketData.__ORPHAN;
+
   I.portfolio.coreHolding = savedCore; I.portfolio.cash = savedCash;
   I.CORE_HOLD_SYMBOLS.forEach(s => { if (saved[s]) I.marketData[s] = saved[s]; else delete I.marketData[s]; });
 });
@@ -1793,7 +1804,7 @@ check('the core holding is invisible to every trading exit path', () => {
   ok(/side: 'buy'/.test(fn), 'the top-up path buys');
   // And the only sell that exists is the arithmetic trim, never a signal-driven exit.
   const trim = src.slice(src.indexOf('function trimCoreHolding'), src.indexOf('function maintainCoreHolding'));
-  ok(/excess <= perNameTarget \* CORE_TRIM_BAND/.test(src),
+  ok(/excess <= nameTarget \* CORE_TRIM_BAND/.test(src),
      'the trim must be gated on drift past the band, not on a view about price');
 });
 
