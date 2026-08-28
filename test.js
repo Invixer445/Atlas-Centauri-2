@@ -1644,6 +1644,25 @@ check('a stale-priced core member is never bought', () => {
   ok(pick === null, 'with every price stale it must buy nothing, got ' + JSON.stringify(pick));
 });
 
+check('the core builds a basket, not one big position', () => {
+  // Sizing against the WHOLE-basket gap put the entire allocation into whichever name
+  // came first — $500 of a $1000 account into a single stock, which is exactly the
+  // concentration a basket exists to prevent. Each buy must be one name-sized slice.
+  if (!I.CORE_HOLD_ON) {
+    ok(I.coreTopUpQty(100, 1000, 0, 1000) === 0, 'disabled core must never buy');
+    return;
+  }
+  const n = I.CORE_HOLD_SYMBOLS.length;
+  const perName = (1000 * I.CORE_HOLD_FRACTION) / n;
+  const first = I.coreTopUpQty(100, 1000, 0, 1000) * 100;      // $ value of the first buy
+  ok(Math.abs(first - perName) < 0.5,
+     `first buy should be one name's slice ($${perName.toFixed(2)}), got $${first.toFixed(2)}`);
+  ok(first < 1000 * I.CORE_HOLD_FRACTION * 0.9,
+     'a single buy must never take the whole basket allocation');
+  // A name already at its slice must not be topped up again.
+  ok(I.coreTopUpQty(100, 1000, perName, 1000) === 0, 'a filled name must not be bought again');
+});
+
 check('core top-up sizing buys the gap, never churns, never sells', () => {
   // coreTopUpQty is pure, so the sizing decision is testable without a live market —
   // the live path is gated on market hours and would otherwise go unverified.

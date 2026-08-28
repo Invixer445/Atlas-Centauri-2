@@ -4389,13 +4389,25 @@ function coreHoldingValue() {
 // How much to add IN TOTAL to reach the target weight. Pure, so the sizing decision is
 // testable without a live market. TOP-UP ONLY: never returns a sell, because the
 // measured advantage of holding comes precisely from not reacting.
-function coreTopUpQty(price, totalValue, currentCoreValue, cash) {
+// Shares to add to ONE basket member, sized against that member's share of the target.
+//
+// PER-NAME, NOT PER-BASKET. Sizing against the whole-basket gap put the entire
+// allocation into whichever name was picked first — on a $1000 account with a 50%
+// core that is $500 into a single stock, which is precisely the concentration the
+// basket exists to avoid. Measured: one name returns 0.59 per unit of risk, five or
+// more returns ~1.35 for the same return. Buying one name-sized slice per cycle walks
+// the basket out evenly over successive passes and never overshoots the total.
+//
+// Pure, so the sizing decision is testable without a live market. TOP-UP ONLY: never
+// returns a sell, because the measured advantage of holding comes from not reacting.
+function coreTopUpQty(price, totalValue, currentNameValue, cash, nameCount = CORE_HOLD_SYMBOLS.length) {
   if (!CORE_HOLD_ON) return 0;
   if (!Number.isFinite(price) || price <= 0) return 0;
-  const target = totalValue * CORE_HOLD_FRACTION;
-  const gap    = target - currentCoreValue;
+  const n = Math.max(1, nameCount);
+  const perNameTarget = (totalValue * CORE_HOLD_FRACTION) / n;
+  const gap = perNameTarget - currentNameValue;
   // Band keeps ordinary drift from generating a stream of tiny spread-paying buys.
-  if (gap <= target * CORE_REBALANCE_BAND) return 0;
+  if (gap <= perNameTarget * CORE_REBALANCE_BAND) return 0;
   const spend = Math.min(gap, Math.max(0, cash - 1));      // leave $1 so cash never hits 0
   if (spend < Math.max(MIN_FRACTIONAL_NOTIONAL, 1)) return 0;
   let qty = spend / price;
@@ -4431,7 +4443,9 @@ function maintainCoreHolding() {
   if (!pick) return;                                     // no fresh price on any member
 
   const totalValue = getTotalValue();
-  const qty = coreTopUpQty(pick.px, totalValue, coreHoldingValue(), portfolio.cash);
+  const lotNow = (portfolio.coreHolding || {})[pick.sym];
+  const nameValue = lotNow && lotNow.qty > 0 ? lotNow.qty * pick.px : 0;
+  const qty = coreTopUpQty(pick.px, totalValue, nameValue, portfolio.cash);
   if (!(qty > 0)) return;
 
   const cost = qty * pick.px;
