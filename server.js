@@ -4547,6 +4547,14 @@ function mostUnderweightCore() {
   return pick;
 }
 
+// A HUMAN halt stops the core; an automatic one does not. capitalSystem.emergencyStop
+// is set both by the operator and by the automatic drawdown backstop, so the manual
+// flag is what distinguishes them.
+function coreHaltedByOperator() {
+  return !!(capitalSystem.emergencyStopManual || capitalSystem.safeModeManual === 'halt' || CORE_PAUSED);
+}
+let CORE_PAUSED = false;   // toggled by the admin API
+
 // Which basket member has run furthest ABOVE its slice, and by how many shares.
 // Returns null when nothing has drifted past the trim band. Never sells a whole
 // position — only the excess above target, so the holding itself is never exited.
@@ -4590,6 +4598,7 @@ function mostOverweightCore(totalValue) {
 function trimCoreHolding() {
   if (!CORE_HOLD_ON) return;
   if (!getCurrentMarket()) return;
+  if (coreHaltedByOperator()) return;
   const pick = mostOverweightCore(getTotalValue());
   if (!pick) return;
 
@@ -4630,6 +4639,11 @@ function trimCoreHolding() {
 function maintainCoreHolding() {
   if (!CORE_HOLD_ON) return;
   if (!getCurrentMarket()) return;                       // only during market hours
+  // An operator pressing stop means STOP — including the core. Note the asymmetry:
+  // the AUTOMATIC drawdown halt deliberately does not reach here, because pausing a
+  // long-term holding during a dip is precisely the reaction the core exists to avoid.
+  // A human deciding to halt is a different thing from a threshold tripping.
+  if (coreHaltedByOperator()) return;
   const pick = mostUnderweightCore();
   if (!pick) return;                                     // no fresh price on any member
 
@@ -5090,6 +5104,16 @@ async function syncFromBroker() {
         // untracked by ATLAS and therefore with no stop-loss attached. Adopt anything
         // that is a real position; only a true zero is skipped.
         if ((book[bp.symbol] || []).length > 0 || qty <= 0) continue;   // internal already tracks it
+        // THE CORE IS ALREADY TRACKED, JUST NOT IN THIS BOOK. Core holdings sit at the
+        // broker like any other position, so without this the boot sync adopted all ten
+        // of them into longPositions on every restart — attaching stop-losses to a
+        // long-term hold, letting the trading engine sell it, and counting the same
+        // shares TWICE in equity (measured: $50 of stock valued at $100). Everything
+        // built to keep the core invisible to trading exits was undone at boot.
+        if (CORE_HOLD_ON && portfolio.coreHolding && portfolio.coreHolding[bp.symbol]) {
+          console.log(`[SYNC] ${bp.symbol} is a core holding — left out of the trading book`);
+          continue;
+        }
         const frac = Math.min(0.15, Math.max(0.02, 2.2 * (atrPct(bp.symbol) || 0.02)));
         const stopPrice = dir === 'LONG' ? bp.avg_entry_price * (1 - frac) : bp.avg_entry_price * (1 + frac);
         const tgtPrice  = dir === 'LONG' ? bp.avg_entry_price * (1 + frac * 2.1) : bp.avg_entry_price * (1 - frac * 2.1);
@@ -5114,6 +5138,8 @@ async function syncFromBroker() {
       // nothing" — that would delete a real book on a network blip.
       if (pos.ok && Array.isArray(pos.positions)) {
         const brokerSyms = new Set(pos.positions.map(x => x.symbol));
+        // Core symbols are held in their own book; they are never phantoms here.
+        if (CORE_HOLD_ON) Object.keys(portfolio.coreHolding || {}).forEach(s2 => brokerSyms.add(s2));
         let dropped = 0;
         for (const book of [portfolio.longPositions, portfolio.shortPositions]) {
           for (const sym of Object.keys(book)) {
@@ -7430,7 +7456,8 @@ module.exports = {
     extractJsonArray, extractJsonObject, affordableMaxPrice, MAX_SINGLE_SHARE_FRACTION, fetchBars,
     FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
     CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore,
-    mostOverweightCore, trimCoreHolding, CORE_TRIM_BAND, coreHoldingValue, maintainCoreHolding, coreTopUpQty,
+    mostOverweightCore, trimCoreHolding, CORE_TRIM_BAND, coreHaltedByOperator,
+    setCorePaused: (v) => { CORE_PAUSED = !!v; }, coreHoldingValue, maintainCoreHolding, coreTopUpQty,
     logDailyTradeDigest, rejectionBucket, noteDailyRejection, tradableValue, wouldExceedHeat,
     noteEntryRejection, entriesPausedByBroker, clearEntryRejectBackoff, entryPauseRemainingMs, pendingEntryNotional,
     onCooldown, clearSymbolCooldown: (s) => { delete symbolCooldowns[s]; }, EXEC_BROKER_AUTH,

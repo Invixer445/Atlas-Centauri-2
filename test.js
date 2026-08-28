@@ -1780,6 +1780,42 @@ check('core top-up sizing buys the gap, never churns, never sells', () => {
   ok(q(1000, per * 1.5, 1000) === 0, 'a name ABOVE its slice must return 0 — a hold never sells');
 });
 
+check('the boot sync does not adopt core holdings as trades', () => {
+  // Core positions sit at the broker like any other. The adoption loop only checked
+  // longPositions, so every restart pulled all ten into the TRADING book — attaching
+  // stop-losses to a long-term hold, exposing it to the exit engine, and counting the
+  // same shares twice in equity (measured: $50 of stock valued at $100). Every other
+  // guard keeping the core separate was undone at boot.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/portfolio\.coreHolding\[bp\.symbol\]\) \{/.test(src),
+     'the adoption loop must skip symbols already held in the core book');
+  ok(/is a core holding — left out of the trading book/.test(src),
+     'and say so, because a silent skip is indistinguishable from a missed position');
+});
+
+check('an operator halt stops the core; an automatic one does not', () => {
+  // Deliberate asymmetry. A threshold tripping during a dip must NOT pause a long-term
+  // holding — that reaction is exactly what destroys buy-and-hold returns. A human
+  // pressing stop is a different instruction and must reach everything.
+  ok(typeof I.coreHaltedByOperator === 'function', 'the core must consult an operator halt');
+  const before = I.coreHaltedByOperator();
+  I.setCorePaused(true);
+  ok(I.coreHaltedByOperator() === true, 'an explicit pause must halt the core');
+  I.setCorePaused(false);
+  ok(I.coreHaltedByOperator() === before, 'and releasing it must restore the prior state');
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fn = src.slice(src.indexOf('function coreHaltedByOperator'), src.indexOf('function mostOverweightCore'));
+  ok(!/currentDrawdown|safeMode\b/.test(fn),
+     'the automatic drawdown halt must NOT reach the core');
+  // And assert the CALL SITES, not just that the helper exists — deleting both calls
+  // passed this test until now, which is the third time that gap has appeared here.
+  const buy  = src.slice(src.indexOf('function maintainCoreHolding'), src.indexOf('function maintainCoreHolding') + 700);
+  const trim = src.slice(src.indexOf('function trimCoreHolding'), src.indexOf('function trimCoreHolding') + 700);
+  ok(/if \(coreHaltedByOperator\(\)\) return;/.test(buy), 'core BUYING must honour the operator halt');
+  ok(/if \(coreHaltedByOperator\(\)\) return;/.test(trim), 'core TRIMMING must honour the operator halt');
+});
+
 check('the core holding is invisible to every trading exit path', () => {
   // The whole point of a hold is that stops, trails, take-profit rungs, kill switches
   // and loss halts cannot touch it. That is guaranteed structurally by keeping it out
