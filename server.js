@@ -1,5 +1,5 @@
 // ════════════════════════════════════════════════════════════════════════════
-//  ATLAS CENTAURI — Unified Engine  v11.20   (US Markets Only: NASDAQ + NYSE)
+//  ATLAS LUMEN — Unified Engine  v11.20   (US Markets Only: NASDAQ + NYSE)
 //
 //  ONE engine, three named subsystems:
 //
@@ -15,7 +15,7 @@
 //                  trained on every closed trade learns which setups actually win,
 //                  and drives ¼-Kelly sizing and direction. Decides HOW MUCH and
 //                  which DIRECTION, and LEARNS from every trade it sends to Terra.
-//                  (Both AIs live in the "CENTAURI BRAIN" section below.)
+//                  (Both AIs live in the "LUMEN BRAIN" section below.)
 //
 //    🌍 TERRA   — the EXECUTION ENGINE. Everything dedicated to carrying out what
 //                  Venus and Jupiter decide: order routing to the broker, fills,
@@ -157,12 +157,12 @@ if (EXEC_BROKER_AUTH && broker.isLive) {
 }
 
 // ─── BRAIN CONFIG — knobs for Venus (research AI) + Jupiter (trading AI) ──────
-// The brain itself is defined above (CENTAURI BRAIN section). These are Terra's
+// The brain itself is defined above (LUMEN BRAIN section). These are Terra's
 // runtime knobs for wiring it in. Without an API key Venus is disabled and
 // ATLAS runs pure-technical (Jupiter's win-model still learns and sizes; there are
 // simply no news recommendations to act on).
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║  CENTAURI BRAIN — the two AIs that decide WHAT and HOW to trade            ║
+// ║  LUMEN BRAIN — the two AIs that decide WHAT and HOW to trade            ║
 // ║    ♀ VENUS   · research AI (scans web + SEC 13F holdings + news → ideas)   ║
 // ║    🔭 JUPITER · trading AI  (sizes, decides & learns: win-model + Kelly)   ║
 // ║  Merged inline (was intelligence.js) so brain + execution are ONE engine.  ║
@@ -974,7 +974,7 @@ async function analyze(articles) {
 //  degrades gracefully: if one is unreachable, Venus uses the others and never crashes.
 // ════════════════════════════════════════════════════════════════════════════
 
-const SEC_UA = process.env.SEC_USER_AGENT || 'ATLAS-Centauri-research';
+const SEC_UA = process.env.SEC_USER_AGENT || 'ATLAS-Lumen-research';
 // SEC 13F lists holdings by company name/CUSIP, not ticker, so map the core universe.
 // Unknown (dynamic) symbols fall back to querying the ticker itself.
 // v11.19: the original map only covered mega-caps that AREN'T in WATCHLISTS below —
@@ -1841,7 +1841,7 @@ Output ONLY JSON:
   };
 }
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║  END CENTAURI BRAIN.  Everything below is 🌍 TERRA — the EXECUTION ENGINE   ║
+// ║  END LUMEN BRAIN.  Everything below is 🌍 TERRA — the EXECUTION ENGINE   ║
 // ║  and its supporting infrastructure (market data, indicators, risk gates,   ║
 // ║  order routing, persistence, dashboard server). Terra does only what       ║
 // ║  Venus and Jupiter tell it to: it sizes nothing and decides no direction —  ║
@@ -4867,7 +4867,7 @@ function recordLiveOrder(entry) {
   if (liveOrderLog.length > 200) liveOrderLog.shift();
 }
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║  v11.18 — BROKER-AUTHORITATIVE EXECUTION (Centauri Integrated)              ║
+// ║  v11.18 — BROKER-AUTHORITATIVE EXECUTION (Lumen Integrated)              ║
 // ║  Pending-order lifecycle: Terra approves → order submits → broker fill      ║
 // ║  books the position at the REAL price. Alpaca (paper) is the source of      ║
 // ║  truth; the internal ledger mirrors it by construction.                     ║
@@ -5779,7 +5779,7 @@ function finalizeClose(ticker, direction, totalPnL, exitPrice, market, stopLoss,
     recordTradeAnalytics(closedTrade, setupType, regime, SYMBOL_SECTOR[ticker] || (dynamicSymbols[ticker] ? 'dynamic' : undefined));
   }
 
-  // CENTAURI: attribute outcome to the AI catalyst that influenced the entry
+  // LUMEN: attribute outcome to the AI catalyst that influenced the entry
   recordAiOutcome(ticker, direction, totalPnL);
 
   logTrade(`CLOSE ${direction} ${ticker} @ $${exitPrice.toFixed(2)} PnL $${totalPnL.toFixed(2)}`);
@@ -5961,10 +5961,10 @@ function buildStateObject() {
     // BUG 3 FIX: persist gapData so gap blocks survive a restart.
     // (candleData itself is too large to persist and is rebuilt by fetchCandles.)
     gapData,
-    // CENTAURI: persist both engines' state. Venus owns its calibration
+    // LUMEN: persist both engines' state. Venus owns its calibration
     // (long-term per-catalyst memory); Jupiter owns its live signals + edge log.
     // Terra persists the dynamic-watchlist roster.
-    centauri: {
+    lumen: {
       venus: venus.serialize(),
       jupiter:   jupiter.serialize(),
       dynamicSymbols
@@ -6137,15 +6137,15 @@ function loadState() {
         if (g && g.blockUntil > now) gapData[sym] = g;
       });
     }
-    // CENTAURI restore: Venus's research calibration is permanent; Jupiter's
+    // LUMEN restore: Venus's research calibration is permanent; Jupiter's
     // signals are restored only if still fresh (a restart hours later shouldn't
     // resurrect a dead news edge). Supports the new two-engine format, the legacy
     // single-layer format, AND state files written before Venus/Jupiter swapped
     // roles — we route each saved block by its CONTENT, not its key name, so the
     // research-calibration block always reaches Venus and the win-model block
     // always reaches Jupiter regardless of how it was labelled on disk.
-    if (state.centauri && typeof state.centauri === 'object') {
-      const c = state.centauri, now = Date.now();
+    if (state.lumen && typeof state.lumen === 'object') {
+      const c = state.lumen, now = Date.now();
 
       // New format — route by content (back-compatible across the role swap)
       const blocks = [c.venus, c.jupiter].filter(b => b && typeof b === 'object');
@@ -6175,7 +6175,7 @@ function loadState() {
       const nSig = vs.activeSignals.length;
       const nCal = Object.keys(js.calibration).length;
       if (nDyn || nSig || nCal) {
-        console.log(`[CENTAURI] Restored — Jupiter: ${nSig} live signals, ${nDyn} dynamic symbols | Venus: ${nCal} catalyst calibrations`);
+        console.log(`[LUMEN] Restored — Jupiter: ${nSig} live signals, ${nDyn} dynamic symbols | Venus: ${nCal} catalyst calibrations`);
       }
     }
     // Date-anchor daily counters
@@ -6713,7 +6713,7 @@ function evaluateAndTrade() {
     // Overnight gap block (>3% gap = skip for 30 min to let price stabilise)
     if (isGapBlocked(symbol)) continue;
 
-    // CENTAURI: dynamic symbols must build real data before any entry. The
+    // LUMEN: dynamic symbols must build real data before any entry. The
     // strategy gate's cold-start fallback is permissive by design for the core
     // list (those symbols accumulate history within minutes of boot), but a
     // just-added news symbol could otherwise trade on a 1-tick history.
@@ -6772,7 +6772,7 @@ function evaluateAndTrade() {
     longScore = (momentumFactor * 0.25 + trendFactor * 0.20 + emaFactor * 0.15 + 
                  priceFactor * 0.10 + rsiFactor * 0.10 + volumeFactor * 0.10 + sentimentFactor * 0.10);
 
-    // CENTAURI: bounded AI adjustment (± AI_SIGNAL_WEIGHT max, conviction- and
+    // LUMEN: bounded AI adjustment (± AI_SIGNAL_WEIGHT max, conviction- and
     // time-decay-scaled). The AI nudges the score; it cannot manufacture an
     // entry by itself or bypass the strategy gate below.
     const aiAdj = aiScoreAdjustment(symbol);
@@ -6808,7 +6808,7 @@ function evaluateAndTrade() {
     
     shortScore = (momentumFactorShort * 0.25 + trendFactorShort * 0.20 + emaFactorShort * 0.15 + 
                   priceFactorShort * 0.10 + rsiFactorShort * 0.10 + volumeFactorShort * 0.10 + sentimentFactorShort * 0.10);
-    shortScore = Math.max(0, Math.min(1, shortScore + aiAdj.short));   // CENTAURI adjustment
+    shortScore = Math.max(0, Math.min(1, shortScore + aiAdj.short));   // LUMEN adjustment
 
     const shortReady = shortScore >= minThreshold && regime !== 'bull' && tf15mBias !== 'bullish' && gate.shortGate;
 
@@ -7013,7 +7013,7 @@ app.get('/api/portfolio', (req, res) => {
         blockedUntil: g.blockUntil > Date.now()
           ? new Date(g.blockUntil).toISOString() : null
       })),
-    // CENTAURI: both engines broadcast to Luna.
+    // LUMEN: both engines broadcast to Luna.
     //   intel  = backward-compatible combined view (existing dashboard cards)
     //   venus / jupiter = the two-engine breakdown
     //   terra  = the execution gate (recent rejections + what it enforces)
@@ -7024,7 +7024,7 @@ app.get('/api/portfolio', (req, res) => {
   });
 });
 
-// CENTAURI: combined summary (Venus calibration + Jupiter signals) for Luna's
+// LUMEN: combined summary (Venus calibration + Jupiter signals) for Luna's
 // existing Intel card. Kept backward-compatible so the dashboard needs no change.
 function buildIntelSummary() {
   const v = jupiter.getState();
@@ -7046,7 +7046,7 @@ function buildIntelSummary() {
   };
 }
 
-// CENTAURI: combined view + per-engine endpoints
+// LUMEN: combined view + per-engine endpoints
 app.get('/api/intel', (req, res) => res.json({ ...buildIntelSummary(), recentOutcomes: jupiter.getState().recentOutcomes }));
 app.get('/api/venus', (req, res) => res.json({ ...venus.getState(), research: venus.getResearch(), watchlist: venus.getResearch().watchlist }));   // research engine
 app.get('/api/jupiter',   (req, res) => res.json({ ...jupiter.getState(), dynamicWatchlist: Object.keys(dynamicSymbols) }));  // trading engine
@@ -7093,7 +7093,7 @@ app.get('/api/health', (req, res) => res.json({
   dynamic_watchlist: DYNAMIC_WATCHLIST_ON,
   dynamic_symbols: Object.keys(dynamicSymbols).length,
   live_ai_signals: jupiter.activeSymbols().length,
-  version: 'v11.20-centauri'
+  version: 'v11.20-lumen'
 }));
 
 // Toggle A+ mode via POST /api/aplus?enable=true|false
@@ -7260,7 +7260,7 @@ if (require.main === module) app.listen(PORT, async () => {
   // guess at when diagnosing why nothing traded.
   let VERSION = 'unknown';
   try { VERSION = require('./package.json').version; } catch (_) {}
-  console.log(`\n🌌  ATLAS CENTAURI — Unified Engine v${VERSION} on port ${PORT}`);
+  console.log(`\n🌌  ATLAS LUMEN — Unified Engine v${VERSION} on port ${PORT}`);
   console.log(`   ♀ Venus (research AI: web + 13F + news) + 🔭 Jupiter (trading AI: sizes/decides/learns) + 🌍 Terra (execution gate)`);
   console.log(`[STARTUP] Alpaca data feed (${ALPACA_DATA_FEED}) — US markets (NASDAQ/NYSE) only`);
   // Print the settings that actually decide whether a trade happens. Every one of
@@ -7410,7 +7410,7 @@ if (require.main === module) app.listen(PORT, async () => {
     else console.log('[PRICES] Skipping refresh — market closed');
   }, 21600000);
 
-  // 12. CENTAURI cycle — Terra fetches news → Venus analyzes → Jupiter consumes
+  // 12. LUMEN cycle — Terra fetches news → Venus analyzes → Jupiter consumes
   //     (no-op without API key; skips outside 8:00–16:00 ET; no LLM call when no
   //      fresh news). This is the heartbeat of the Venus→Jupiter pipeline.
   if (AI_ENABLED) {
@@ -7425,11 +7425,11 @@ if (require.main === module) app.listen(PORT, async () => {
     console.log(`[DIAG] Market: ${m || ('CLOSED — ' + (marketClosedReason() || 'unknown'))} | Regime: ${detectMarketRegime()} | Breadth: ${(sentimentData.breadthScore*100).toFixed(0)}% | SPY: ${(sentimentData.spyMomentum*100).toFixed(2)}% | Prices: ${Object.keys(marketData).length} | Candles: ${Object.keys(candleData).length} | Jupiter signals: ${jupiter.activeSymbols().length}`);
   }, 40000);
 
-  console.log("[STARTUP] Centauri online — unified engine v11.20 (Venus + Jupiter + Terra) ready\n");
+  console.log("[STARTUP] Lumen online — unified engine v11.20 (Venus + Jupiter + Terra) ready\n");
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-//  MODULE EXPORTS — expose the Centauri brain when this engine is imported
+//  MODULE EXPORTS — expose the Lumen brain when this engine is imported
 //  (e.g. by train.js or tests) so the AIs can be trained/inspected WITHOUT
 //  booting the execution engine. Running `node server.js` directly boots normally.
 // ════════════════════════════════════════════════════════════════════════════

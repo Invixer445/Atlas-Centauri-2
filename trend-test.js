@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ════════════════════════════════════════════════════════════════════════════
-//  ATLAS CENTAURI — trend-test.js  ·  the last untested idea with real evidence
+//  ATLAS LUMEN — trend-test.js  ·  the last untested idea with real evidence
 //
 //  Everything this project has tried so far asked the bot to PICK: which stock,
 //  which direction, which minute. Measured across ~22 variants, seven windows and

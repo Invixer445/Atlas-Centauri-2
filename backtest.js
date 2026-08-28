@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ════════════════════════════════════════════════════════════════════════════
-//  ATLAS CENTAURI — backtest.js  ·  does this strategy actually make money?
+//  ATLAS LUMEN — backtest.js  ·  does this strategy actually make money?
 //
 //  Replays historical 1-minute bars through the REAL decision functions exported
 //  by server.js — evaluateStrategyGate, buildTradePlan, terraValidateTrade, the

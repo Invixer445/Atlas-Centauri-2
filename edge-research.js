@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ════════════════════════════════════════════════════════════════════════════
-//  ATLAS CENTAURI — edge-research.js  ·  find a trading edge the honest way
+//  ATLAS LUMEN — edge-research.js  ·  find a trading edge the honest way
 //
 //  WHY THIS EXISTS
 //  Every edge test in this project so far re-cut the SAME history. That is how six

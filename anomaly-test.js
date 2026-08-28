@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ════════════════════════════════════════════════════════════════════════════
-//  ATLAS CENTAURI — anomaly-test.js  ·  the two documented effects never tested here
+//  ATLAS LUMEN — anomaly-test.js  ·  the two documented effects never tested here
 //
 //  Everything tested so far asked the bot to pick a direction from recent price
 //  action. That measured +0.005R on symbols it was not built around — zero. These

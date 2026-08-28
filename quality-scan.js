@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ════════════════════════════════════════════════════════════════════════════
-//  ATLAS CENTAURI — quality-scan.js  ·  can the bot tell a good setup from a bad one?
+//  ATLAS LUMEN — quality-scan.js  ·  can the bot tell a good setup from a bad one?
 //
 //  THE QUESTION THIS ANSWERS
 //  "Bet bigger on the safer trades" only works if the bot can actually IDENTIFY

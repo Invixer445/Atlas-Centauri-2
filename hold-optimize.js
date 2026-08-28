@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ════════════════════════════════════════════════════════════════════════════
-//  ATLAS CENTAURI — hold-optimize.js  ·  what should the core actually hold?
+//  ATLAS LUMEN — hold-optimize.js  ·  what should the core actually hold?
 //
 //  The overnight decomposition established WHERE the return lives (holding, not
 //  trading). This asks the next question honestly: given that you are going to hold

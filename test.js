@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ════════════════════════════════════════════════════════════════════════════
-//  ATLAS CENTAURI — regression test suite   (run: npm test)
+//  ATLAS LUMEN — regression test suite   (run: npm test)
 //
 //  Zero dependencies. Locks in the invariants that were previously only ever
 //  verified by hand — including the two real bugs found in v11.19:
@@ -74,7 +74,7 @@ function seedSymbol(sym, price = 20) {
   };
 }
 
-console.log('🧪  ATLAS CENTAURI — regression suite');
+console.log('🧪  ATLAS LUMEN — regression suite');
 
 // ════════════════════════════════════════════════════════════════════════════
 group('RISK RAILS — must never be silently loosened');

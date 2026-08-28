@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ════════════════════════════════════════════════════════════════════════════
-//  ATLAS CENTAURI — train.js · Offline specialization trainer  v11.4
+//  ATLAS LUMEN — train.js · Offline specialization trainer  v11.4
 //
 //  Makes Jupiter and Venus HIGHLY SPECIALIZED by re-training their learning models
 //  over the experience they've accumulated. The live bot learns online (one trade at
@@ -69,7 +69,7 @@ const line = (s = '') => console.log(s);
 const hr = () => line('─'.repeat(70));
 
 line('');
-line('🎓  ATLAS CENTAURI — Offline Specialization Trainer');
+line('🎓  ATLAS LUMEN — Offline Specialization Trainer');
 hr();
 
 // ── load state ───────────────────────────────────────────────────────────────
@@ -85,8 +85,8 @@ if (fs.existsSync(STATE_PATH)) {
 // Route each saved block by CONTENT, not key name, so the win-model always reaches the
 // trading engine and the calibration always reaches the research engine — robust across
 // the Venus/Jupiter role swap and a couple of legacy shapes.
-const centauri = state.centauri || {};
-const _blocks = [centauri.jupiter, centauri.venus].filter(b => b && typeof b === 'object');
+const lumen = state.lumen || {};
+const _blocks = [lumen.jupiter, lumen.venus].filter(b => b && typeof b === 'object');
 const winModelState = _blocks.find(b => b.winModel || b.trainLog || b.signals)
                     || (state.aiSignals ? { signals: state.aiSignals } : null);
 const calibState    = _blocks.find(b => b.calibGlobal || b.calibByCat || b.calibLog || b.calibration)
@@ -154,9 +154,9 @@ if (DRY) {
 } else if (!jupRes.ok && !venRes.ok) {
   line('Nothing trained — state file left unchanged.');
 } else {
-  state.centauri = state.centauri || {};
-  state.centauri.jupiter = tradingEngine.serialize();    // win-model / sizing / decision
-  state.centauri.venus   = researchEngine.serialize();   // research confidence calibration
+  state.lumen = state.lumen || {};
+  state.lumen.jupiter = tradingEngine.serialize();    // win-model / sizing / decision
+  state.lumen.venus   = researchEngine.serialize();   // research confidence calibration
   try {
     // Atomic write (tmp + rename) — a crash mid-write can never corrupt the live state file.
     const tmp = STATE_PATH + '.train-tmp';

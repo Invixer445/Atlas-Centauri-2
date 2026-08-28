@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ════════════════════════════════════════════════════════════════════════════
-//  ATLAS CENTAURI — project.js  ·  what could this actually earn, with compounding?
+//  ATLAS LUMEN — project.js  ·  what could this actually earn, with compounding?
 //
 //  WHY THIS IS NOT "measured return × 12 months"
 //  The measured per-trade edge is +0.113R with t = 1.52. t = 1.52 means the true
