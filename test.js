@@ -1672,12 +1672,14 @@ check('core top-up sizing buys the gap, never churns, never sells', () => {
     ok(q(1000, 0, 1000) === 0, 'with the core disabled it must never buy anything');
     return;                                    // default config: OFF, nothing more to assert
   }
-  ok(Math.abs(q(1000, 0, 1000) * px - 500) < 1, 'an empty book must buy up to the target weight');
-  ok(q(1000, 500, 500) === 0, 'at target it must not churn');
-  ok(q(1000, 480, 520) === 0, 'inside the rebalance band it must not churn');
-  ok(q(1000, 200, 800) > 0,   'well below target it must top up');
-  ok(q(1000, 0, 0) === 0,     'with no cash it must not buy');
-  ok(q(1000, 700, 300) === 0, 'ABOVE target it must return 0 — a hold never sells');
+  // Values are PER NAME now: on $1000 at 50% across N names, each name targets 500/N.
+  const per = (1000 * I.CORE_HOLD_FRACTION) / I.CORE_HOLD_SYMBOLS.length;
+  ok(Math.abs(q(1000, 0, 1000) * px - per) < 1, "an empty name must be bought up to its own slice");
+  ok(q(1000, per, 1000) === 0, 'a name at its slice must not churn');
+  ok(q(1000, per * 0.96, 1000) === 0, 'inside the rebalance band it must not churn');
+  ok(q(1000, per * 0.3, 1000) > 0, 'a name well below its slice must be topped up');
+  ok(q(1000, 0, 0) === 0, 'with no cash it must not buy');
+  ok(q(1000, per * 1.5, 1000) === 0, 'a name ABOVE its slice must return 0 — a hold never sells');
 });
 
 check('the core holding is invisible to every trading exit path', () => {
@@ -1695,7 +1697,8 @@ check('the core holding is invisible to every trading exit path', () => {
   const fn = src.slice(src.indexOf('function coreTopUpQty'),
                        src.indexOf('function processProfitVault'));
   ok(!/closeLong|submitOrder\([^)]*'sell'/.test(fn), 'the core path must never sell');
-  ok(/gap <= target \* CORE_REBALANCE_BAND/.test(fn), 'it must only act when meaningfully under target');
+  ok(/gap <= perNameTarget \* CORE_REBALANCE_BAND/.test(fn),
+     'it must only act when a NAME is meaningfully under its own slice of the target');
   ok(/side: 'buy'/.test(fn), 'the only broker order on this path is a buy');
 });
 
