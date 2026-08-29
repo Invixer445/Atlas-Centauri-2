@@ -1223,6 +1223,52 @@ Output ONLY JSON:
   return { basket: unique.slice(0, size), sectors: r.sectors || {}, reasoning: r.reasoning || '' };
 }
 
+// ── AI-ASSISTED TRIM (v11.39) ───────────────────────────────────────────────
+// The operator's reasoning: "better to sell going up near a high and make a little
+// less than the peak, than to sell after the peak and make less than anything."
+// That is a real argument, and this implements it — but DELIBERATELY BOUNDED, because
+// every judgement-timed exit measured in this project destroyed value (the trailing
+// stop turned a 2.09:1 payoff into 1.2:1).
+//
+// The bounds, and why each exists:
+//   · it may only ACCELERATE a trim, never prevent one. The arithmetic trim at 25%
+//     drift always still fires. Letting an AI talk the bot OUT of banking profit is
+//     how a winner becomes a round trip.
+//   · it may only trim the EXCESS above target, never exit a position. A hold that
+//     can be fully sold on a view is not a hold.
+//   · it is asked for a probability, not a story, and a high bar is required to act.
+//   · every call is logged with what the arithmetic would have done, so the register
+//     can score whether the AI's timing beat the plain rule.
+// Returns { trim: bool, confidence, why } or null when unavailable.
+async function assessTrim(sym, ctx = {}) {
+  const prompt =
+`You are VENUS. A long-term holding has risen and the question is whether to bank some
+of the gain NOW rather than wait.
+
+Holding: ${sym}
+  gain since purchase      ${(ctx.gainPct ?? 0).toFixed(1)}%
+  above its target weight  ${(ctx.overweightPct ?? 0).toFixed(1)}%
+  move over the last week  ${(ctx.weekPct ?? 0).toFixed(1)}%
+  distance below its recent high ${(ctx.offHighPct ?? 0).toFixed(1)}%
+
+You are NOT being asked to predict the price. You are being asked one narrow question:
+is there a concrete, identifiable reason to bank part of this gain now rather than let
+it ride — a known upcoming event, a stretched move, a sector-wide problem, news that
+changes the company's value?
+
+"It has gone up a lot" is NOT a reason on its own; that is what the mechanical rule
+already handles. Absent a specific reason, answer false. Answering false is the
+correct and expected default.
+
+Output ONLY JSON:
+{"trim":true|false,"confidence":0.0-1.0,"why":"one short sentence naming the reason"}`;
+
+  const r = await llmReason(prompt);
+  if (!r || typeof r.trim !== 'boolean') return null;
+  return { trim: !!r.trim, confidence: Math.max(0, Math.min(1, Number(r.confidence) || 0)),
+           why: String(r.why || '').slice(0, 200) };
+}
+
 async function assess(ctx = {}) {
   const names = researchData.watchlist.slice(0, 12).map(w =>
     `${w.symbol}: 13F=${(w.institutional||0).toFixed(2)} (${w.institutionalFilings||0} filings), news=${(w.newsConviction||0).toFixed(2)}${w.catalyst?` [${w.catalyst}]`:''}, RVOL=${(w.rvol||0).toFixed(1)}`
@@ -1286,7 +1332,7 @@ const venus = {
   // list at boot, so a copied value here would report the stale configured name.
   get AI_MODEL() { return AI_MODEL; },
   resolveAiModel,
-  analyze, research, assess, proposeBasket, researchRecommendations, getResearch, getResearchFor, institutionalInterest,
+  analyze, research, assess, assessTrim, proposeBasket, researchRecommendations, getResearch, getResearchFor, institutionalInterest,
   learn, calibrateConviction, getCalibration, getState, serialize, loadState: venusLoadState,
   MECHANISMS, TRADEABLE_MECHANISMS, validateRec, isTradeableIdea, recsFromParsed,
   trainOffline, ingestCalibrationData, getTrainStats
@@ -1554,7 +1600,11 @@ function createJupiter(config = {}) {
     riskFraction = Math.max(0, Math.min(cap, riskFraction));   // hard cap unchanged
     if (riskFraction <= 0) return 0;
 
-    const equity = Math.max(0, T.capitalSystem.tradingCapital);
+    // Phase gate: while the trading side is funded by banked profit, that is the
+    // equity it sizes against — not the whole account.
+    const equity = Math.max(0, T.helpers.tradingCapitalAllowed
+      ? T.helpers.tradingCapitalAllowed()
+      : T.capitalSystem.tradingCapital);
     const exact  = (equity * riskFraction) / stopDistance;      // the size risk math WANTS
     if (!Number.isFinite(exact)) return 0;
     const maxByNotional = (equity * 0.60) / price;
@@ -2352,6 +2402,28 @@ const CORE_REBALANCE_BAND = 0.10;
 // frequency was worth almost nothing (1.30-1.41 return/risk from weekly to never), so
 // the band is set to act rarely and only on genuine drift.
 const CORE_TRIM_BAND = Math.max(0.05, parseFloat(process.env.CORE_TRIM_BAND || '0.25'));
+// The band the AI may pull a trim forward to. It can act between EARLY and the full
+// band, never below EARLY — so a holding must still have genuinely run before any
+// judgement is applied, and the arithmetic rule at CORE_TRIM_BAND always still fires.
+const CORE_TRIM_EARLY_BAND = Math.max(0.05, parseFloat(process.env.CORE_TRIM_EARLY_BAND || '0.12'));
+// How sure the AI must be to pull a trim forward. High on purpose: the default answer
+// is "no", and acting on a weak view is the behaviour that cost 2.09:1 -> 1.2:1.
+const CORE_TRIM_AI_CONFIDENCE = Math.max(0.5, parseFloat(process.env.CORE_TRIM_AI_CONFIDENCE || '0.75'));
+const CORE_TRIM_AI = process.env.CORE_TRIM_AI !== 'false';
+const TRIM_DECISION_LOG = 'atlas-trim-decisions.json';
+let _lastTrimAiAt = 0;
+
+// Append-only record of every AI trim call AND what the arithmetic would have done,
+// so the register can later score whether the judgement beat the plain rule.
+function recordTrimDecision(rec) {
+  try {
+    let log = [];
+    try { log = JSON.parse(fs.readFileSync(TRIM_DECISION_LOG, 'utf8')); } catch {}
+    if (!Array.isArray(log)) log = [];
+    log.push({ at: new Date().toISOString(), ...rec });
+    fs.writeFileSync(TRIM_DECISION_LOG, JSON.stringify(log.slice(-500), null, 2));
+  } catch (e) { console.warn(`[CORE] could not record trim decision: ${e.message}`); }
+}
 
 // Where the core basket's MEMBERSHIP comes from. 'fixed' uses CORE_HOLD_SYMBOLS.
 // 'venus' uses whatever Venus proposes.
@@ -2363,6 +2435,27 @@ const CORE_TRIM_BAND = Math.max(0.05, parseFloat(process.env.CORE_TRIM_BAND || '
 // proposal is LOGGED and SCORED, while the money stays on the control basket until the
 // register says otherwise.
 const CORE_BASKET_SOURCE = (process.env.CORE_BASKET_SOURCE || 'fixed').toLowerCase();
+
+// ── PHASE GATE (v11.39) ─────────────────────────────────────────────────────
+// TWO PHASES, and the second one is funded by the first.
+//
+// PHASE 1 (hold): only the core basket runs. It buys, holds, and trims winners
+//   back to target, banking realised gains as it goes.
+// PHASE 2 (trade): unlocks only once banked realised profit reaches
+//   TRADING_UNLOCK_USD. Until then the trading engine takes no entries at all.
+//
+// WHY THIS IS THE RIGHT SHAPE. On the first live day the holding side made +$1.20
+// and the single trade lost $1.32 — without the trading side it would have been a
+// green day. The measured expectancy of trading is ~zero; the measured expectancy of
+// holding is the market's drift. Gating one behind the other means the experiment
+// can only ever spend winnings, never the stake.
+//
+// Once unlocked, trading is sized from BANKED PROFIT, not the whole account, so the
+// original $1000 is never what is being risked on an unproven strategy.
+const PHASE_GATE_ENABLED  = process.env.PHASE_GATE_ENABLED !== 'false';
+const TRADING_UNLOCK_USD  = Math.max(0, parseFloat(process.env.TRADING_UNLOCK_USD || '50'));
+// Once unlocked, what share of banked profit the trading side may put at risk.
+const TRADING_PROFIT_SHARE = Math.max(0, Math.min(1, parseFloat(process.env.TRADING_PROFIT_SHARE || '1.0')));
 // One proposal a day is plenty for a decision measured in months, and it keeps the
 // LLM budget for the news calls that actually decay.
 const BASKET_PROPOSAL_INTERVAL_MS = 24 * 3600 * 1000;
@@ -4562,7 +4655,7 @@ let CORE_PAUSED = false;   // toggled by the admin API
 // Which basket member has run furthest ABOVE its slice, and by how many shares.
 // Returns null when nothing has drifted past the trim band. Never sells a whole
 // position — only the excess above target, so the holding itself is never exited.
-function mostOverweightCore(totalValue) {
+function mostOverweightCore(totalValue, band = CORE_TRIM_BAND) {
   const h = portfolio.coreHolding || {};
   const perNameTarget = (totalValue * CORE_HOLD_FRACTION) / Math.max(1, CORE_HOLD_SYMBOLS.length);
   if (!(perNameTarget > 0)) return null;
@@ -4582,7 +4675,7 @@ function mostOverweightCore(totalValue) {
     const inBasket = CORE_HOLD_SYMBOLS.includes(sym);
     const nameTarget = inBasket ? perNameTarget : 0;
     const excess = val - nameTarget;
-    if (excess <= nameTarget * CORE_TRIM_BAND) continue;          // inside the band, leave it alone
+    if (excess <= nameTarget * band) continue;                    // inside the band, leave it alone
     if (!inBasket && val < MIN_FRACTIONAL_NOTIONAL) continue;     // dust, not worth the spread
     if (excess > most) {
       let qty = excess / px;
@@ -4599,17 +4692,53 @@ function mostOverweightCore(totalValue) {
 // Sell the excess of whichever holding has run furthest past its slice. This is the
 // core's ONLY seller, and it is arithmetic: no view is taken on whether the price is
 // high, only on whether the position has outgrown its share of the basket.
-function trimCoreHolding() {
+async function trimCoreHolding() {
   if (!CORE_HOLD_ON) return;
   if (!getCurrentMarket()) return;
   if (coreHaltedByOperator()) return;
-  const pick = mostOverweightCore(getTotalValue());
+  const tv = getTotalValue();
+
+  // 1. The arithmetic rule ALWAYS runs first and is never overridden.
+  let pick = mostOverweightCore(tv);
+  let source = 'rule';
+
+  // 2. Only if the rule finds nothing may the AI pull a trim forward, and only for a
+  //    holding that has already drifted past the EARLY band. It can accelerate; it can
+  //    never veto. Rate-limited to one call an hour so this cannot eat the LLM budget.
+  if (!pick && CORE_TRIM_AI && Date.now() - _lastTrimAiAt > 3600000) {
+    const cand = mostOverweightCore(tv, CORE_TRIM_EARLY_BAND);
+    if (cand) {
+      _lastTrimAiAt = Date.now();
+      const lot = portfolio.coreHolding[cand.sym];
+      const gainPct = lot && lot.avgPrice > 0 ? (cand.px / lot.avgPrice - 1) * 100 : 0;
+      const hist = (candleData[cand.sym]?.m1 || []).map(c => c.c);
+      const weekPct = hist.length > 5 ? (cand.px / hist[0] - 1) * 100 : 0;
+      const hi = hist.length ? Math.max(...hist, cand.px) : cand.px;
+      const verdict = await venus.assessTrim(cand.sym, {
+        gainPct, overweightPct: (cand.excess / Math.max(1e-9, cand.px * cand.qty)) * 100,
+        weekPct, offHighPct: hi > 0 ? (1 - cand.px / hi) * 100 : 0
+      }).catch(() => null);
+      // Logged whether or not it acts — a 'no' is evidence too, and without it the
+      // register would only ever see the cases the AI chose to act on.
+      recordTrimDecision({ symbol: cand.sym, gainPct: +gainPct.toFixed(2),
+                           ruleWouldTrim: false, aiSaid: verdict ? verdict.trim : null,
+                           confidence: verdict ? verdict.confidence : null,
+                           why: verdict ? verdict.why : 'no response', acted: false });
+      if (verdict && verdict.trim && verdict.confidence >= CORE_TRIM_AI_CONFIDENCE) {
+        pick = cand; source = 'ai';
+        console.log(`[CORE] 🧠 Venus pulling a trim forward on ${cand.sym} ` +
+                    `(confidence ${(verdict.confidence*100).toFixed(0)}%) — ${verdict.why}`);
+      }
+    }
+  }
   if (!pick) return;
 
   const lot = portfolio.coreHolding[pick.sym];
   const proceeds = pick.qty * pick.px;
   const costBasis = lot.avgPrice * pick.qty;
   const gain = proceeds - costBasis;
+  // Realised, banked, sitting in cash — this is what unlocks the trading phase.
+  capitalSystem.bankedProfit = (capitalSystem.bankedProfit || 0) + gain;
 
   lot.qty -= pick.qty;
   lot.investedCash = Math.max(0, lot.investedCash - costBasis);
@@ -4618,7 +4747,9 @@ function trimCoreHolding() {
 
   console.log(`[CORE] 💰 Trimmed ${pick.qty.toFixed(6)} ${pick.sym} @ $${pick.px.toFixed(2)} ` +
               `= $${proceeds.toFixed(2)} banked (${gain >= 0 ? '+' : ''}$${gain.toFixed(2)} vs cost) — ` +
-              `it had grown ${((pick.excess / (pick.excess + pick.qty * pick.px)) * 100).toFixed(0)}% past its slice`);
+              `it had grown ${((pick.excess / (pick.excess + pick.qty * pick.px)) * 100).toFixed(0)}% past its slice [${source}]`);
+  recordTrimDecision({ symbol: pick.sym, proceeds: +proceeds.toFixed(2), gain: +gain.toFixed(2),
+                       source, ruleWouldTrim: source === 'rule', acted: true });
 
   if (LIVE_TRADING && broker && broker.configured) {
     // Mirror of the buy-side rollback: if the broker refuses, the ledger must not keep
@@ -5010,6 +5141,22 @@ function noteEntryRejection(ticker, error) {
 // Cleared by any successful entry: the condition that caused it has demonstrably lifted.
 function clearEntryRejectBackoff() {
   if (_entryRejectStreak || entryPauseUntil) { _entryRejectStreak = 0; entryPauseUntil = 0; }
+}
+
+// Is the trading phase still locked behind the holding phase's banked profit?
+function tradingPhaseLocked() {
+  if (!PHASE_GATE_ENABLED) return false;
+  if (!CORE_HOLD_ON) return false;          // no holding phase configured — nothing to gate behind
+  return (capitalSystem.bankedProfit || 0) < TRADING_UNLOCK_USD;
+}
+
+// Once unlocked, how much money the trading side may actually put at risk. Sized from
+// BANKED PROFIT rather than the whole account, so an unproven strategy is never
+// spending the original stake — only what the holding side has already earned.
+function tradingCapitalAllowed() {
+  if (!PHASE_GATE_ENABLED || !CORE_HOLD_ON) return capitalSystem.tradingCapital;
+  const funded = (capitalSystem.bankedProfit || 0) * TRADING_PROFIT_SHARE;
+  return Math.max(0, Math.min(capitalSystem.tradingCapital, funded));
 }
 
 function entriesPausedByBroker() {
@@ -6613,6 +6760,20 @@ function evaluateAndTrade() {
   // The broker has told us it cannot fund new entries. Retrying at 2s intervals
   // achieves nothing and hammers the API, so hold off until the backoff expires.
   // EXITS AND STOPS ARE NOT AFFECTED — they run above this point.
+  // PHASE GATE — the trading side stays dark until the holding side has banked
+  // TRADING_UNLOCK_USD of realised profit. Exits and stops are NOT gated: anything
+  // already open must still be able to close.
+  if (tradingPhaseLocked()) {
+    if (Date.now() - (evaluateAndTrade._lastPhaseLog || 0) > 900000) {
+      evaluateAndTrade._lastPhaseLog = Date.now();
+      const banked = capitalSystem.bankedProfit || 0;
+      console.log(`[PHASE] Trading locked — holding phase has banked $${banked.toFixed(2)} of the ` +
+                  `$${TRADING_UNLOCK_USD.toFixed(2)} needed. The core keeps buying, holding and trimming; ` +
+                  `no trades are taken until the holding side has paid for them.`);
+    }
+    return;
+  }
+
   if (entriesPausedByBroker()) {
     if (Date.now() - (evaluateAndTrade._lastBrokerPauseLog || 0) > 60000) {
       evaluateAndTrade._lastBrokerPauseLog = Date.now();
@@ -7284,6 +7445,9 @@ if (require.main === module) app.listen(PORT, async () => {
               `${LONG_ONLY ? 'LONG-ONLY' : 'long+short'} | stop ${STRATEGY.ATR_STOP_MULT}xATR target ${STRATEGY.ATR_TARGET_MULT}xATR`);
   console.log(`[CONFIG] risk ${(STRATEGY.RISK_PER_TRADE_BASE*100).toFixed(1)}%/trade | ATR floor ${(STRATEGY.MIN_ATR_ENTRY*100).toFixed(2)}% | ` +
               `net R:R >= ${STRATEGY.MIN_RR_NET} | cost ceiling ${(STRATEGY.MAX_ROUND_TRIP_COST*100).toFixed(2)}%`);
+  if (PHASE_GATE_ENABLED && CORE_HOLD_ON)
+    console.log(`[CONFIG] PHASE GATE ON — trading stays locked until the holding side banks ` +
+                `$${TRADING_UNLOCK_USD.toFixed(2)}; after that it risks only banked profit`);
   console.log(`[CONFIG] fractional sizing ${FRACTIONAL_ENABLED ? `ON (min $${MIN_FRACTIONAL_NOTIONAL} position)` : 'OFF'} | ` +
               (CORE_HOLD_ON
                 ? `core holding ${(CORE_HOLD_FRACTION*100).toFixed(0)}% across ${CORE_HOLD_SYMBOLS.length} names (${CORE_HOLD_SYMBOLS.slice(0,4).join(',')}${CORE_HOLD_SYMBOLS.length>4?'…':''})`
@@ -7306,6 +7470,7 @@ if (require.main === module) app.listen(PORT, async () => {
       regimeNumeric: () => ({ bull: 1, bullish: 1, choppy: 0, neutral: 0, bear: -1, bearish: -1 }[detectMarketRegime()] ?? 0),
       sessionFraction: () => { const { hours } = getEasternTimeParts(); return Math.max(0, Math.min(1, (hours - 9.5) / 6.5)); },
       spread: (sym) => estimateDynamicSpread(sym),
+      tradingCapitalAllowed,
       quote: (sym) => { const m = marketData[sym]; return m ? { price: m.price, prevClose: m.prevClose } : null; }
     }
   });
@@ -7399,7 +7564,7 @@ if (require.main === module) app.listen(PORT, async () => {
   //     position that is never meant to be traded.
   if (CORE_HOLD_ON) setInterval(maintainCoreHolding, 300000);
   // Trim runs on its own timer, offset so a buy and a sell never fire in the same tick.
-  if (CORE_HOLD_ON) setInterval(trimCoreHolding, 300000);
+  if (CORE_HOLD_ON) setInterval(() => { trimCoreHolding().catch(e => console.warn('[CORE] trim error:', e.message)); }, 300000);
 
   // 6. Profit vault — every 5 min
   setInterval(processProfitVault, 300000);
@@ -7475,6 +7640,7 @@ module.exports = {
     setCorePaused: (v) => { CORE_PAUSED = !!v; }, coreHoldingValue, maintainCoreHolding, coreTopUpQty,
     logDailyTradeDigest, rejectionBucket, noteDailyRejection, tradableValue, wouldExceedHeat,
     noteEntryRejection, entriesPausedByBroker, clearEntryRejectBackoff, entryPauseRemainingMs, pendingEntryNotional,
+    tradingPhaseLocked, tradingCapitalAllowed, PHASE_GATE_ENABLED, TRADING_UNLOCK_USD, TRADING_PROFIT_SHARE,
     onCooldown, clearSymbolCooldown: (s) => { delete symbolCooldowns[s]; }, EXEC_BROKER_AUTH,
     setBrokerMirror: (m) => { brokerMirror = m; },
     estimateRoundTripCost, netRewardRisk, sideCost, LIMIT_ENTRIES, estimateDynamicSpread,

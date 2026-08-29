@@ -1733,6 +1733,83 @@ check('the core banks profit by trimming winners back to target', () => {
   I.CORE_HOLD_SYMBOLS.forEach(s => { if (saved[s]) I.marketData[s] = saved[s]; else delete I.marketData[s]; });
 });
 
+check('trading stays locked until the holding side banks profit', () => {
+  // The first live day: holding made +$1.20, the single trade lost $1.32. Without the
+  // trading side it would have been green. Gating one behind the other means the
+  // unproven strategy can only ever spend winnings, never the stake.
+  if (!I.PHASE_GATE_ENABLED || !I.CORE_HOLD_ON) {
+    ok(I.tradingPhaseLocked() === false, 'with no holding phase configured there is nothing to gate behind');
+    return;
+  }
+  const saved = I.capitalSystem.bankedProfit;
+  I.capitalSystem.bankedProfit = 0;
+  ok(I.tradingPhaseLocked() === true, 'with nothing banked, trading must be locked');
+  I.capitalSystem.bankedProfit = I.TRADING_UNLOCK_USD - 0.01;
+  ok(I.tradingPhaseLocked() === true, 'one cent short must still be locked');
+  I.capitalSystem.bankedProfit = I.TRADING_UNLOCK_USD;
+  ok(I.tradingPhaseLocked() === false, 'reaching the threshold must unlock it');
+  I.capitalSystem.bankedProfit = saved;
+});
+
+check('once unlocked, trading risks only banked profit', () => {
+  // The point of the gate is not just to delay trading but to cap what it can lose.
+  // Sizing from the whole account after unlocking would put the original stake back
+  // on an unproven strategy.
+  if (!I.PHASE_GATE_ENABLED || !I.CORE_HOLD_ON) { ok(true, 'gate not configured'); return; }
+  const savedBank = I.capitalSystem.bankedProfit, savedCap = I.capitalSystem.tradingCapital;
+  I.capitalSystem.tradingCapital = 700;
+  I.capitalSystem.bankedProfit = 60;
+  const allowed = I.tradingCapitalAllowed();
+  I.capitalSystem.bankedProfit = savedBank; I.capitalSystem.tradingCapital = savedCap;
+  ok(allowed <= 60 * I.TRADING_PROFIT_SHARE + 0.01,
+     `trading must be funded by banked profit ($60), not the $700 book — got $${allowed.toFixed(2)}`);
+  ok(allowed < 700, 'it must never reach for the whole trading book');
+});
+
+check('the phase gate blocks entries but never exits', () => {
+  // Anything already open must always be able to close. A gate that trapped positions
+  // would be far worse than no gate.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const i = src.indexOf('if (tradingPhaseLocked())');
+  ok(i > 0, 'the entry scan must consult the phase gate');
+  // Exits run earlier in evaluateAndTrade than the entry gates; assert the gate sits
+  // after the exit sweep rather than before it.
+  const exitsAt = src.indexOf('longsStop.forEach(t    => closeLong(t, true));');
+  ok(exitsAt > 0 && exitsAt < i, 'the phase gate must come AFTER the exit sweep, so exits are never blocked');
+});
+
+check('the AI can accelerate a trim but never prevent one', () => {
+  // The operator's reasoning — bank near a high rather than after it — is implemented,
+  // but bounded. Every judgement-timed exit measured in this project destroyed value
+  // (the trailing stop turned a 2.09:1 payoff into 1.2:1), so the arithmetic rule must
+  // remain sovereign: the AI may only pull a trim FORWARD, never talk the bot out of
+  // banking profit, and never sell more than the excess.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const i = src.indexOf('async function trimCoreHolding');
+  const fn = src.slice(i, src.indexOf('\nfunction ', i + 1));
+  // The rule runs FIRST and unconditionally.
+  ok(/let pick = mostOverweightCore\(tv\);/.test(fn), 'the arithmetic rule must run first');
+  // The AI is consulted only when the rule found nothing — it cannot override a trim.
+  ok(/if \(!pick && CORE_TRIM_AI/.test(fn),
+     'the AI must only be consulted when the rule found nothing — it can never veto a trim');
+  // And only for a holding already past the early band, so a view alone is not enough.
+  ok(/mostOverweightCore\(tv, CORE_TRIM_EARLY_BAND\)/.test(fn),
+     'the AI may only act on a holding that has already drifted past the early band');
+  ok(/verdict\.confidence >= CORE_TRIM_AI_CONFIDENCE/.test(fn), 'a high confidence bar is required');
+});
+
+check('every AI trim decision is logged, including the refusals', () => {
+  // Logging only the cases the AI acted on would make it look infallible in review —
+  // the register needs the "no" answers to score whether its timing beat the rule.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const i = src.indexOf('async function trimCoreHolding');
+  const fn = src.slice(i, src.indexOf('\nfunction ', i + 1));
+  const calls = (fn.match(/recordTrimDecision\(/g) || []).length;
+  ok(calls >= 2, `both the consulted-and-declined and the acted cases must be logged, found ${calls}`);
+  ok(/acted: false/.test(fn), 'a declined trim must be recorded too');
+  ok(/ruleWouldTrim/.test(fn), 'each record must say what the arithmetic would have done');
+});
+
 check('a failed trim rolls the ledger back', () => {
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
   const fn = src.slice(src.indexOf('function trimCoreHolding'), src.indexOf('function maintainCoreHolding'));
@@ -1867,8 +1944,8 @@ check('the core holding is invisible to every trading exit path', () => {
   ok(/side: 'buy'/.test(fn), 'the top-up path buys');
   // And the only sell that exists is the arithmetic trim, never a signal-driven exit.
   const trim = src.slice(src.indexOf('function trimCoreHolding'), src.indexOf('function maintainCoreHolding'));
-  ok(/excess <= nameTarget \* CORE_TRIM_BAND/.test(src),
-     'the trim must be gated on drift past the band, not on a view about price');
+  ok(/excess <= nameTarget \* band/.test(src),
+     'the trim must be gated on drift past a band, not on a view about price');
 });
 
 check('the core holding does not inflate trading capital', () => {
