@@ -7440,7 +7440,7 @@ if (require.main === module) app.listen(PORT, async () => {
     console.log(`[DIAG] Market: ${m || ('CLOSED — ' + (marketClosedReason() || 'unknown'))} | Regime: ${detectMarketRegime()} | Breadth: ${(sentimentData.breadthScore*100).toFixed(0)}% | SPY: ${(sentimentData.spyMomentum*100).toFixed(2)}% | Prices: ${Object.keys(marketData).length} | Candles: ${Object.keys(candleData).length} | Jupiter signals: ${jupiter.activeSymbols().length}`);
   }, 40000);
 
-  console.log("[STARTUP] Lumen online — unified engine v11.20 (Venus + Jupiter + Terra) ready\n");
+  console.log(`[STARTUP] Lumen online — unified engine v${VERSION} (Venus + Jupiter + Terra) ready\n`);
 });
 
 // ════════════════════════════════════════════════════════════════════════════
