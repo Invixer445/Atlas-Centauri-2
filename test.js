@@ -1733,6 +1733,55 @@ check('the core banks profit by trimming winners back to target', () => {
   I.CORE_HOLD_SYMBOLS.forEach(s => { if (saved[s]) I.marketData[s] = saved[s]; else delete I.marketData[s]; });
 });
 
+// Set the trading funding pool to `usd`, whichever basis the build is using.
+// 'banked' reads capitalSystem.bankedProfit; 'total' reads equity above start.
+function setTradingFunds(usd) {
+  I.capitalSystem.tradingDrawn = 0;
+  if (I.TRADING_UNLOCK_BASIS === 'total') {
+    I.portfolio.coreHolding = {};
+    I.portfolio.cash = I.START_CAPITAL + usd;
+  } else {
+    I.capitalSystem.bankedProfit = usd;
+  }
+}
+
+check('phase 1 puts idle cash to work, then steps back down', () => {
+  // A 50% core while trading is locked leaves half the account earning nothing for a
+  // phase lasting months — measured: the whole $1000 returns 8.8%/yr instead of the
+  // basket's 17.6%, which also doubles the wait for the gate to open.
+  if (!I.CORE_HOLD_ON || !I.PHASE_GATE_ENABLED) { ok(true, 'gate not configured'); return; }
+  const sb = I.capitalSystem.bankedProfit, sd = I.capitalSystem.tradingDrawn, sc = I.portfolio.cash;
+  I.capitalSystem.tradingDrawn = 0; I.capitalSystem.bankedProfit = 0; I.portfolio.cash = 1000;
+  ok(I.tradingPhaseLocked(), 'precondition: locked');
+  const locked = I.effectiveCoreFraction();
+  ok(locked >= I.CORE_PHASE1_FRACTION - 1e-9,
+     `while locked the core should target ~${(I.CORE_PHASE1_FRACTION*100).toFixed(0)}%, got ${(locked*100).toFixed(0)}%`);
+  ok(locked > I.CORE_HOLD_FRACTION, 'phase 1 must hold MORE than the unlocked target');
+  I.capitalSystem.bankedProfit = 10000;                      // force unlocked
+  I.portfolio.cash = 20000;
+  ok(!I.tradingPhaseLocked(), 'precondition: unlocked');
+  ok(Math.abs(I.effectiveCoreFraction() - I.CORE_HOLD_FRACTION) < 1e-9,
+     'once unlocked it must step back down to the configured fraction');
+  I.capitalSystem.bankedProfit = sb; I.capitalSystem.tradingDrawn = sd; I.portfolio.cash = sc;
+});
+
+check('unlocking on total profit still only ever risks gains', () => {
+  // 'total' counts unrealised gains, which is much faster. The protection is unchanged:
+  // if the account is above its starting capital, what trading may use is winnings —
+  // whether those winnings sit in cash or in shares does not change whose money it is.
+  if (!I.PHASE_GATE_ENABLED || !I.CORE_HOLD_ON) { ok(true, 'gate not configured'); return; }
+  if (I.TRADING_UNLOCK_BASIS !== 'total') { ok(true, "basis is 'banked' — covered elsewhere"); return; }
+  const sd = I.capitalSystem.tradingDrawn, sc = I.portfolio.cash, sh = I.portfolio.coreHolding;
+  I.capitalSystem.tradingDrawn = 0; I.portfolio.coreHolding = {};
+  I.portfolio.cash = 1000;
+  ok(I.tradingPhaseLocked(), 'at exactly starting capital there are no gains — must stay locked');
+  I.portfolio.cash = 1000 - 50;
+  ok(I.tradingPhaseLocked(), 'BELOW starting capital must never unlock');
+  I.portfolio.cash = 1000 + I.TRADING_UNLOCK_USD;
+  ok(!I.tradingPhaseLocked(), 'gains at the threshold must unlock');
+  I.capitalSystem.tradingDrawn = sd; I.portfolio.cash = sc; I.portfolio.coreHolding = sh;
+});
+
 check('trading stays locked until the holding side banks profit', () => {
   // The first live day: holding made +$1.20, the single trade lost $1.32. Without the
   // trading side it would have been green. Gating one behind the other means the
@@ -1744,13 +1793,14 @@ check('trading stays locked until the holding side banks profit', () => {
   const saved = I.capitalSystem.bankedProfit, savedDrawn = I.capitalSystem.tradingDrawn;
   // Control BOTH halves of the pool — available = banked + drawn, so leaving a prior
   // test's drawn figure in place makes this assert against the wrong number.
-  I.capitalSystem.tradingDrawn = 0;
-  I.capitalSystem.bankedProfit = 0;
-  ok(I.tradingPhaseLocked() === true, 'with nothing banked, trading must be locked');
-  I.capitalSystem.bankedProfit = I.TRADING_UNLOCK_USD - 0.01;
+  const savedCash = I.portfolio.cash, savedHold = I.portfolio.coreHolding;
+  setTradingFunds(0);
+  ok(I.tradingPhaseLocked() === true, 'with nothing earned, trading must be locked');
+  setTradingFunds(I.TRADING_UNLOCK_USD - 0.01);
   ok(I.tradingPhaseLocked() === true, 'one cent short must still be locked');
-  I.capitalSystem.bankedProfit = I.TRADING_UNLOCK_USD;
+  setTradingFunds(I.TRADING_UNLOCK_USD);
   ok(I.tradingPhaseLocked() === false, 'reaching the threshold must unlock it');
+  I.portfolio.cash = savedCash; I.portfolio.coreHolding = savedHold;
   I.capitalSystem.bankedProfit = saved; I.capitalSystem.tradingDrawn = savedDrawn;
 });
 
@@ -1760,14 +1810,15 @@ check('trading losses give the funding back and re-lock the gate', () => {
   // false the moment trading started losing.
   if (!I.PHASE_GATE_ENABLED || !I.CORE_HOLD_ON) { ok(true, 'gate not configured'); return; }
   const sb = I.capitalSystem.bankedProfit, sd = I.capitalSystem.tradingDrawn;
-  I.capitalSystem.bankedProfit = I.TRADING_UNLOCK_USD + 10;
-  I.capitalSystem.tradingDrawn = 0;
-  ok(I.tradingPhaseLocked() === false, 'enough banked should unlock');
+  const savedCash2 = I.portfolio.cash, savedHold2 = I.portfolio.coreHolding;
+  setTradingFunds(I.TRADING_UNLOCK_USD + 10);
+  ok(I.tradingPhaseLocked() === false, 'enough earned should unlock');
   I.bankTradingPnL(-11);                       // give back more than the surplus
   ok(I.tradingPhaseLocked() === true, 'losing the funding must RE-LOCK the gate');
   I.bankTradingPnL(+11);                       // win it back
   ok(I.tradingPhaseLocked() === false, 'earning it back must unlock again');
   I.capitalSystem.bankedProfit = sb; I.capitalSystem.tradingDrawn = sd;
+  I.portfolio.cash = savedCash2; I.portfolio.coreHolding = savedHold2;
 });
 
 check('the funding pool cannot be corrupted or go negative', () => {
@@ -1870,11 +1921,11 @@ check('the core builds a basket, not one big position', () => {
     return;
   }
   const n = I.CORE_HOLD_SYMBOLS.length;
-  const perName = (1000 * I.CORE_HOLD_FRACTION) / n;
+  const perName = (1000 * I.effectiveCoreFraction()) / n;   // phase 1 holds more
   const first = I.coreTopUpQty(100, 1000, 0, 1000) * 100;      // $ value of the first buy
   ok(Math.abs(first - perName) < 0.5,
      `first buy should be one name's slice ($${perName.toFixed(2)}), got $${first.toFixed(2)}`);
-  ok(first < 1000 * I.CORE_HOLD_FRACTION * 0.9,
+  ok(first < 1000 * I.effectiveCoreFraction() * 0.9,
      'a single buy must never take the whole basket allocation');
   // A name already at its slice must not be topped up again.
   ok(I.coreTopUpQty(100, 1000, perName, 1000) === 0, 'a filled name must not be bought again');
@@ -1890,7 +1941,7 @@ check('core top-up sizing buys the gap, never churns, never sells', () => {
     return;                                    // default config: OFF, nothing more to assert
   }
   // Values are PER NAME now: on $1000 at 50% across N names, each name targets 500/N.
-  const per = (1000 * I.CORE_HOLD_FRACTION) / I.CORE_HOLD_SYMBOLS.length;
+  const per = (1000 * I.effectiveCoreFraction()) / I.CORE_HOLD_SYMBOLS.length;
   ok(Math.abs(q(1000, 0, 1000) * px - per) < 1, "an empty name must be bought up to its own slice");
   ok(q(1000, per, 1000) === 0, 'a name at its slice must not churn');
   ok(q(1000, per * 0.96, 1000) === 0, 'inside the rebalance band it must not churn');

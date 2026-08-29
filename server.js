@@ -2389,6 +2389,13 @@ const CORE_HOLD_SYMBOLS = (process.env.CORE_HOLD_SYMBOLS ||
 const CORE_HOLD_SYMBOL   = CORE_HOLD_SYMBOLS[0];   // back-compat for single-name callers
 const CORE_HOLD_FRACTION = Math.max(0, Math.min(0.9, parseFloat(process.env.CORE_HOLD_FRACTION || '0')));
 const CORE_HOLD_ON       = CORE_HOLD_FRACTION > 0;
+// While trading is LOCKED there is nothing for spare cash to do, so leaving it idle
+// simply halves the account's return for a phase that may last months. Measured: at a
+// 50% core the whole $1000 earns 8.8%/yr instead of the basket's 17.6%, and the wait
+// for the gate to open doubles as a direct result. Phase 1 therefore holds nearly
+// everything and steps back down to CORE_HOLD_FRACTION the moment trading unlocks.
+const CORE_PHASE1_FRACTION = Math.max(0, Math.min(0.95,
+  parseFloat(process.env.CORE_PHASE1_FRACTION || '0.95')));
 // Only top up when meaningfully below target, so a drifting price does not generate
 // a stream of tiny orders that pay spread for nothing.
 const CORE_REBALANCE_BAND = 0.10;
@@ -2401,11 +2408,11 @@ const CORE_REBALANCE_BAND = 0.10;
 // 0.25 is deliberately wide: trimming costs spread every time, and measured rebalance
 // frequency was worth almost nothing (1.30-1.41 return/risk from weekly to never), so
 // the band is set to act rarely and only on genuine drift.
-const CORE_TRIM_BAND = Math.max(0.05, parseFloat(process.env.CORE_TRIM_BAND || '0.25'));
+const CORE_TRIM_BAND = Math.max(0.05, parseFloat(process.env.CORE_TRIM_BAND || '0.12'));
 // The band the AI may pull a trim forward to. It can act between EARLY and the full
 // band, never below EARLY — so a holding must still have genuinely run before any
 // judgement is applied, and the arithmetic rule at CORE_TRIM_BAND always still fires.
-const CORE_TRIM_EARLY_BAND = Math.max(0.05, parseFloat(process.env.CORE_TRIM_EARLY_BAND || '0.12'));
+const CORE_TRIM_EARLY_BAND = Math.max(0.05, parseFloat(process.env.CORE_TRIM_EARLY_BAND || '0.07'));
 // How sure the AI must be to pull a trim forward. High on purpose: the default answer
 // is "no", and acting on a weak view is the behaviour that cost 2.09:1 -> 1.2:1.
 const CORE_TRIM_AI_CONFIDENCE = Math.max(0.5, parseFloat(process.env.CORE_TRIM_AI_CONFIDENCE || '0.75'));
@@ -2453,9 +2460,22 @@ const CORE_BASKET_SOURCE = (process.env.CORE_BASKET_SOURCE || 'fixed').toLowerCa
 // Once unlocked, trading is sized from BANKED PROFIT, not the whole account, so the
 // original $1000 is never what is being risked on an unproven strategy.
 const PHASE_GATE_ENABLED  = process.env.PHASE_GATE_ENABLED !== 'false';
-const TRADING_UNLOCK_USD  = Math.max(0, parseFloat(process.env.TRADING_UNLOCK_USD || '50'));
+const TRADING_UNLOCK_USD  = Math.max(0, parseFloat(process.env.TRADING_UNLOCK_USD || '15'));
 // Once unlocked, what share of banked profit the trading side may put at risk.
 const TRADING_PROFIT_SHARE = Math.max(0, Math.min(1, parseFloat(process.env.TRADING_PROFIT_SHARE || '1.0')));
+
+// WHAT COUNTS AS "PROFIT THE HOLDING SIDE HAS EARNED".
+//   'banked' — only cash realised by selling. Literal, and very slow: a holding only
+//              realises a sliver when trimmed, so $15 takes over a year to accumulate.
+//   'total'  — the account being worth more than it started. Reaches the same bar in
+//              about a month, and still means trading only ever risks GAINS: if the
+//              account is at $1050 and trading may use $15, that $15 is winnings, not
+//              the stake. Whether the gain is sitting in cash or in shares does not
+//              change whose money is at risk.
+// 'total' is the default because the gate's purpose is "do not risk the stake", and
+// that purpose is served either way — while 'banked' delays the experiment by a year
+// for no additional protection.
+const TRADING_UNLOCK_BASIS = (process.env.TRADING_UNLOCK_BASIS || 'total').toLowerCase();
 // One proposal a day is plenty for a decision measured in months, and it keeps the
 // LLM budget for the news calls that actually decay.
 const BASKET_PROPOSAL_INTERVAL_MS = 24 * 3600 * 1000;
@@ -4581,6 +4601,14 @@ function rebalanceCapital() {
 //  signal. No stop, no target, no trail. That is the entire point — the measured
 //  advantage of holding comes precisely from not reacting.
 // ════════════════════════════════════════════════════════════════════════════
+// The core's target weight RIGHT NOW. Higher while trading is locked, because idle
+// cash earns nothing and the gate cannot open any faster for it sitting there.
+function effectiveCoreFraction() {
+  if (!CORE_HOLD_ON) return 0;
+  if (PHASE_GATE_ENABLED && tradingPhaseLocked()) return Math.max(CORE_HOLD_FRACTION, CORE_PHASE1_FRACTION);
+  return CORE_HOLD_FRACTION;
+}
+
 // Total market value of the core basket.
 function coreHoldingValue() {
   const h = portfolio.coreHolding;
@@ -4612,7 +4640,7 @@ function coreTopUpQty(price, totalValue, currentNameValue, cash, nameCount = COR
   if (!CORE_HOLD_ON) return 0;
   if (!Number.isFinite(price) || price <= 0) return 0;
   const n = Math.max(1, nameCount);
-  const perNameTarget = (totalValue * CORE_HOLD_FRACTION) / n;
+  const perNameTarget = (totalValue * effectiveCoreFraction()) / n;
   const gap = perNameTarget - currentNameValue;
   // Band keeps ordinary drift from generating a stream of tiny spread-paying buys.
   if (gap <= perNameTarget * CORE_REBALANCE_BAND) return 0;
@@ -4657,7 +4685,7 @@ let CORE_PAUSED = false;   // toggled by the admin API
 // position — only the excess above target, so the holding itself is never exited.
 function mostOverweightCore(totalValue, band = CORE_TRIM_BAND) {
   const h = portfolio.coreHolding || {};
-  const perNameTarget = (totalValue * CORE_HOLD_FRACTION) / Math.max(1, CORE_HOLD_SYMBOLS.length);
+  const perNameTarget = (totalValue * effectiveCoreFraction()) / Math.max(1, CORE_HOLD_SYMBOLS.length);
   if (!(perNameTarget > 0)) return null;
   let pick = null, most = 0;
   for (const [sym, lot] of Object.entries(h)) {
@@ -4801,7 +4829,7 @@ function maintainCoreHolding() {
 
   const cost = qty * pick.px;
   if (cost > portfolio.cash) return;
-  const target = totalValue * CORE_HOLD_FRACTION;
+  const target = totalValue * effectiveCoreFraction();
 
   portfolio.cash -= cost;
   portfolio.coreHolding = portfolio.coreHolding || {};
@@ -5165,6 +5193,12 @@ function bankTradingPnL(pnl) {
 // What the trading side actually has to work with: what holding banked, minus what
 // trading has since lost (or plus what it has made).
 function tradingFundsAvailable() {
+  if (TRADING_UNLOCK_BASIS === 'total') {
+    // Everything the account has gained over its starting capital, minus whatever
+    // trading has already given back. Unrealised gains count: they are still winnings.
+    const gained = getTotalValue() - START_CAPITAL;
+    return gained + (capitalSystem.tradingDrawn || 0);
+  }
   return (capitalSystem.bankedProfit || 0) + (capitalSystem.tradingDrawn || 0);
 }
 
@@ -7663,11 +7697,13 @@ module.exports = {
     extractJsonArray, extractJsonObject, affordableMaxPrice, MAX_SINGLE_SHARE_FRACTION, fetchBars,
     FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
     CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore,
+    CORE_PHASE1_FRACTION, effectiveCoreFraction,
     mostOverweightCore, trimCoreHolding, CORE_TRIM_BAND, coreHaltedByOperator,
     setCorePaused: (v) => { CORE_PAUSED = !!v; }, coreHoldingValue, maintainCoreHolding, coreTopUpQty,
     logDailyTradeDigest, rejectionBucket, noteDailyRejection, tradableValue, wouldExceedHeat,
     noteEntryRejection, entriesPausedByBroker, clearEntryRejectBackoff, entryPauseRemainingMs, pendingEntryNotional,
     tradingPhaseLocked, tradingCapitalAllowed, PHASE_GATE_ENABLED, TRADING_UNLOCK_USD, TRADING_PROFIT_SHARE,
+    TRADING_UNLOCK_BASIS,
     bankTradingPnL, tradingFundsAvailable,
     onCooldown, clearSymbolCooldown: (s) => { delete symbolCooldowns[s]; }, EXEC_BROKER_AUTH,
     setBrokerMirror: (m) => { brokerMirror = m; },
