@@ -1741,14 +1741,53 @@ check('trading stays locked until the holding side banks profit', () => {
     ok(I.tradingPhaseLocked() === false, 'with no holding phase configured there is nothing to gate behind');
     return;
   }
-  const saved = I.capitalSystem.bankedProfit;
+  const saved = I.capitalSystem.bankedProfit, savedDrawn = I.capitalSystem.tradingDrawn;
+  // Control BOTH halves of the pool — available = banked + drawn, so leaving a prior
+  // test's drawn figure in place makes this assert against the wrong number.
+  I.capitalSystem.tradingDrawn = 0;
   I.capitalSystem.bankedProfit = 0;
   ok(I.tradingPhaseLocked() === true, 'with nothing banked, trading must be locked');
   I.capitalSystem.bankedProfit = I.TRADING_UNLOCK_USD - 0.01;
   ok(I.tradingPhaseLocked() === true, 'one cent short must still be locked');
   I.capitalSystem.bankedProfit = I.TRADING_UNLOCK_USD;
   ok(I.tradingPhaseLocked() === false, 'reaching the threshold must unlock it');
-  I.capitalSystem.bankedProfit = saved;
+  I.capitalSystem.bankedProfit = saved; I.capitalSystem.tradingDrawn = savedDrawn;
+});
+
+check('trading losses give the funding back and re-lock the gate', () => {
+  // bankedProfit only ever increased, so trading could burn the entire unlock amount
+  // and the gate would still report it as available — "can only spend winnings" was
+  // false the moment trading started losing.
+  if (!I.PHASE_GATE_ENABLED || !I.CORE_HOLD_ON) { ok(true, 'gate not configured'); return; }
+  const sb = I.capitalSystem.bankedProfit, sd = I.capitalSystem.tradingDrawn;
+  I.capitalSystem.bankedProfit = I.TRADING_UNLOCK_USD + 10;
+  I.capitalSystem.tradingDrawn = 0;
+  ok(I.tradingPhaseLocked() === false, 'enough banked should unlock');
+  I.bankTradingPnL(-11);                       // give back more than the surplus
+  ok(I.tradingPhaseLocked() === true, 'losing the funding must RE-LOCK the gate');
+  I.bankTradingPnL(+11);                       // win it back
+  ok(I.tradingPhaseLocked() === false, 'earning it back must unlock again');
+  I.capitalSystem.bankedProfit = sb; I.capitalSystem.tradingDrawn = sd;
+});
+
+check('the funding pool cannot be corrupted or go negative', () => {
+  if (!I.PHASE_GATE_ENABLED || !I.CORE_HOLD_ON) { ok(true, 'gate not configured'); return; }
+  const sb = I.capitalSystem.bankedProfit, sd = I.capitalSystem.tradingDrawn;
+  I.capitalSystem.bankedProfit = 50; I.capitalSystem.tradingDrawn = 0;
+  [NaN, Infinity, -Infinity, undefined, null, 'x'].forEach(v => I.bankTradingPnL(v));
+  ok(Number.isFinite(I.tradingFundsAvailable()),
+     `a bad P&L value corrupted the pool: ${I.tradingFundsAvailable()}`);
+  I.capitalSystem.bankedProfit = 10; I.capitalSystem.tradingDrawn = -100;
+  ok(I.tradingCapitalAllowed() >= 0, 'a deeply negative pool must never produce a negative allowance');
+  I.capitalSystem.bankedProfit = sb; I.capitalSystem.tradingDrawn = sd;
+});
+
+check('both close paths draw against the funding pool', () => {
+  // Full closes and PARTIAL closes book P&L in different places. Hooking only one
+  // would let half of trading's losses go unaccounted for.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  ok(/bankTradingPnL\(totalPnL\);/.test(src), 'full closes must draw against the pool');
+  ok(/bankTradingPnL\(realizedPnL\);/.test(src), 'partial closes must draw against the pool too');
 });
 
 check('once unlocked, trading risks only banked profit', () => {
@@ -1757,10 +1796,13 @@ check('once unlocked, trading risks only banked profit', () => {
   // on an unproven strategy.
   if (!I.PHASE_GATE_ENABLED || !I.CORE_HOLD_ON) { ok(true, 'gate not configured'); return; }
   const savedBank = I.capitalSystem.bankedProfit, savedCap = I.capitalSystem.tradingCapital;
+  const savedDrawn2 = I.capitalSystem.tradingDrawn;
   I.capitalSystem.tradingCapital = 700;
   I.capitalSystem.bankedProfit = 60;
+  I.capitalSystem.tradingDrawn = 0;
   const allowed = I.tradingCapitalAllowed();
   I.capitalSystem.bankedProfit = savedBank; I.capitalSystem.tradingCapital = savedCap;
+  I.capitalSystem.tradingDrawn = savedDrawn2;
   ok(allowed <= 60 * I.TRADING_PROFIT_SHARE + 0.01,
      `trading must be funded by banked profit ($60), not the $700 book — got $${allowed.toFixed(2)}`);
   ok(allowed < 700, 'it must never reach for the whole trading book');

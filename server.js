@@ -5143,11 +5143,36 @@ function clearEntryRejectBackoff() {
   if (_entryRejectStreak || entryPauseUntil) { _entryRejectStreak = 0; entryPauseUntil = 0; }
 }
 
+// Trading P&L draws against the pool the holding side filled.
+//
+// THE BUG THIS CLOSES: bankedProfit only ever increased. Trading could burn through
+// the entire unlock amount and the gate would still report it as available — so the
+// "an unproven strategy can only spend winnings" claim was false the moment trading
+// started losing. It could spend them, lose them, and carry on at the same size.
+// Now losses shrink the pool, and if it falls back under the threshold the trading
+// phase RE-LOCKS until the holding side has earned the right again.
+function bankTradingPnL(pnl) {
+  if (!Number.isFinite(pnl) || pnl === 0) return;
+  const before = tradingFundsAvailable();
+  capitalSystem.tradingDrawn = (capitalSystem.tradingDrawn || 0) + pnl;
+  const after = tradingFundsAvailable();
+  if (PHASE_GATE_ENABLED && CORE_HOLD_ON && before >= TRADING_UNLOCK_USD && after < TRADING_UNLOCK_USD) {
+    console.warn(`[PHASE] Trading has given back its funding ($${after.toFixed(2)} left of the ` +
+                 `$${TRADING_UNLOCK_USD.toFixed(2)} needed) — RE-LOCKED until holding banks more.`);
+  }
+}
+
+// What the trading side actually has to work with: what holding banked, minus what
+// trading has since lost (or plus what it has made).
+function tradingFundsAvailable() {
+  return (capitalSystem.bankedProfit || 0) + (capitalSystem.tradingDrawn || 0);
+}
+
 // Is the trading phase still locked behind the holding phase's banked profit?
 function tradingPhaseLocked() {
   if (!PHASE_GATE_ENABLED) return false;
   if (!CORE_HOLD_ON) return false;          // no holding phase configured — nothing to gate behind
-  return (capitalSystem.bankedProfit || 0) < TRADING_UNLOCK_USD;
+  return tradingFundsAvailable() < TRADING_UNLOCK_USD;
 }
 
 // Once unlocked, how much money the trading side may actually put at risk. Sized from
@@ -5155,7 +5180,7 @@ function tradingPhaseLocked() {
 // spending the original stake — only what the holding side has already earned.
 function tradingCapitalAllowed() {
   if (!PHASE_GATE_ENABLED || !CORE_HOLD_ON) return capitalSystem.tradingCapital;
-  const funded = (capitalSystem.bankedProfit || 0) * TRADING_PROFIT_SHARE;
+  const funded = Math.max(0, tradingFundsAvailable()) * TRADING_PROFIT_SHARE;
   return Math.max(0, Math.min(capitalSystem.tradingCapital, funded));
 }
 
@@ -5877,6 +5902,7 @@ function partialClose(ticker, direction, fraction, rung, opts = {}) {
   // loss kill switch even when 3 prior full trades all lost.
   if (realizedPnL < 0) riskSystem.dailyRealizedLoss += Math.abs(realizedPnL);
 
+  bankTradingPnL(realizedPnL);       // partials draw against the pool too
   // Log the partial as a closed slice so analytics/expectancy see it
   portfolio.closedTrades.push({
     ticker, direction, pnl: realizedPnL, realizedPnL,
@@ -5942,6 +5968,7 @@ function finalizeClose(ticker, direction, totalPnL, exitPrice, market, stopLoss,
   }
 
   // LUMEN: attribute outcome to the AI catalyst that influenced the entry
+  bankTradingPnL(totalPnL);          // full close draws against the funding pool
   recordAiOutcome(ticker, direction, totalPnL);
 
   logTrade(`CLOSE ${direction} ${ticker} @ $${exitPrice.toFixed(2)} PnL $${totalPnL.toFixed(2)}`);
@@ -6766,7 +6793,7 @@ function evaluateAndTrade() {
   if (tradingPhaseLocked()) {
     if (Date.now() - (evaluateAndTrade._lastPhaseLog || 0) > 900000) {
       evaluateAndTrade._lastPhaseLog = Date.now();
-      const banked = capitalSystem.bankedProfit || 0;
+      const banked = tradingFundsAvailable();
       console.log(`[PHASE] Trading locked — holding phase has banked $${banked.toFixed(2)} of the ` +
                   `$${TRADING_UNLOCK_USD.toFixed(2)} needed. The core keeps buying, holding and trimming; ` +
                   `no trades are taken until the holding side has paid for them.`);
@@ -7641,6 +7668,7 @@ module.exports = {
     logDailyTradeDigest, rejectionBucket, noteDailyRejection, tradableValue, wouldExceedHeat,
     noteEntryRejection, entriesPausedByBroker, clearEntryRejectBackoff, entryPauseRemainingMs, pendingEntryNotional,
     tradingPhaseLocked, tradingCapitalAllowed, PHASE_GATE_ENABLED, TRADING_UNLOCK_USD, TRADING_PROFIT_SHARE,
+    bankTradingPnL, tradingFundsAvailable,
     onCooldown, clearSymbolCooldown: (s) => { delete symbolCooldowns[s]; }, EXEC_BROKER_AUTH,
     setBrokerMirror: (m) => { brokerMirror = m; },
     estimateRoundTripCost, netRewardRisk, sideCost, LIMIT_ENTRIES, estimateDynamicSpread,
