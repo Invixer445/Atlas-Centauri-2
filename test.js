@@ -1745,6 +1745,48 @@ function setTradingFunds(usd) {
   }
 }
 
+check('the phase does not flip on ordinary daily noise', () => {
+  // The core targets 95% locked and 50% unlocked, so every flip means selling ~$450
+  // of holdings and buying them back. Measured before the latch: a $1 move across the
+  // threshold flipped 95% -> 50% -> 95%. With ~$8 daily swings on a $15 threshold that
+  // would churn constantly and pay spread each time.
+  if (!I.CORE_HOLD_ON || !I.PHASE_GATE_ENABLED) { ok(true, 'gate not configured'); return; }
+  const sc = I.portfolio.cash, sh = I.portfolio.coreHolding;
+  const sd = I.capitalSystem.tradingDrawn, su = I.capitalSystem.tradingUnlocked;
+  I.capitalSystem.tradingDrawn = 0; I.capitalSystem.tradingUnlocked = false;
+  I.portfolio.coreHolding = {};
+  const t = I.TRADING_UNLOCK_USD;
+
+  setTradingFunds(t - 0.5);
+  const before = I.effectiveCoreFraction();
+  setTradingFunds(t + 0.5);
+  const unlocked = I.effectiveCoreFraction();
+  setTradingFunds(t - 0.5);                       // wobble straight back
+  const after = I.effectiveCoreFraction();
+  ok(before > unlocked, 'crossing the threshold must step the core down');
+  ok(Math.abs(after - unlocked) < 1e-9,
+     `a wobble back must NOT flip the core again (${(unlocked*100).toFixed(0)}% -> ${(after*100).toFixed(0)}%)`);
+
+  // Only a real give-back, well below the threshold, re-locks it.
+  setTradingFunds(t * I.TRADING_RELOCK_RATIO - 0.5);
+  ok(I.effectiveCoreFraction() > unlocked, 'a genuine give-back must re-lock and restore phase 1');
+
+  I.portfolio.cash = sc; I.portfolio.coreHolding = sh;
+  I.capitalSystem.tradingDrawn = sd; I.capitalSystem.tradingUnlocked = su;
+});
+
+check('the unlocked phase survives a restart', () => {
+  // The latch lives on capitalSystem, which is saved and restored wholesale. If it did
+  // not persist, every redeploy would re-lock a gate that had already been earned and
+  // slam the core back to 95%.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  ok(/capitalSystem\.tradingUnlocked = true;/.test(src), 'the unlock must be latched onto capitalSystem');
+  ok(/capitalSystem,/.test(src), 'capitalSystem must be part of the saved state');
+  ok(/queueSaveState\(\);/.test(src.slice(src.indexOf('function tradingPhaseLocked'),
+                                         src.indexOf('function tradingCapitalAllowed'))),
+     'a phase transition must be persisted immediately, not left to the next periodic save');
+});
+
 check('phase 1 puts idle cash to work, then steps back down', () => {
   // A 50% core while trading is locked leaves half the account earning nothing for a
   // phase lasting months — measured: the whole $1000 returns 8.8%/yr instead of the
@@ -1813,9 +1855,14 @@ check('trading losses give the funding back and re-lock the gate', () => {
   const savedCash2 = I.portfolio.cash, savedHold2 = I.portfolio.coreHolding;
   setTradingFunds(I.TRADING_UNLOCK_USD + 10);
   ok(I.tradingPhaseLocked() === false, 'enough earned should unlock');
-  I.bankTradingPnL(-11);                       // give back more than the surplus
-  ok(I.tradingPhaseLocked() === true, 'losing the funding must RE-LOCK the gate');
-  I.bankTradingPnL(+11);                       // win it back
+  // The latch has a dead band, so a small give-back must NOT re-lock — that is the
+  // whole point of it. Only falling below TRADING_RELOCK_RATIO of the threshold does.
+  I.bankTradingPnL(-11);
+  ok(I.tradingPhaseLocked() === false, 'a small give-back must stay unlocked (dead band)');
+  const floor = I.TRADING_UNLOCK_USD * I.TRADING_RELOCK_RATIO;
+  I.bankTradingPnL(-(I.tradingFundsAvailable() - floor + 1));   // drop clearly below the floor
+  ok(I.tradingPhaseLocked() === true, 'falling below the re-lock floor must RE-LOCK the gate');
+  I.bankTradingPnL(+(I.TRADING_UNLOCK_USD - I.tradingFundsAvailable() + 1));  // earn back past the bar
   ok(I.tradingPhaseLocked() === false, 'earning it back must unlock again');
   I.capitalSystem.bankedProfit = sb; I.capitalSystem.tradingDrawn = sd;
   I.portfolio.cash = savedCash2; I.portfolio.coreHolding = savedHold2;

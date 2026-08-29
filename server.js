@@ -2476,6 +2476,15 @@ const TRADING_PROFIT_SHARE = Math.max(0, Math.min(1, parseFloat(process.env.TRAD
 // that purpose is served either way — while 'banked' delays the experiment by a year
 // for no additional protection.
 const TRADING_UNLOCK_BASIS = (process.env.TRADING_UNLOCK_BASIS || 'total').toLowerCase();
+// HYSTERESIS. Recomputing the phase from a bare threshold makes it flip every time the
+// account wobbles across it — and because the core targets 95% while locked and 50%
+// while unlocked, each flip meant selling ~$450 of holdings and buying them back.
+// Measured: a $1 move across the line flipped 95% -> 50% -> 95%. On a $15 threshold
+// with ~$8 daily swings that would churn constantly and pay spread every time.
+// So the phase LATCHES: it unlocks at the threshold and only re-locks once funding
+// falls to a clearly lower level, leaving a wide dead band in between.
+const TRADING_RELOCK_RATIO = Math.max(0, Math.min(0.95,
+  parseFloat(process.env.TRADING_RELOCK_RATIO || '0.5')));
 // One proposal a day is plenty for a decision measured in months, and it keeps the
 // LLM budget for the news calls that actually decay.
 const BASKET_PROPOSAL_INTERVAL_MS = 24 * 3600 * 1000;
@@ -5184,10 +5193,9 @@ function bankTradingPnL(pnl) {
   const before = tradingFundsAvailable();
   capitalSystem.tradingDrawn = (capitalSystem.tradingDrawn || 0) + pnl;
   const after = tradingFundsAvailable();
-  if (PHASE_GATE_ENABLED && CORE_HOLD_ON && before >= TRADING_UNLOCK_USD && after < TRADING_UNLOCK_USD) {
-    console.warn(`[PHASE] Trading has given back its funding ($${after.toFixed(2)} left of the ` +
-                 `$${TRADING_UNLOCK_USD.toFixed(2)} needed) — RE-LOCKED until holding banks more.`);
-  }
+  // The latch in tradingPhaseLocked() owns the announcement, so nothing is said here —
+  // two messages for one transition read as two separate events.
+  void before; void after;
 }
 
 // What the trading side actually has to work with: what holding banked, minus what
@@ -5202,11 +5210,30 @@ function tradingFundsAvailable() {
   return (capitalSystem.bankedProfit || 0) + (capitalSystem.tradingDrawn || 0);
 }
 
-// Is the trading phase still locked behind the holding phase's banked profit?
+// Is the trading phase still locked behind the holding phase's earnings?
+// LATCHED, not recomputed: crossing the threshold once unlocks it, and only a fall to
+// TRADING_RELOCK_RATIO of the threshold locks it again. Without the dead band the core
+// allocation oscillates on ordinary daily noise.
 function tradingPhaseLocked() {
   if (!PHASE_GATE_ENABLED) return false;
   if (!CORE_HOLD_ON) return false;          // no holding phase configured — nothing to gate behind
-  return tradingFundsAvailable() < TRADING_UNLOCK_USD;
+  const funds = tradingFundsAvailable();
+  const wasUnlocked = !!capitalSystem.tradingUnlocked;
+  if (!wasUnlocked && funds >= TRADING_UNLOCK_USD) {
+    capitalSystem.tradingUnlocked = true;
+    console.log(`[PHASE] ✅ TRADING UNLOCKED — the holding side has earned $${funds.toFixed(2)}. ` +
+                `The core steps down to ${(CORE_HOLD_FRACTION*100).toFixed(0)}% and the trading engine wakes up.`);
+    queueSaveState();
+    return false;
+  }
+  if (wasUnlocked && funds < TRADING_UNLOCK_USD * TRADING_RELOCK_RATIO) {
+    capitalSystem.tradingUnlocked = false;
+    console.warn(`[PHASE] Trading has given back most of its funding ($${funds.toFixed(2)}) — RE-LOCKED. ` +
+                 `The core goes back to ${(CORE_PHASE1_FRACTION*100).toFixed(0)}% until it earns the right again.`);
+    queueSaveState();
+    return true;
+  }
+  return !wasUnlocked;
 }
 
 // Once unlocked, how much money the trading side may actually put at risk. Sized from
@@ -7703,7 +7730,7 @@ module.exports = {
     logDailyTradeDigest, rejectionBucket, noteDailyRejection, tradableValue, wouldExceedHeat,
     noteEntryRejection, entriesPausedByBroker, clearEntryRejectBackoff, entryPauseRemainingMs, pendingEntryNotional,
     tradingPhaseLocked, tradingCapitalAllowed, PHASE_GATE_ENABLED, TRADING_UNLOCK_USD, TRADING_PROFIT_SHARE,
-    TRADING_UNLOCK_BASIS,
+    TRADING_UNLOCK_BASIS, TRADING_RELOCK_RATIO,
     bankTradingPnL, tradingFundsAvailable,
     onCooldown, clearSymbolCooldown: (s) => { delete symbolCooldowns[s]; }, EXEC_BROKER_AUTH,
     setBrokerMirror: (m) => { brokerMirror = m; },
