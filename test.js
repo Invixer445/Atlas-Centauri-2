@@ -1745,6 +1745,44 @@ function setTradingFunds(usd) {
   }
 }
 
+check('the unlock step-down actually reaches the new weight', () => {
+  // At unlock the core must fall from CORE_PHASE1_FRACTION to CORE_HOLD_FRACTION. That
+  // is a large sale — ~$474 on a $1047 account — and it happens through the ordinary
+  // trim, one name per cycle. If it stalled, the core would sit at 95% forever and
+  // trading would have no cash to use.
+  if (!I.CORE_HOLD_ON || !I.PHASE_GATE_ENABLED) { ok(true, 'gate not configured'); return; }
+  const sc = I.portfolio.cash, sh = I.portfolio.coreHolding, sd = I.capitalSystem.tradingDrawn;
+  const su = I.capitalSystem.tradingUnlocked, saved = {};
+  I.capitalSystem.tradingDrawn = 0; I.capitalSystem.tradingUnlocked = false;
+  I.portfolio.cash = 50; I.portfolio.coreHolding = {};
+  I.CORE_HOLD_SYMBOLS.forEach(sym => {
+    saved[sym] = I.marketData[sym];
+    I.marketData[sym] = { price: 105, prevClose: 105, lastUpdate: Date.now() };
+    I.portfolio.coreHolding[sym] = { qty: 0.95, avgPrice: 100, investedCash: 95 };   // each +5%
+  });
+  ok(!I.tradingPhaseLocked(), 'a 5% gain on the core should clear the unlock bar');
+
+  // Drain the step-down the way the 5-minute timer would.
+  let cycles = 0;
+  while (cycles < 40) {
+    const p = I.mostOverweightCore(I.getTotalValue());
+    if (!p) break;
+    const lot = I.portfolio.coreHolding[p.sym];
+    lot.qty -= p.qty; lot.investedCash = Math.max(0, lot.investedCash - lot.avgPrice * p.qty);
+    if (lot.qty <= 1e-9) delete I.portfolio.coreHolding[p.sym];
+    I.portfolio.cash += p.qty * p.px;
+    cycles++;
+  }
+  const ratio = I.coreHoldingValue() / I.getTotalValue();
+  ok(cycles > 0 && cycles < 40, `the step-down must terminate, took ${cycles} cycles`);
+  ok(Math.abs(ratio - I.CORE_HOLD_FRACTION) < 0.03,
+     `core should land near ${(I.CORE_HOLD_FRACTION*100).toFixed(0)}%, got ${(ratio*100).toFixed(1)}%`);
+
+  I.portfolio.cash = sc; I.portfolio.coreHolding = sh;
+  I.capitalSystem.tradingDrawn = sd; I.capitalSystem.tradingUnlocked = su;
+  I.CORE_HOLD_SYMBOLS.forEach(sym => { if (saved[sym]) I.marketData[sym] = saved[sym]; else delete I.marketData[sym]; });
+});
+
 check('the phase does not flip on ordinary daily noise', () => {
   // The core targets 95% locked and 50% unlocked, so every flip means selling ~$450
   // of holdings and buying them back. Measured before the latch: a $1 move across the
