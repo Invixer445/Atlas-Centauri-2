@@ -7538,7 +7538,14 @@ if (require.main === module) app.listen(PORT, async () => {
                 `$${TRADING_UNLOCK_USD.toFixed(2)}; after that it risks only banked profit`);
   console.log(`[CONFIG] fractional sizing ${FRACTIONAL_ENABLED ? `ON (min $${MIN_FRACTIONAL_NOTIONAL} position)` : 'OFF'} | ` +
               (CORE_HOLD_ON
-                ? `core holding ${(CORE_HOLD_FRACTION*100).toFixed(0)}% across ${CORE_HOLD_SYMBOLS.length} names (${CORE_HOLD_SYMBOLS.slice(0,4).join(',')}${CORE_HOLD_SYMBOLS.length>4?'…':''})`
+                // Report the weight it will ACTUALLY target, not the configured one.
+                // While the phase gate holds trading back the core runs at
+                // CORE_PHASE1_FRACTION, so printing 50% here described a state the bot
+                // would not reach for weeks and made the first live log misleading.
+                ? `core holding ${(effectiveCoreFraction()*100).toFixed(0)}% now` +
+                  (PHASE_GATE_ENABLED && tradingPhaseLocked()
+                    ? ` (steps to ${(CORE_HOLD_FRACTION*100).toFixed(0)}% when trading unlocks)` : '') +
+                  ` across ${CORE_HOLD_SYMBOLS.length} names${CORE_BASKET_SOURCE === 'venus' ? ' — awaiting Venus\'s picks' : ` (${CORE_HOLD_SYMBOLS.slice(0,4).join(',')}${CORE_HOLD_SYMBOLS.length>4?'…':''})`}`
                 : `core holding OFF (set CORE_HOLD_FRACTION=0.5 to hold half across ${CORE_HOLD_SYMBOLS.length} names)`));
 
   // ── Wire JUPITER to Terra's live state + indicator helpers ──
