@@ -4610,6 +4610,19 @@ function rebalanceCapital() {
 //  signal. No stop, no target, no trail. That is the entire point — the measured
 //  advantage of holding comes precisely from not reacting.
 // ════════════════════════════════════════════════════════════════════════════
+// Moving cash INTO the core is an allocation change, not a loss — but the trading
+// drawdown is measured on (total - core) against a peak that started at START_CAPITAL.
+// Buying $571 of core therefore read as a 57% drawdown on an account that was UP
+// $1.41, tripping safe mode (10%), the emergency entry halt (20%) and the risk-level
+// check (20%) all at once, and pinning every Jupiter self-check to "High drawdown
+// mandates minimal risk". Rebasing the peak by the same amount the core absorbs keeps
+// the high-water mark aligned with the trading book's actual size, so drawdown once
+// again measures losses only.
+function rebasePeakForCoreFlow(cashDelta) {
+  if (!Number.isFinite(cashDelta) || cashDelta === 0) return;
+  riskSystem.peakValue = Math.max(0, (riskSystem.peakValue || 0) - cashDelta);
+}
+
 // The core's target weight RIGHT NOW. Higher while trading is locked, because idle
 // cash earns nothing and the gate cannot open any faster for it sitting there.
 function effectiveCoreFraction() {
@@ -4781,6 +4794,7 @@ async function trimCoreHolding() {
   lot.investedCash = Math.max(0, lot.investedCash - costBasis);
   if (lot.qty <= 1e-9) delete portfolio.coreHolding[pick.sym];
   portfolio.cash += proceeds;
+  rebasePeakForCoreFlow(-proceeds);     // the trading book just got bigger again
 
   console.log(`[CORE] 💰 Trimmed ${pick.qty.toFixed(6)} ${pick.sym} @ $${pick.px.toFixed(2)} ` +
               `= $${proceeds.toFixed(2)} banked (${gain >= 0 ? '+' : ''}$${gain.toFixed(2)} vs cost) — ` +
@@ -4793,6 +4807,7 @@ async function trimCoreHolding() {
     // claiming the sale happened.
     const rollback = (why) => {
       portfolio.cash -= proceeds;
+      rebasePeakForCoreFlow(proceeds);  // undo the rebase along with the credit
       const l = (portfolio.coreHolding = portfolio.coreHolding || {})[pick.sym];
       if (l) { l.qty += pick.qty; l.investedCash += costBasis; }
       else portfolio.coreHolding[pick.sym] = { qty: pick.qty, avgPrice: lot.avgPrice,
@@ -4841,6 +4856,7 @@ function maintainCoreHolding() {
   const target = totalValue * effectiveCoreFraction();
 
   portfolio.cash -= cost;
+  rebasePeakForCoreFlow(cost);          // allocation, not a loss
   portfolio.coreHolding = portfolio.coreHolding || {};
   const lot = portfolio.coreHolding[pick.sym];
   if (lot && lot.qty > 0) {
@@ -4858,6 +4874,7 @@ function maintainCoreHolding() {
     // lie — roll it back rather than letting ATLAS believe it owns shares it does not.
     const rollback = (why) => {
       portfolio.cash += cost;
+      rebasePeakForCoreFlow(-cost);     // undo the rebase along with the debit
       const l = (portfolio.coreHolding || {})[pick.sym];
       if (l) {
         l.qty -= qty; l.investedCash -= cost;
@@ -5488,11 +5505,22 @@ function logDailyTradeDigest() {
   if (traded > 0) {
     console.log(`[DAY] ${day}: ${traded} trade(s) opened.` +
                 (top.length ? `  Most common block: ${top[0][0]} (${top[0][1]}×)` : ''));
-  } else {
-    console.log(`[DAY] ${day}: NO TRADES. The goal is to trade daily within profit parameters — here is what stopped it:`);
-    if (!top.length) console.log(`       nothing was even evaluated (market closed, data missing, or entries halted).`);
-    top.forEach(([r, n]) => console.log(`       ${String(n).padStart(4)}×  ${r}`));
+    return;
   }
+  console.log(`[DAY] ${day}: NO TRADES. Here is what stopped it:`);
+  // The phase gate returns BEFORE any candidate is evaluated, so no rejection reasons
+  // are recorded and the digest fell back to "market closed, data missing, or entries
+  // halted" — three guesses, none of them the actual answer. When trading is gated on
+  // purpose, say so, and say how far off the unlock is.
+  if (PHASE_GATE_ENABLED && CORE_HOLD_ON && tradingPhaseLocked()) {
+    const funds = tradingFundsAvailable();
+    console.log(`       PHASE GATE — trading is intentionally locked. The holding side has earned ` +
+                `$${funds.toFixed(2)} of the $${TRADING_UNLOCK_USD.toFixed(2)} needed. This is the ` +
+                `system working, not a fault: the core keeps buying and trimming meanwhile.`);
+    return;
+  }
+  if (!top.length) console.log(`       nothing was even evaluated (market closed, data missing, or entries halted).`);
+  top.forEach(([r, n]) => console.log(`       ${String(n).padStart(4)}×  ${r}`));
 }
 
 function recordRejection(plan, reason) {
@@ -7731,7 +7759,7 @@ module.exports = {
     extractJsonArray, extractJsonObject, affordableMaxPrice, MAX_SINGLE_SHARE_FRACTION, fetchBars,
     FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
     CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore,
-    CORE_PHASE1_FRACTION, effectiveCoreFraction,
+    CORE_PHASE1_FRACTION, effectiveCoreFraction, rebasePeakForCoreFlow,
     mostOverweightCore, trimCoreHolding, CORE_TRIM_BAND, coreHaltedByOperator,
     setCorePaused: (v) => { CORE_PAUSED = !!v; }, coreHoldingValue, maintainCoreHolding, coreTopUpQty,
     logDailyTradeDigest, rejectionBucket, noteDailyRejection, tradableValue, wouldExceedHeat,

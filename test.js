@@ -1745,6 +1745,51 @@ function setTradingFunds(usd) {
   }
 }
 
+check('funding the core is not counted as a drawdown', () => {
+  // Trading drawdown is measured on (total - core) against a peak that starts at
+  // START_CAPITAL. Buying $571 of core therefore read as a 57% drawdown on an account
+  // that was UP $1.41 — tripping safe mode (10%), the emergency entry halt (20%) and
+  // the risk-level check (20%) at once, and pinning every self-check to "High drawdown".
+  const sc = I.portfolio.cash, sh = I.portfolio.coreHolding, sp = I.riskSystem.peakValue;
+  I.portfolio.cash = 1000; I.portfolio.coreHolding = {}; I.riskSystem.peakValue = 1000;
+  I.marketData.__PEAK = { price: 100, prevClose: 100, lastUpdate: Date.now() };
+  for (let i = 0; i < 6; i++) { I.portfolio.cash -= 95; I.rebasePeakForCoreFlow(95); }
+  I.portfolio.coreHolding.__PEAK = { qty: 5.7, avgPrice: 100, investedCash: 570 };
+  const trading = I.getTotalValue() - I.coreHoldingValue();
+  const dd = (I.riskSystem.peakValue - trading) / Math.max(1, I.riskSystem.peakValue);
+  ok(dd < 0.02, `moving cash into the core must not register as a loss, got ${(dd*100).toFixed(1)}% drawdown`);
+  // And trimming back must restore the peak, or the next core buy would double-count.
+  I.portfolio.cash += 200; I.rebasePeakForCoreFlow(-200);
+  ok(Math.abs(I.riskSystem.peakValue - 630) < 0.01,
+     `a trim must restore the peak symmetrically, got ${I.riskSystem.peakValue.toFixed(2)}`);
+  I.portfolio.cash = sc; I.portfolio.coreHolding = sh; I.riskSystem.peakValue = sp;
+  delete I.marketData.__PEAK;
+
+  // ASSERT THE CALL SITES, not just the helper. This test drove the helper directly,
+  // so deleting the calls from the buy and trim paths passed it — the fourth time in
+  // this project that testing a function instead of its wiring hid a live defect.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const buy  = src.slice(src.indexOf('function maintainCoreHolding'), src.indexOf('\nfunction processProfitVault'));
+  const trim = src.slice(src.indexOf('async function trimCoreHolding'), src.indexOf('function maintainCoreHolding'));
+  ok(/rebasePeakForCoreFlow\(cost\);/.test(buy), 'a core BUY must rebase the peak');
+  ok(/rebasePeakForCoreFlow\(-cost\);/.test(buy), 'and its rollback must undo that');
+  ok(/rebasePeakForCoreFlow\(-proceeds\);/.test(trim), 'a core TRIM must restore the peak');
+  ok(/rebasePeakForCoreFlow\(proceeds\);/.test(trim), 'and its rollback must undo that');
+});
+
+check('a zero-trade day names the phase gate rather than guessing', () => {
+  // The gate returns before any candidate is evaluated, so no rejection reasons are
+  // recorded and the digest printed "market closed, data missing, or entries halted"
+  // — three guesses, none of them the reason.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fn = src.slice(src.indexOf('function logDailyTradeDigest'), src.indexOf('function recordRejection'));
+  ok(/PHASE GATE — trading is intentionally locked/.test(fn),
+     'the digest must name the phase gate when that is the reason');
+  ok(/tradingFundsAvailable\(\)/.test(fn), 'and report how far off the unlock is');
+  ok(fn.indexOf('PHASE GATE') < fn.indexOf('nothing was even evaluated'),
+     'the specific reason must be checked BEFORE the generic fallback');
+});
+
 check('the unlock step-down actually reaches the new weight', () => {
   // At unlock the core must fall from CORE_PHASE1_FRACTION to CORE_HOLD_FRACTION. That
   // is a large sale — ~$474 on a $1047 account — and it happens through the ordinary
