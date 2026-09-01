@@ -2422,6 +2422,19 @@ const CORE_PHASE1_FRACTION = Math.max(0, Math.min(0.95,
 // Only top up when meaningfully below target, so a drifting price does not generate
 // a stream of tiny orders that pay spread for nothing.
 const CORE_REBALANCE_BAND = 0.10;
+// Is the unlock step-down big enough for the trim to actually execute it? The core
+// falls from CORE_PHASE1_FRACTION to CORE_HOLD_FRACTION when trading unlocks, and it
+// does so through the ordinary trim — which only acts once a name is CORE_TRIM_BAND
+// above its target. Set the two fractions close together (CORE_HOLD_FRACTION=0.9
+// against a 0.95 phase-1 weight is only 5pp) and every name sits inside the band, so
+// nothing sells, and trading unlocks into an account with no cash to trade. That is the
+// band working as designed — but silently, and the operator would have no way to tell
+// the difference between "waiting" and "will never happen".
+function unlockStepDownIsActionable() {
+  if (!CORE_HOLD_ON) return true;
+  if (!(CORE_HOLD_FRACTION > 0)) return true;
+  return (CORE_PHASE1_FRACTION - CORE_HOLD_FRACTION) / CORE_HOLD_FRACTION > CORE_TRIM_BAND;
+}
 // TRIM BAND — how far above its slice a holding may drift before the excess is sold.
 // This is how the core BANKS PROFIT without anyone deciding a stock is "high". A name
 // that runs turns into cash automatically; a name that lags gets bought with it. That
@@ -2558,9 +2571,14 @@ let _lastBasketProposalAt = 0;
 // Set once Venus has actually delivered a basket. Until then, venus mode buys nothing.
 let _venusBasketReceived = false;
 let _coreWaitLogAt = 0;
+let _trimWaitLogAt = 0;
 // Core buys submitted to the broker but not yet acknowledged. Guards the check-then-act
 // race that the faster cadence below would otherwise reopen.
 let _coreBuyInFlight = 0;
+// Core cash committed since the last broker snapshot. The mirror refreshes on a timer,
+// so orders placed between refreshes are invisible to it; without tracking them the
+// funding check would clear the same dollars over and over.
+let _coreCommittedSinceMirror = 0;
 
 // HOW FAST THE BASKET FILLS. One name every five minutes needed 50 minutes to build ten
 // names, and Venus only proposes late in the session — so the account spent Monday
@@ -4787,14 +4805,6 @@ function coreWeightMap(symbols = CORE_HOLD_SYMBOLS, conv = CORE_CONVICTION) {
   return out;
 }
 
-// This name's share of the core right now. Falls back to equal weight for anything
-// not in the basket, so an orphaned holding is never handed a tilted target.
-function coreShareOf(sym, symbols = CORE_HOLD_SYMBOLS) {
-  const w = coreWeightMap(symbols);
-  const n = Math.max(1, (symbols || []).length);
-  return Number.isFinite(w[sym]) ? w[sym] : 1 / n;
-}
-
 // How much to add IN TOTAL to reach the target weight. Pure, so the sizing decision is
 // testable without a live market. TOP-UP ONLY: never returns a sell, because the
 // measured advantage of holding comes precisely from not reacting.
@@ -4912,6 +4922,22 @@ async function trimCoreHolding() {
   if (!CORE_HOLD_ON) return;
   if (!getCurrentMarket()) return;
   if (coreHaltedByOperator()) return;
+  // THE SAME GUARD THE BUY SIDE HAS, AND FOR A WORSE REASON. maintainCoreHolding
+  // refuses to act in venus mode until a proposal exists, so it cannot buy the default
+  // basket by mistake. The trim had no such check — and its mistake is not buying the
+  // wrong thing, it is SELLING the right thing: with no proposal yet, every holding
+  // Venus picked reads as off-basket, whose target is zero, so the trim liquidates it.
+  // The saved basket now prevents this on any normal restart; this is the backstop for
+  // when there is no state to restore — a fresh volume, a wiped file, a first boot with
+  // positions already at the broker.
+  if (CORE_BASKET_SOURCE === 'venus' && !_venusBasketReceived) {
+    if (Date.now() - (_trimWaitLogAt || 0) > 600000) {
+      _trimWaitLogAt = Date.now();
+      console.log('[CORE] Trim paused until Venus proposes (CORE_BASKET_SOURCE=venus) — ' +
+                  'without a live basket every holding would look off-basket and be sold out.');
+    }
+    return;
+  }
   const tv = getTotalValue();
 
   // 1. The arithmetic rule ALWAYS runs first and is never overridden.
@@ -5044,9 +5070,28 @@ function coreBuyStep() {
 
   const cost = qty * pick.px;
   if (cost > portfolio.cash) return false;
+
+  // CAN THE BROKER ACTUALLY PAY? The core has always sized against ATLAS's own ledger,
+  // and syncFromBroker only reconciles cash at BOOT — so intraday the two drift apart
+  // on fill slippage. At one buy every five minutes that drift was irrelevant. At four
+  // a minute the core can now issue a whole basket's worth of orders between
+  // reconciliations, and ordering against cash the broker does not have is exactly what
+  // produced 1,800 rejections an hour on the trading side before RULE 3.2 existed.
+  // Same rules as that gate: fractional orders get no margin so they are checked against
+  // CASH, and a stale mirror is treated as unknown rather than guessed at.
+  const mirrorAge = Date.now() - (brokerMirror.at || 0);
+  if (brokerMirror.ok && Number.isFinite(brokerMirror.cash) && mirrorAge < BROKER_MIRROR_MAX_AGE_MS) {
+    const bp = Number.isFinite(brokerMirror.buying_power) ? brokerMirror.buying_power : brokerMirror.cash;
+    const fundable = isFractionalQty(qty) ? brokerMirror.cash : Math.min(brokerMirror.cash, bp);
+    // Everything this cycle has already committed but the snapshot cannot know about.
+    const committed = _coreCommittedSinceMirror + pendingEntryNotional();
+    if (cost > (fundable - committed) * 0.98) return false;
+  }
+
   const target = totalValue * effectiveCoreFraction();
 
   portfolio.cash -= cost;
+  _coreCommittedSinceMirror += cost;    // invisible to the mirror until it next refreshes
   rebasePeakForCoreFlow(cost);          // allocation, not a loss
   portfolio.coreHolding = portfolio.coreHolding || {};
   const lot = portfolio.coreHolding[pick.sym];
@@ -5065,6 +5110,7 @@ function coreBuyStep() {
     // lie — roll it back rather than letting ATLAS believe it owns shares it does not.
     const rollback = (why) => {
       portfolio.cash += cost;
+      _coreCommittedSinceMirror = Math.max(0, _coreCommittedSinceMirror - cost);
       rebasePeakForCoreFlow(-cost);     // undo the rebase along with the debit
       const l = (portfolio.coreHolding || {})[pick.sym];
       if (l) {
@@ -5637,6 +5683,10 @@ async function refreshBrokerMirror() {
       buying_power: acct.ok ? acct.buying_power : null,
       positions: pos.ok ? pos.positions : []
     };
+    // A fresh snapshot already reflects every core buy the broker has processed, so the
+    // running commitment total starts over. Without this reset it would grow without
+    // bound and eventually block the core from buying anything at all.
+    _coreCommittedSinceMirror = 0;
   } catch (e) { brokerMirror = { at: Date.now(), ok: false, error: e.message }; }
 }
 
@@ -6385,6 +6435,15 @@ function buildStateObject() {
     shortPositions: portfolio.shortPositions,
     trades:         portfolio.trades.slice(-500),
     coreHolding:    portfolio.coreHolding,
+    // THE BASKET ITSELF, not just the shares in it. In venus mode the live basket is
+    // chosen at runtime and existed only in memory — so a restart reverted
+    // CORE_HOLD_SYMBOLS to the env default while the HOLDINGS stayed as Venus picked
+    // them. Every holding outside the default list then read as off-basket, whose
+    // target is zero, and the trim sold it out completely. On Monday's book that is
+    // PFE and BAC — $192.21, 19.2% of the account — liquidated on any restart during
+    // market hours and repurchased minutes later when Venus proposed again.
+    coreBasket:     (CORE_BASKET_SOURCE === 'venus' && _venusBasketReceived) ? [...CORE_HOLD_SYMBOLS] : null,
+    coreConviction: CORE_CONVICTION,
     closedTrades:   portfolio.closedTrades.slice(-500),
     marketTransition: marketTransitionData,
     capitalSystem,
@@ -6544,6 +6603,23 @@ function loadState() {
           if (lot && typeof lot === 'object' && Number.isFinite(lot.qty) && lot.qty > 0
               && Number.isFinite(lot.avgPrice) && lot.avgPrice > 0) portfolio.coreHolding[sym] = lot;
         }
+      }
+    }
+    // Restore the live basket BEFORE any interval can fire, or the first trim pass
+    // measures Venus's holdings against the env default and sells everything that does
+    // not appear in it. Only in venus mode: with a fixed basket the env is authoritative
+    // and a stale saved list must never override an operator's edit.
+    if (CORE_BASKET_SOURCE === 'venus' && Array.isArray(state.coreBasket)) {
+      const restored = state.coreBasket
+        .map(s => String(s || '').toUpperCase().trim())
+        .filter(s => /^[A-Z.]{1,6}$/.test(s));
+      if (restored.length) {
+        CORE_HOLD_SYMBOLS.length = 0; CORE_HOLD_SYMBOLS.push(...new Set(restored));
+        const cv = state.coreConviction;
+        CORE_CONVICTION = (cv && typeof cv === 'object' && !Array.isArray(cv)) ? cv : {};
+        _venusBasketReceived = true;
+        console.log(`[LOAD] Restored Venus basket (${CORE_HOLD_SYMBOLS.join(',')}) — ` +
+                    `without this the trim would sell every holding outside the default list`);
       }
     }
     marketTransitionData      = state.marketTransition ?? marketTransitionData;
@@ -7769,8 +7845,20 @@ if (require.main === module) app.listen(PORT, async () => {
                 ? `core holding ${(effectiveCoreFraction()*100).toFixed(0)}% now` +
                   (PHASE_GATE_ENABLED && tradingPhaseLocked()
                     ? ` (steps to ${(CORE_HOLD_FRACTION*100).toFixed(0)}% when trading unlocks)` : '') +
-                  ` across ${CORE_HOLD_SYMBOLS.length} names${CORE_BASKET_SOURCE === 'venus' ? ' — awaiting Venus\'s picks' : ` (${CORE_HOLD_SYMBOLS.slice(0,4).join(',')}${CORE_HOLD_SYMBOLS.length>4?'…':''})`}`
+                  // "awaiting Venus's picks" is only true when there is no live basket.
+                  // After a restart the basket is restored from state, and printing
+                  // "awaiting" then describes a state the bot is not in — the same
+                  // misleading-first-log problem the phase-1 weight above already fixed.
+                  ` across ${CORE_HOLD_SYMBOLS.length} names${(CORE_BASKET_SOURCE === 'venus' && !_venusBasketReceived) ? ' — awaiting Venus\'s picks' : ` (${CORE_HOLD_SYMBOLS.slice(0,4).join(',')}${CORE_HOLD_SYMBOLS.length>4?'…':''}${CORE_BASKET_SOURCE === 'venus' ? ', restored' : ''})`}`
                 : `core holding OFF (set CORE_HOLD_FRACTION=0.5 to hold half across ${CORE_HOLD_SYMBOLS.length} names)`));
+  if (CORE_HOLD_ON && PHASE_GATE_ENABLED && !unlockStepDownIsActionable()) {
+    console.warn(`[CONFIG] ⚠️  CORE_HOLD_FRACTION=${CORE_HOLD_FRACTION} sits only ` +
+      `${((CORE_PHASE1_FRACTION - CORE_HOLD_FRACTION) * 100).toFixed(0)}pp below the phase-1 weight ` +
+      `(${(CORE_PHASE1_FRACTION * 100).toFixed(0)}%), which is inside the ${(CORE_TRIM_BAND * 100).toFixed(0)}% trim band. ` +
+      `When trading unlocks, the step-down will free little or NO cash — the trim correctly ` +
+      `refuses to pay spread for a move that small, so trading would unlock with nothing to ` +
+      `trade. Lower CORE_HOLD_FRACTION (0.5 is the tested value) or raise CORE_TRIM_BAND.`);
+  }
 
   // ── Wire JUPITER to Terra's live state + indicator helpers ──
   // (Objects are shared by reference, so Jupiter always reads current values.)
@@ -7955,13 +8043,17 @@ module.exports = {
     extractJsonArray, extractJsonObject, affordableMaxPrice, MAX_SINGLE_SHARE_FRACTION, fetchBars,
     FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
     CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore,
-    CORE_PHASE1_FRACTION, effectiveCoreFraction, rebasePeakForCoreFlow,
-    coreWeightMap, coreShareOf, coreBuyStep, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS,
+    CORE_PHASE1_FRACTION, effectiveCoreFraction, rebasePeakForCoreFlow, unlockStepDownIsActionable,
+    coreWeightMap, coreBuyStep, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS,
     CORE_TILT_ON, CORE_TILT_STRENGTH, CORE_TILT_MAX, CORE_TILT_MIN, CORE_TILT_MAX_SHARE,
     getCoreConviction: () => CORE_CONVICTION,
     setCoreConviction: (v) => { CORE_CONVICTION = (v && typeof v === 'object') ? v : {}; },
     mostOverweightCore, trimCoreHolding, CORE_TRIM_BAND, coreHaltedByOperator,
     setCorePaused: (v) => { CORE_PAUSED = !!v; }, coreHoldingValue, maintainCoreHolding, coreTopUpQty,
+    // Test-only: lets the suite exercise the core's broker funding gate for real
+    // instead of asserting only that its source text exists.
+    setBrokerMirror: (m) => { brokerMirror = m; },
+    resetCoreCommitted: () => { _coreCommittedSinceMirror = 0; },
     logDailyTradeDigest, rejectionBucket, noteDailyRejection, tradableValue, wouldExceedHeat,
     noteEntryRejection, entriesPausedByBroker, clearEntryRejectBackoff, entryPauseRemainingMs, pendingEntryNotional,
     tradingPhaseLocked, tradingCapitalAllowed, PHASE_GATE_ENABLED, TRADING_UNLOCK_USD, TRADING_PROFIT_SHARE,

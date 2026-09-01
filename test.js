@@ -1796,6 +1796,12 @@ check('the unlock step-down actually reaches the new weight', () => {
   // trim, one name per cycle. If it stalled, the core would sit at 95% forever and
   // trading would have no cash to use.
   if (!I.CORE_HOLD_ON || !I.PHASE_GATE_ENABLED) { ok(true, 'gate not configured'); return; }
+  // With CORE_HOLD_FRACTION set close to the phase-1 weight the step-down is smaller
+  // than the trim band, so NOTHING sells — correctly, because paying spread to move a
+  // few points is exactly what the band exists to prevent. Asserting a step-down here
+  // would be asserting that the band is broken. The engine warns about this config at
+  // boot; the test declines to run rather than reporting a false failure.
+  if (!I.unlockStepDownIsActionable()) { ok(true, 'step-down is inside the trim band — see the boot warning'); return; }
   const sc = I.portfolio.cash, sh = I.portfolio.coreHolding, sd = I.capitalSystem.tradingDrawn;
   const su = I.capitalSystem.tradingUnlocked, saved = {};
   I.capitalSystem.tradingDrawn = 0; I.capitalSystem.tradingUnlocked = false;
@@ -2258,6 +2264,62 @@ check('the core fills the basket in minutes, not an hour', () => {
   ok(minutesToFill <= 5, `a 10-name basket must fill within 5 minutes, takes ${minutesToFill.toFixed(1)}`);
 });
 
+check('the buy loop actually deploys the account and then stops', () => {
+  // Everything else about this change is asserted on SOURCE. This runs it: an empty
+  // basket, $1000, and nothing but repeated coreBuyStep calls — the same thing the
+  // interval does. Source assertions prove the loop is wired; only this proves the
+  // wiring converges instead of over-buying, stalling, or looping forever.
+  if (!I.CORE_HOLD_ON) return;
+  // HARD SAFETY: coreBuyStep submits to the broker when LIVE_TRADING is on. Never let
+  // a test place a real order, even against a paper account.
+  if (String(process.env.LIVE_TRADING).toLowerCase() === 'true') return;
+
+  const saved = {
+    cash: I.portfolio.cash, core: I.portfolio.coreHolding,
+    peak: I.riskSystem.peakValue, longs: I.portfolio.longPositions,
+    shorts: I.portfolio.shortPositions, md: {},
+  };
+  const syms = I.CORE_HOLD_SYMBOLS;
+  syms.forEach(s => { saved.md[s] = I.marketData[s];
+    I.marketData[s] = { price: 100, prevClose: 100, lastUpdate: Date.now() }; });
+  I.portfolio.longPositions = {}; I.portfolio.shortPositions = {};
+  I.portfolio.coreHolding = {}; I.portfolio.cash = 1000; I.riskSystem.peakValue = 1000;
+
+  let steps = 0, negativeCash = false;
+  while (steps < 60 && I.coreBuyStep()) {
+    steps++;
+    if (I.portfolio.cash < 0) negativeCash = true;
+  }
+  const total = I.getTotalValue();
+  const core = I.coreHoldingValue();
+  const deployed = total > 0 ? core / total : 0;
+  const targetFrac = I.effectiveCoreFraction();
+  const names = Object.keys(I.portfolio.coreHolding).length;
+  const w = I.coreWeightMap();
+  let worstOver = 0;
+  for (const [sym, lot] of Object.entries(I.portfolio.coreHolding)) {
+    const share = (lot.qty * 100) / Math.max(1e-9, core);
+    worstOver = Math.max(worstOver, share - (w[sym] ?? 1 / syms.length));
+  }
+  const endCash = I.portfolio.cash;
+
+  Object.assign(I.portfolio, { cash: saved.cash, coreHolding: saved.core,
+                               longPositions: saved.longs, shortPositions: saved.shorts });
+  I.riskSystem.peakValue = saved.peak;
+  syms.forEach(s => { if (saved.md[s]) I.marketData[s] = saved.md[s]; else delete I.marketData[s]; });
+
+  ok(!negativeCash, 'cash must never go negative while the loop runs');
+  ok(steps < 60, `the loop must terminate on its own, ran ${steps} steps`);
+  ok(names === syms.length, `every name must be opened, got ${names} of ${syms.length}`);
+  ok(Math.abs(deployed - targetFrac) < 0.02,
+     `must deploy to ${(targetFrac*100).toFixed(0)}%, reached ${(deployed*100).toFixed(1)}%`);
+  ok(endCash >= 0 && endCash < 1000 * (1 - targetFrac) + 5,
+     `leftover cash should be the undeployed remainder, got $${endCash.toFixed(2)}`);
+  ok(worstOver < 0.02, `no name may overshoot its share by more than 2pp, worst was ${(worstOver*100).toFixed(1)}pp`);
+  // And once full it must report "nothing to do" rather than churning.
+  ok(steps >= syms.length, `it must take at least one step per name, took ${steps}`);
+});
+
 check('faster core buying does not reopen the check-then-act race', () => {
   // The ledger is debited synchronously; the broker leg resolves later. At five-minute
   // spacing a second tick could not overlap in-flight orders. At sixty seconds with
@@ -2299,6 +2361,152 @@ check('Venus conviction is a screen score with a safe default, never a forecast'
   // 0.5 must genuinely be the neutral point, or the default silently tilts.
   const neutral = I.coreWeightMap(['A', 'B', 'C', 'D'], { A: 0.5, B: 0.5, C: 0.5, D: 0.5 });
   ok(Math.abs(neutral.A - 0.25) < 1e-9, '0.5 conviction must map to exactly equal weight');
+});
+
+check('core buys are checked against the broker, not only the ledger', () => {
+  // The core has always sized against ATLAS's own ledger, and syncFromBroker reconciles
+  // cash only at BOOT — so intraday the two drift apart on fill slippage. One buy every
+  // five minutes made that irrelevant; four a minute can issue a whole basket's worth of
+  // orders between reconciliations. Ordering against cash the broker does not have is
+  // what produced 1,800 rejections an hour on the trading side before RULE 3.2.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function coreBuyStep'), src.indexOf('function processProfitVault'));
+  ok(/brokerMirror\.ok && Number\.isFinite\(brokerMirror\.cash\)/.test(fn),
+     'the core must consult the broker mirror before committing cash');
+  ok(/mirrorAge < BROKER_MIRROR_MAX_AGE_MS/.test(fn),
+     'a stale mirror must be treated as unknown, not trusted');
+  ok(/isFractionalQty\(qty\) \? brokerMirror\.cash : Math\.min\(brokerMirror\.cash, bp\)/.test(fn),
+     'fractional orders get no margin and must be checked against cash');
+  // The snapshot cannot see orders placed since it was taken. Without tracking them the
+  // same dollars clear the gate on every pass of the loop.
+  ok(/_coreCommittedSinceMirror \+= cost;/.test(fn), 'a committed buy must be recorded against the snapshot');
+  ok(/const committed = _coreCommittedSinceMirror \+ pendingEntryNotional\(\);/.test(fn),
+     'the gate must subtract what is already committed, including trading entries');
+  // THE LINE THAT ACTUALLY REFUSES. Everything above only computes numbers; deleting
+  // this one leaves the whole gate in place as decoration, and the suite passed with it
+  // gone until this assertion existed.
+  ok(/if \(cost > \(fundable - committed\) \* 0\.98\) return false;/.test(fn),
+     'the gate must actually refuse the buy, not merely compute what it could afford');
+  ok(/_coreCommittedSinceMirror = Math\.max\(0, _coreCommittedSinceMirror - cost\)/.test(fn),
+     'a rolled-back buy must release its commitment');
+  // And the counter must reset when a fresh snapshot arrives, or it grows without bound
+  // and eventually blocks the core from ever buying again.
+  // Anchored to the function's own closing brace rather than to whatever happens to be
+  // declared next — refreshBrokerMirror sits AFTER syncFromBroker, so slicing between
+  // them ran backwards and asserted against an empty string.
+  const mStart = src.indexOf('async function refreshBrokerMirror');
+  const mirror = src.slice(mStart, src.indexOf('\n}', mStart));
+  ok(mStart > 0 && mirror.includes('brokerMirror = {'), 'the mirror slice must contain the function body');
+  ok(/_coreCommittedSinceMirror = 0;/.test(mirror),
+     'a fresh broker snapshot must reset the running commitment total');
+
+  // BEHAVIOURAL: a broker that cannot fund the buy must stop it.
+  if (!I.CORE_HOLD_ON) return;
+  if (String(process.env.LIVE_TRADING).toLowerCase() === 'true') return;
+  const saved = { cash: I.portfolio.cash, core: I.portfolio.coreHolding, peak: I.riskSystem.peakValue,
+                  longs: I.portfolio.longPositions, shorts: I.portfolio.shortPositions, md: {} };
+  const syms = I.CORE_HOLD_SYMBOLS;
+  syms.forEach(s => { saved.md[s] = I.marketData[s];
+    I.marketData[s] = { price: 100, prevClose: 100, lastUpdate: Date.now() }; });
+  I.portfolio.longPositions = {}; I.portfolio.shortPositions = {};
+  I.portfolio.coreHolding = {}; I.portfolio.cash = 1000; I.riskSystem.peakValue = 1000;
+  I.resetCoreCommitted();
+
+  // The LEDGER says $1000. The BROKER says $3. Only the broker is real.
+  I.setBrokerMirror({ at: Date.now(), ok: true, cash: 3, buying_power: 3, equity: 1000, positions: [] });
+  const blocked = I.coreBuyStep();
+  const boughtWhileBroke = Object.keys(I.portfolio.coreHolding).length;
+
+  // A stale snapshot must NOT block — the gate stands down rather than guessing.
+  I.setBrokerMirror({ at: Date.now() - 60 * 60 * 1000, ok: true, cash: 3, buying_power: 3, positions: [] });
+  const staleAllows = I.coreBuyStep();
+
+  I.setBrokerMirror({ at: 0, ok: false });
+  I.resetCoreCommitted();
+  Object.assign(I.portfolio, { cash: saved.cash, coreHolding: saved.core,
+                               longPositions: saved.longs, shortPositions: saved.shorts });
+  I.riskSystem.peakValue = saved.peak;
+  syms.forEach(s => { if (saved.md[s]) I.marketData[s] = saved.md[s]; else delete I.marketData[s]; });
+
+  ok(blocked === false, 'a buy the broker cannot fund must be refused');
+  ok(boughtWhileBroke === 0, 'and nothing may be written to the ledger when it is refused');
+  ok(staleAllows === true, 'a stale snapshot must not block the core — unknown is not the same as broke');
+  // The reset must land on the SUCCESS path. Resetting in the catch too would clear the
+  // commitment record on a snapshot that never arrived, re-clearing spent cash.
+  ok(!/catch \(e\) \{ brokerMirror = \{ at: Date\.now\(\), ok: false, error: e\.message \}; _coreCommittedSinceMirror = 0/.test(mirror),
+     'a FAILED refresh must not reset the commitment total');
+});
+
+check('a step-down too small for the trim band is warned about, not left silent', () => {
+  // The core falls from CORE_PHASE1_FRACTION to CORE_HOLD_FRACTION at unlock, through
+  // the ordinary trim — which only acts once a name is CORE_TRIM_BAND above target. Set
+  // the two close together and every name sits inside the band, so nothing sells and
+  // trading unlocks into an account with no cash. That is the band working correctly,
+  // but the operator cannot tell "waiting" from "will never happen" without being told.
+  ok(I.unlockStepDownIsActionable() === ((I.CORE_PHASE1_FRACTION - I.CORE_HOLD_FRACTION) / I.CORE_HOLD_FRACTION > I.CORE_TRIM_BAND)
+     || !I.CORE_HOLD_ON,
+     'the check must compare the step-down against the trim band');
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/if \(CORE_HOLD_ON && PHASE_GATE_ENABLED && !unlockStepDownIsActionable\(\)\)/.test(src),
+     'the boot banner must warn when the configured step-down cannot execute');
+  ok(/free little or NO cash/.test(src), 'and say plainly what will happen');
+  // The condition must be a real comparison, not a constant.
+  ok(/\(CORE_PHASE1_FRACTION - CORE_HOLD_FRACTION\) \/ CORE_HOLD_FRACTION > CORE_TRIM_BAND/.test(src),
+     'the threshold must be derived from the trim band, not hard-coded');
+});
+
+check('a restart does not liquidate the basket Venus chose', () => {
+  // THE WORST BUG FOUND IN THIS PASS, and it predates the conviction work. In venus
+  // mode the live basket existed only in memory. A restart reverted CORE_HOLD_SYMBOLS
+  // to the env default while the HOLDINGS stayed as Venus picked them — so every
+  // holding outside the default list read as off-basket, whose target is zero, and the
+  // trim sold it out completely. maintainCoreHolding was guarded against acting before
+  // a proposal; trimCoreHolding was not, and its mistake is the expensive direction.
+  // On Monday's book: PFE and BAC, $192.21, 19.2% of the account, sold on any restart
+  // during market hours and repurchased minutes later at a fresh spread.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+
+  // 1. The basket must be persisted, not just the shares in it.
+  ok(/coreBasket:\s+\(CORE_BASKET_SOURCE === 'venus' && _venusBasketReceived\) \? \[\.\.\.CORE_HOLD_SYMBOLS\] : null/.test(src),
+     'the live basket must be saved in venus mode');
+  ok(/coreConviction: CORE_CONVICTION/.test(src), 'and the conviction that sized it');
+  // Saved only in venus mode: a stale list must never override an operator's env edit.
+  ok(!/coreBasket:\s+\[\.\.\.CORE_HOLD_SYMBOLS\],/.test(src),
+     'the basket must not be saved unconditionally — a fixed basket is env-authoritative');
+
+  // 2. It must be restored BEFORE any interval can fire.
+  const loadIdx = src.indexOf('CORE_HOLD_SYMBOLS.push(...new Set(restored))');
+  const startIdx = src.indexOf('setInterval(maintainCoreHolding');
+  ok(loadIdx > 0 && loadIdx < startIdx, 'the basket must be restored before the core intervals start');
+
+  // 3. And the trim must refuse to run with no live basket, whatever the state file says.
+  const trim = src.slice(src.indexOf('async function trimCoreHolding'), src.indexOf('function maintainCoreHolding'));
+  ok(/CORE_BASKET_SOURCE === 'venus' && !_venusBasketReceived/.test(trim),
+     'the trim must wait for a live basket, exactly as the buy side does');
+  const guardIdx = trim.indexOf("CORE_BASKET_SOURCE === 'venus'");
+  const pickIdx = trim.indexOf('mostOverweightCore');
+  ok(guardIdx > 0 && guardIdx < pickIdx, 'the guard must run before anything is selected for sale');
+
+  // 4. Behavioural: an off-basket name IS still fully exited when the basket is live —
+  //    the guard must not have neutered the mechanism that removes genuinely dropped names.
+  if (!I.CORE_HOLD_ON) return;
+  const savedCore = I.portfolio.coreHolding, saved = {};
+  I.CORE_HOLD_SYMBOLS.forEach(s => { saved[s] = I.marketData[s];
+    I.marketData[s] = { price: 100, prevClose: 100, lastUpdate: Date.now() };
+    I.portfolio.coreHolding = I.portfolio.coreHolding || {}; });
+  I.portfolio.coreHolding = {};
+  I.CORE_HOLD_SYMBOLS.forEach(s => { I.portfolio.coreHolding[s] = { qty: 0.5, avgPrice: 100, investedCash: 50 }; });
+  I.portfolio.coreHolding.__DROPPED = { qty: 5, avgPrice: 10, investedCash: 50 };
+  I.marketData.__DROPPED = { price: 30, prevClose: 30, lastUpdate: Date.now() };
+  const pick = I.mostOverweightCore(I.getTotalValue());
+  delete I.portfolio.coreHolding.__DROPPED; delete I.marketData.__DROPPED;
+  I.portfolio.coreHolding = savedCore;
+  I.CORE_HOLD_SYMBOLS.forEach(s => { if (saved[s]) I.marketData[s] = saved[s]; else delete I.marketData[s]; });
+  ok(pick && pick.sym === '__DROPPED' && pick.qty >= 5,
+     'a genuinely dropped name must still be exited in full');
 });
 
 check('conviction is adopted only with the basket it describes', () => {
@@ -2356,10 +2564,14 @@ check('venus basket mode buys nothing until Venus has actually proposed', () => 
      'the basket swap must sit inside an explicit CORE_BASKET_SOURCE=venus branch');
   ok(src.slice(branchIdx, branchEnd).includes('_venusBasketReceived = true'),
      'the flag must be set inside the branch that swaps the basket');
-  // And nowhere else — a second assignment outside the swap would let the core start
-  // buying the DEFAULT basket while believing it had Venus's.
-  ok(src.split('_venusBasketReceived = true').length - 1 === 1,
-     'the flag must be set in exactly one place');
+  // Exactly two legitimate places, and nowhere else — a stray assignment would let the
+  // core start buying the DEFAULT basket while believing it had Venus's.
+  ok(src.split('_venusBasketReceived = true').length - 1 === 2,
+     'the flag must be set in exactly two places: the basket swap and the state restore');
+  const loadIdx = src.indexOf('CORE_HOLD_SYMBOLS.push(...new Set(restored))');
+  ok(loadIdx > 0, 'the saved basket must be restored on load');
+  ok(src.slice(loadIdx, loadIdx + 400).includes('_venusBasketReceived = true'),
+     'restoring a saved basket must also mark it received, or the core waits for a proposal it already has');
 });
 
 check('an operator halt stops the core; an automatic one does not', () => {
