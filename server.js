@@ -1208,10 +1208,18 @@ Choose for:
 Explicitly do NOT choose for: recent price moves, momentum, news, hype, or your view of
 what will outperform. A boring, well-spread basket is the correct answer.
 
+For each pick also give a CONVICTION from 0 to 1. Conviction is NOT a prediction of
+return and must never be used as one. It measures one thing only: HOW WELL THIS NAME
+MEETS THE SCREEN ABOVE. A deeply liquid, plainly profitable, well-established business
+that also fills a sector gap in the basket scores near 1.0. A name you included because
+something had to fill the slot — thinner, more cyclical, more leveraged, or doubling up
+a sector you already hold — scores near 0.3. If every pick is equally solid, score them
+all the same; a flat set of scores is a valid and expected answer.
+
 Candidates: ${list}
 
 Output ONLY JSON:
-{"basket":["SYM", ...${size} symbols],"sectors":{"SYM":"sector"},"reasoning":"one sentence on the spread achieved"}`;
+{"basket":["SYM", ...${size} symbols],"sectors":{"SYM":"sector"},"conviction":{"SYM":0.0-1.0},"reasoning":"one sentence on the spread achieved"}`;
 
   const r = await llmReason(prompt);
   if (!r || !Array.isArray(r.basket)) return null;
@@ -1220,7 +1228,22 @@ Output ONLY JSON:
     .filter(x => /^[A-Z.]{1,6}$/.test(x) && candidates.includes(x));
   const unique = [...new Set(picked)];
   if (unique.length < Math.min(5, size)) return null;      // too thin to be a basket
-  return { basket: unique.slice(0, size), sectors: r.sectors || {}, reasoning: r.reasoning || '' };
+  const basket = unique.slice(0, size);
+  // CONVICTION IS A SCREEN-QUALITY SCORE, NOT A FORECAST, and that distinction is the
+  // reason this is safe to size on. Asking Venus how confident it is that a name will
+  // RISE reintroduces exactly the forecasting the prompt above forbids — and forecasting
+  // measured +0.005R at t=0.08 over 562 trades here, which is zero. Asking how well a
+  // name meets a durability-and-spread screen is a judgement about the company, not the
+  // price, and it is the judgement Venus is already being asked to make.
+  // Anything missing or unparseable becomes 0.5, which coreWeightMap treats as exactly
+  // equal weight — so a malformed reply degrades to the old $95-a-name behaviour rather
+  // than to a random tilt.
+  const conviction = {};
+  for (const sym of basket) {
+    const raw = Number(r.conviction?.[sym]);
+    conviction[sym] = Number.isFinite(raw) ? Math.max(0, Math.min(1, raw)) : 0.5;
+  }
+  return { basket, sectors: r.sectors || {}, conviction, reasoning: r.reasoning || '' };
 }
 
 // ── AI-ASSISTED TRIM (v11.39) ───────────────────────────────────────────────
@@ -2443,6 +2466,49 @@ function recordTrimDecision(rec) {
 // register says otherwise.
 const CORE_BASKET_SOURCE = (process.env.CORE_BASKET_SOURCE || 'fixed').toLowerCase();
 
+// ── CONVICTION WEIGHTING (v11.46) ───────────────────────────────────────────
+// Equal $95 slices are replaced by slices that lean toward the names Venus is most
+// confident in. The operator asked for this directly; the reason it is BOUNDED is
+// worth stating, because the measurement is unusually clear about the trade.
+//
+// Conviction was simulated at known correlations to the forward month, 16 runs each,
+// against the same 10-name basket over 6.1 years:
+//
+//     tilt cap    no skill      skill 0.05     skill 0.10
+//       13%       -0.2pp         +0.5pp         +1.6pp
+//       16%       -0.2pp         +1.2pp         +3.0pp
+//       25%       -0.2pp         +1.7pp         +4.6pp
+//       40%       -0.9pp         +2.2pp         +5.6pp
+//
+// The asymmetry is the whole argument: up to a ~25% cap, being COMPLETELY WRONG costs
+// about 0.2pp of CAGR, while being slightly right pays multiples of that. That makes a
+// bounded tilt close to a free option. Past ~40% the cost of being wrong starts to bite
+// and the position sizes stop looking like a basket.
+//
+// Jupiter's measured directional skill is +0.005R at t=0.08 over 562 trades — a
+// correlation of ~0.003, with a standard error of ~0.042. Break-even for the tilt sits
+// near 0.01. So the honest statement is that we CANNOT TELL whether this helps, the
+// confidence interval straddles break-even, and the reason to run it anyway is that
+// the loss if it is worthless is roughly a rounding error while the register finally
+// gets live data on whether conviction means anything at all.
+//
+// STRENGTH maps conviction 0..1 onto a weight multiplier: 0.5 -> 1.0x (equal weight),
+// 1.0 -> 1+S, 0.0 -> 1-S. With S=0.6 and ten names, the most-favoured name lands near
+// 15% of the core against an equal-weight 10% — inside the measured-safe range.
+const CORE_TILT_ON       = process.env.CORE_TILT !== 'false';
+const CORE_TILT_STRENGTH = Math.max(0, Math.min(0.8, parseFloat(process.env.CORE_TILT_STRENGTH || '0.6')));
+// Hard rails, applied after the tilt, as a multiple of equal weight. Even a conviction
+// of exactly 1.0 across one name cannot breach these.
+const CORE_TILT_MAX      = Math.max(1, Math.min(3, parseFloat(process.env.CORE_TILT_MAX || '1.8')));
+const CORE_TILT_MIN      = Math.max(0.1, Math.min(1, parseFloat(process.env.CORE_TILT_MIN || '0.5')));
+// The rail that actually binds: no single name may exceed this share of the core, no
+// matter what conviction pattern Venus returns. 0.25 is the edge of the range where a
+// completely wrong tilt still costs only ~0.2pp of CAGR.
+const CORE_TILT_MAX_SHARE = Math.max(0.1, Math.min(0.5, parseFloat(process.env.CORE_TILT_MAX_SHARE || '0.25')));
+// sym -> 0..1 conviction from Venus. Empty means equal weight, which is the default
+// state and the state after any restart until Venus proposes again.
+let CORE_CONVICTION = {};
+
 // ── PHASE GATE (v11.39) ─────────────────────────────────────────────────────
 // TWO PHASES, and the second one is funded by the first.
 //
@@ -2492,6 +2558,17 @@ let _lastBasketProposalAt = 0;
 // Set once Venus has actually delivered a basket. Until then, venus mode buys nothing.
 let _venusBasketReceived = false;
 let _coreWaitLogAt = 0;
+// Core buys submitted to the broker but not yet acknowledged. Guards the check-then-act
+// race that the faster cadence below would otherwise reopen.
+let _coreBuyInFlight = 0;
+
+// HOW FAST THE BASKET FILLS. One name every five minutes needed 50 minutes to build ten
+// names, and Venus only proposes late in the session — so the account spent Monday
+// 43% in cash. Four buys a minute fills the same basket in about three minutes.
+// The per-cycle cap is not timidity: each buy is a market order, and pacing them lets
+// the broker-rejection backoff engage before the whole allocation is committed.
+const CORE_BUYS_PER_CYCLE = Math.max(1, Math.min(10, parseInt(process.env.CORE_BUYS_PER_CYCLE || '4', 10)));
+const CORE_INTERVAL_MS    = Math.max(15000, parseInt(process.env.CORE_INTERVAL_MS || '60000', 10));
 const BASKET_LOG = 'atlas-basket-proposals.json';
 
 // Append-only record of what Venus proposed and when. The timestamp is the whole point:
@@ -3653,9 +3730,20 @@ async function runIntelCycle() {
           console.log(`[VENUS] 🧺 Basket proposal: ${prop.basket.join(',')}`);
           console.log(`[VENUS]    ${overlap}/${prop.basket.length} overlap with the live basket · ${prop.reasoning}`);
           recordBasketProposal(prop);
+          if (CORE_TILT_ON && prop.conviction) {
+            const w = coreWeightMap(prop.basket, prop.conviction);
+            const spread = Object.values(w);
+            console.log(`[VENUS]    conviction → weights ` +
+              prop.basket.map(s => `${s} ${(w[s] * 100).toFixed(1)}%`).join(' · '));
+            console.log(`[VENUS]    (equal weight would be ${(100 / prop.basket.length).toFixed(1)}% — ` +
+              `spread ${(Math.min(...spread) * 100).toFixed(1)}%–${(Math.max(...spread) * 100).toFixed(1)}%)`);
+          }
           if (CORE_BASKET_SOURCE === 'venus') {
             console.log(`[VENUS]    CORE_BASKET_SOURCE=venus — this proposal is now the live basket`);
             CORE_HOLD_SYMBOLS.length = 0; CORE_HOLD_SYMBOLS.push(...prop.basket);
+            // Conviction only takes effect on the basket it was written for. Carrying it
+            // across a basket change would size new names by a score describing old ones.
+            CORE_CONVICTION = prop.conviction || {};
             _venusBasketReceived = true;
           }
         }
@@ -4644,6 +4732,69 @@ function coreHoldingValue() {
   return v;
 }
 
+// Each basket member's share of the CORE, as a map summing to 1.
+//
+// Equal weight unless Venus has supplied conviction AND the tilt is enabled — so the
+// default, and the state after every restart, is the plain $95-a-name behaviour that
+// the rest of the system was measured against.
+//
+// Conviction is centred on 0.5 rather than on the basket mean. Centring on the mean
+// would force a tilt even when Venus is equally confident about all ten names: the
+// most-confident of ten identical names would still get a bigger slice, which is
+// noise amplification, not conviction. Centring on a fixed 0.5 means a uniformly
+// confident basket stays equal-weight, and only genuine spread moves money.
+//
+// Pure apart from its defaults, so the weighting is testable without a live market.
+function coreWeightMap(symbols = CORE_HOLD_SYMBOLS, conv = CORE_CONVICTION) {
+  const list = Array.isArray(symbols) && symbols.length ? symbols : [];
+  const n = Math.max(1, list.length);
+  const eq = 1 / n;
+  const out = {};
+  if (!CORE_TILT_ON || !conv || typeof conv !== 'object') {
+    for (const s of list) out[s] = eq;
+    return out;
+  }
+  const mult = list.map(s => {
+    const c = Number(conv[s]);
+    if (!Number.isFinite(c)) return 1;                       // no view = equal weight
+    const clamped = Math.max(0, Math.min(1, c));
+    const m = 1 + CORE_TILT_STRENGTH * (2 * clamped - 1);
+    return Math.max(CORE_TILT_MIN, Math.min(CORE_TILT_MAX, m));
+  });
+  const tot = mult.reduce((a, b) => a + b, 0);
+  if (!(tot > 0)) { for (const s of list) out[s] = eq; return out; }
+  let w = mult.map(m => m / tot);
+
+  // HARD RAIL ON THE FINAL SHARE. The per-name multiplier is bounded, but shares are
+  // normalised, so bounding the multiplier is not the same as bounding the result:
+  // rate one name 1.0 and the other nine 0.0 and the favourite lands at 30.8% of the
+  // core — outside the range where the measurement said a wrong tilt stays cheap
+  // (-0.2pp up to a ~25% cap, -0.9pp by 40%). Cap the share itself and give the excess
+  // back to the others, so no conviction pattern whatsoever can breach the tested zone.
+  // The cap can never sit below equal weight, or a small basket would be infeasible.
+  const cap = Math.max(CORE_TILT_MAX_SHARE, eq);
+  for (let pass = 0; pass < 6; pass++) {
+    const capped = w.map(x => Math.min(x, cap));
+    const deficit = 1 - capped.reduce((a, b) => a + b, 0);
+    if (deficit <= 1e-9) { w = capped; break; }
+    const room = capped.map((x, i) => (x < cap - 1e-9 ? i : -1)).filter(i => i >= 0);
+    if (!room.length) { w = capped; break; }
+    const roomTotal = room.reduce((s, i) => s + capped[i], 0);
+    w = capped;
+    for (const i of room) w[i] += deficit * (roomTotal > 0 ? capped[i] / roomTotal : 1 / room.length);
+  }
+  list.forEach((s, i) => { out[s] = w[i]; });
+  return out;
+}
+
+// This name's share of the core right now. Falls back to equal weight for anything
+// not in the basket, so an orphaned holding is never handed a tilted target.
+function coreShareOf(sym, symbols = CORE_HOLD_SYMBOLS) {
+  const w = coreWeightMap(symbols);
+  const n = Math.max(1, (symbols || []).length);
+  return Number.isFinite(w[sym]) ? w[sym] : 1 / n;
+}
+
 // How much to add IN TOTAL to reach the target weight. Pure, so the sizing decision is
 // testable without a live market. TOP-UP ONLY: never returns a sell, because the
 // measured advantage of holding comes precisely from not reacting.
@@ -4658,11 +4809,14 @@ function coreHoldingValue() {
 //
 // Pure, so the sizing decision is testable without a live market. TOP-UP ONLY: never
 // returns a sell, because the measured advantage of holding comes from not reacting.
-function coreTopUpQty(price, totalValue, currentNameValue, cash, nameCount = CORE_HOLD_SYMBOLS.length) {
+// `share` is this name's fraction of the core (see coreWeightMap). Omitting it means
+// equal weight, which is what every caller predating the conviction tilt expects.
+function coreTopUpQty(price, totalValue, currentNameValue, cash, nameCount = CORE_HOLD_SYMBOLS.length, share = null) {
   if (!CORE_HOLD_ON) return 0;
   if (!Number.isFinite(price) || price <= 0) return 0;
   const n = Math.max(1, nameCount);
-  const perNameTarget = (totalValue * effectiveCoreFraction()) / n;
+  const frac = (Number.isFinite(share) && share > 0) ? share : 1 / n;
+  const perNameTarget = totalValue * effectiveCoreFraction() * frac;
   const gap = perNameTarget - currentNameValue;
   // Band keeps ordinary drift from generating a stream of tiny spread-paying buys.
   if (gap <= perNameTarget * CORE_REBALANCE_BAND) return 0;
@@ -4679,7 +4833,9 @@ function coreTopUpQty(price, totalValue, currentNameValue, cash, nameCount = COR
 // back, so drift is tolerated and only NEW money is directed.
 function mostUnderweightCore() {
   const h = portfolio.coreHolding || {};
-  const perName = coreHoldingValue() / Math.max(1, CORE_HOLD_SYMBOLS.length);
+  const total = coreHoldingValue();
+  const w = coreWeightMap();
+  const n = Math.max(1, CORE_HOLD_SYMBOLS.length);
   let pick = null, worst = Infinity;
   for (const sym of CORE_HOLD_SYMBOLS) {
     const px = marketData[sym]?.price;
@@ -4688,8 +4844,12 @@ function mostUnderweightCore() {
     if (upd && (Date.now() - upd) > MAX_PRICE_AGE_MS) continue;   // never buy on a stale price
     const lot = h[sym];
     const val = lot && lot.qty > 0 ? lot.qty * px : 0;
-    const short = val - perName;
-    if (short < worst) { worst = short; pick = { sym, px }; }
+    // Each name is measured against ITS OWN slice, so a high-conviction name is
+    // "behind" until it reaches a bigger share — which is how the tilt actually
+    // moves money without anything ever being sold to fund it.
+    const share = Number.isFinite(w[sym]) ? w[sym] : 1 / n;
+    const short = val - total * share;
+    if (short < worst) { worst = short; pick = { sym, px, share }; }
   }
   return pick;
 }
@@ -4707,8 +4867,14 @@ let CORE_PAUSED = false;   // toggled by the admin API
 // position — only the excess above target, so the holding itself is never exited.
 function mostOverweightCore(totalValue, band = CORE_TRIM_BAND) {
   const h = portfolio.coreHolding || {};
-  const perNameTarget = (totalValue * effectiveCoreFraction()) / Math.max(1, CORE_HOLD_SYMBOLS.length);
-  if (!(perNameTarget > 0)) return null;
+  const coreTarget = totalValue * effectiveCoreFraction();
+  if (!(coreTarget > 0)) return null;
+  // The trim must use the SAME weights the top-up uses. If buying leaned toward a
+  // high-conviction name while trimming pulled every name back to equal weight, the
+  // two would fight — buy, trim, buy, trim, paying spread on every leg and ending
+  // exactly where it started.
+  const w = coreWeightMap();
+  const nEq = Math.max(1, CORE_HOLD_SYMBOLS.length);
   let pick = null, most = 0;
   for (const [sym, lot] of Object.entries(h)) {
     if (!lot || !(lot.qty > 0)) continue;
@@ -4723,7 +4889,7 @@ function mostOverweightCore(totalValue, band = CORE_TRIM_BAND) {
     // would leave every old name permanently diluting the new one — they are never
     // topped up again, so nothing else would ever remove them.
     const inBasket = CORE_HOLD_SYMBOLS.includes(sym);
-    const nameTarget = inBasket ? perNameTarget : 0;
+    const nameTarget = inBasket ? coreTarget * (Number.isFinite(w[sym]) ? w[sym] : 1 / nEq) : 0;
     const excess = val - nameTarget;
     if (excess <= nameTarget * band) continue;                    // inside the band, leave it alone
     if (!inBasket && val < MIN_FRACTIONAL_NOTIONAL) continue;     // dust, not worth the spread
@@ -4842,17 +5008,42 @@ function maintainCoreHolding() {
     return;
   }
   if (coreHaltedByOperator()) return;
+  // RE-ENTRANCY GUARD. The ledger is debited synchronously and the broker leg resolves
+  // later, so a tick that fires while orders are still in flight would size its buys
+  // against a cash balance that is already spoken for. At the old 5-minute cadence that
+  // could not happen; at 60 seconds with several buys per pass it can. This is the same
+  // check-then-act race that once put 18 HOOD orders in 50 seconds.
+  if (_coreBuyInFlight > 0) return;
+
+  // MULTI-BUY PER CYCLE (v11.46). One name every 5 minutes meant a 10-name basket took
+  // 50 minutes to build, and Venus proposes late in the session — Monday 2026-08-31 the
+  // basket reached 6 of 10 names before the close and the account finished the day 43%
+  // in cash. Idle cash is the largest measured drag in the whole system: the basket
+  // earns 22.6%/yr, so at 57% deployed the account makes $0.41/day where 95% deployed
+  // makes $0.82. That is a DOUBLING of daily profit for no additional risk-taking —
+  // in fact for LESS risk, since a 10-name basket drew down 14.6% against the live
+  // six's 16.7%. Nothing about the strategy changes; it just stops sitting in cash.
+  for (let step = 0; step < CORE_BUYS_PER_CYCLE; step++) {
+    if (!coreBuyStep()) break;
+  }
+  queueSaveState();
+}
+
+// One top-up. Returns true if it bought, so the caller can keep going until the basket
+// is full, cash runs out, or nothing is meaningfully underweight.
+function coreBuyStep() {
   const pick = mostUnderweightCore();
-  if (!pick) return;                                     // no fresh price on any member
+  if (!pick) return false;                               // no fresh price on any member
 
   const totalValue = getTotalValue();
   const lotNow = (portfolio.coreHolding || {})[pick.sym];
   const nameValue = lotNow && lotNow.qty > 0 ? lotNow.qty * pick.px : 0;
-  const qty = coreTopUpQty(pick.px, totalValue, nameValue, portfolio.cash);
-  if (!(qty > 0)) return;
+  const qty = coreTopUpQty(pick.px, totalValue, nameValue, portfolio.cash,
+                           CORE_HOLD_SYMBOLS.length, pick.share);
+  if (!(qty > 0)) return false;
 
   const cost = qty * pick.px;
-  if (cost > portfolio.cash) return;
+  if (cost > portfolio.cash) return false;
   const target = totalValue * effectiveCoreFraction();
 
   portfolio.cash -= cost;
@@ -4883,12 +5074,17 @@ function maintainCoreHolding() {
       console.warn(`[CORE] core buy failed (${why}) — ledger rolled back $${cost.toFixed(2)}`);
       queueSaveState();
     };
+    // Counted as in-flight until the broker answers, so the next tick cannot size a
+    // buy against cash these orders have already claimed.
+    _coreBuyInFlight++;
+    const settle = () => { _coreBuyInFlight = Math.max(0, _coreBuyInFlight - 1); };
     broker.submitOrder({ symbol: pick.sym, side: 'buy', qty, type: 'market',
                          tif: 'day', refPrice: pick.px })
-      .then(r => { if (!r.ok) rollback(r.error); })
-      .catch(e => rollback(e.message));
+      .then(r => { if (!r.ok) rollback(r.error); settle(); })
+      .catch(e => { rollback(e.message); settle(); });
   }
   queueSaveState();
+  return true;
 }
 
 function processProfitVault() {
@@ -7685,7 +7881,7 @@ if (require.main === module) app.listen(PORT, async () => {
 
   // 5b. Core holding — top up toward target weight. Every 5 min is ample for a
   //     position that is never meant to be traded.
-  if (CORE_HOLD_ON) setInterval(maintainCoreHolding, 300000);
+  if (CORE_HOLD_ON) setInterval(maintainCoreHolding, CORE_INTERVAL_MS);
   // Trim runs on its own timer, offset so a buy and a sell never fire in the same tick.
   if (CORE_HOLD_ON) setInterval(() => { trimCoreHolding().catch(e => console.warn('[CORE] trim error:', e.message)); }, 300000);
 
@@ -7760,6 +7956,10 @@ module.exports = {
     FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
     CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore,
     CORE_PHASE1_FRACTION, effectiveCoreFraction, rebasePeakForCoreFlow,
+    coreWeightMap, coreShareOf, coreBuyStep, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS,
+    CORE_TILT_ON, CORE_TILT_STRENGTH, CORE_TILT_MAX, CORE_TILT_MIN, CORE_TILT_MAX_SHARE,
+    getCoreConviction: () => CORE_CONVICTION,
+    setCoreConviction: (v) => { CORE_CONVICTION = (v && typeof v === 'object') ? v : {}; },
     mostOverweightCore, trimCoreHolding, CORE_TRIM_BAND, coreHaltedByOperator,
     setCorePaused: (v) => { CORE_PAUSED = !!v; }, coreHoldingValue, maintainCoreHolding, coreTopUpQty,
     logDailyTradeDigest, rejectionBucket, noteDailyRejection, tradableValue, wouldExceedHeat,

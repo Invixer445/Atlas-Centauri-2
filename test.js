@@ -2080,6 +2080,241 @@ check('core top-up sizing buys the gap, never churns, never sells', () => {
   ok(q(1000, per * 1.5, 1000) === 0, 'a name ABOVE its slice must return 0 — a hold never sells');
 });
 
+// ── CONVICTION WEIGHTING & DEPLOYMENT SPEED (v11.46) ────────────────────────
+check('conviction weighting stays equal-weight unless conviction actually differs', () => {
+  const syms = Array.from({ length: 10 }, (_, i) => 'S' + i);
+  const w = (conv) => Object.values(I.coreWeightMap(syms, conv));
+  const sum = (a) => a.reduce((x, y) => x + y, 0);
+
+  const none = w({});
+  ok(Math.abs(Math.max(...none) - 0.1) < 1e-9, 'no conviction must give exactly equal weight');
+  // Uniform confidence must NOT tilt. Centring on the basket mean instead of a fixed
+  // 0.5 would make the "most confident" of ten identical names win a bigger slice,
+  // which is amplifying noise, not expressing conviction.
+  const flatHigh = w(Object.fromEntries(syms.map(s => [s, 1])));
+  const flatLow  = w(Object.fromEntries(syms.map(s => [s, 0])));
+  ok(Math.abs(Math.max(...flatHigh) - 0.1) < 1e-9, 'uniformly HIGH conviction must stay equal weight');
+  ok(Math.abs(Math.max(...flatLow) - 0.1) < 1e-9, 'uniformly LOW conviction must stay equal weight');
+
+  // Genuine spread must move money, and in the right direction.
+  const tilted = I.coreWeightMap(syms, Object.fromEntries(syms.map((s, i) => [s, i === 0 ? 1 : 0.5])));
+  ok(tilted.S0 > 0.1 + 1e-6, `a high-conviction name must get MORE than equal weight, got ${(tilted.S0*100).toFixed(1)}%`);
+  ok(tilted.S1 < 0.1 - 1e-6, 'and the rest must give that share up');
+  ok(Math.abs(sum(Object.values(tilted)) - 1) < 1e-9, 'weights must sum to exactly 1');
+
+  // PIN THE MAPPING ITSELF. "Uniform conviction stays equal" is satisfied by any
+  // formula of the form 1 + f(c), including ones that quietly change how far apart
+  // conviction 1.0 and 0.0 end up — so it does not pin the shape. Conviction must be
+  // centred on 0.5 and symmetric: the extremes must differ by exactly (1+S)/(1-S).
+  const ends = I.coreWeightMap(syms, Object.fromEntries(
+    syms.map((s, i) => [s, i === 0 ? 1 : i === 1 ? 0 : 0.5])));
+  // The extremes are set by the multiplier rails, not by STRENGTH alone: CORE_TILT_MIN
+  // floors the low end before normalisation, so the achievable spread is narrower than
+  // (1+S)/(1-S). Pinning the naive formula asserts something the code deliberately does
+  // not do, which is a failing test rather than a caught bug.
+  const hiMult = Math.min(I.CORE_TILT_MAX, 1 + I.CORE_TILT_STRENGTH);
+  const loMult = Math.max(I.CORE_TILT_MIN, 1 - I.CORE_TILT_STRENGTH);
+  ok(Math.abs(ends.S0 / ends.S1 - hiMult / loMult) < 1e-6,
+     `full conviction must be worth exactly ${(hiMult/loMult).toFixed(2)}x zero conviction, got ${(ends.S0/ends.S1).toFixed(3)}`);
+  // A neutral name sits strictly between them, and every neutral name gets the same
+  // slice — its absolute share moves with what else is in the basket, which is correct.
+  ok(ends.S2 > ends.S1 && ends.S2 < ends.S0, 'a neutral 0.5 name must sit between the extremes');
+  ok(Math.abs(ends.S2 - ends.S9) < 1e-12, 'all neutral names must get identical slices');
+  ok(Math.abs(ends.S0 / ends.S2 - hiMult) < 1e-6,
+     `full conviction must be exactly ${hiMult}x a neutral name`);
+
+  // CONVICTION IS ABSOLUTE, NOT RELATIVE. Centring on the basket mean would size the
+  // same two names differently depending on what else happened to be in the basket
+  // that day — and would tilt hardest exactly when Venus is least discriminating,
+  // because with ten near-identical scores the mean sits among them and tiny gaps get
+  // stretched into real money. The uniform-conviction cases above do NOT catch this:
+  // when every score is equal, mean-centring collapses to neutral and looks correct.
+  const pairRatio = (fill) => {
+    const names = ['A', 'B', 'X0', 'X1', 'X2', 'X3'];
+    const conv = { A: 0.6, B: 0.4, X0: fill, X1: fill, X2: fill, X3: fill };
+    const w = I.coreWeightMap(names, conv);
+    return w.A / w.B;
+  };
+  // Fills chosen to stay clear of the concentration rail. Below about 0.3 the rest of
+  // the basket shrinks enough that A breaches the 25% cap, and the rail then breaks
+  // proportionality ON PURPOSE — that is the rail working, not a violation of this
+  // property, so testing it there would assert the opposite of what is wanted.
+  ok(Math.abs(pairRatio(0.5) - pairRatio(0.9)) < 1e-9,
+     `two names must keep their relative size regardless of the rest of the basket: ` +
+     `${pairRatio(0.5).toFixed(4)} vs ${pairRatio(0.9).toFixed(4)}`);
+  ok(Math.abs(pairRatio(0.5) - pairRatio(0.35)) < 1e-9,
+     'and that must hold for a lower-conviction basket too');
+});
+
+check('no conviction pattern can breach the tested concentration rail', () => {
+  // The per-name multiplier is bounded but shares are NORMALISED, so bounding the
+  // multiplier does not bound the result: one name at 1.0 with nine at 0.0 reaches
+  // 30.8% of the core on the multiplier rail alone. The measurement is only reassuring
+  // up to ~25% (a completely wrong tilt costs 0.2pp there, 0.9pp by 40%), so the rail
+  // that matters is on the final share.
+  // n=3 and n=2 matter: there the 25% rail is BELOW equal weight, so a rail that is not
+  // floored at 1/n caps every name and the weights silently sum to less than 1 — the
+  // core would then target a fraction of the allocation it was told to hold.
+  for (const n of [2, 3, 4, 5, 10, 15, 20]) {
+    const syms = Array.from({ length: n }, (_, i) => 'S' + i);
+    for (const conv of [
+      Object.fromEntries(syms.map((s, i) => [s, i === 0 ? 1 : 0])),        // one hero
+      Object.fromEntries(syms.map((s, i) => [s, i < 2 ? 1 : 0])),          // two heroes
+      Object.fromEntries(syms.map((s, i) => [s, i === 0 ? 0 : 1])),        // one pariah
+    ]) {
+      const v = Object.values(I.coreWeightMap(syms, conv));
+      const cap = Math.max(I.CORE_TILT_MAX_SHARE, 1 / n);
+      ok(Math.max(...v) <= cap + 1e-9,
+         `${n} names: max share ${(Math.max(...v)*100).toFixed(1)}% breached the ${(cap*100).toFixed(1)}% rail`);
+      ok(Math.abs(v.reduce((a, b) => a + b, 0) - 1) < 1e-9,
+         `${n} names: weights must still sum to 1 after the rail is applied`);
+      ok(Math.min(...v) > 0, 'the rail must never zero a basket member out');
+    }
+  }
+});
+
+check('the tilt reaches sizing, and buying and trimming use the SAME weights', () => {
+  // SOURCE ASSERTIONS FIRST, BEFORE ANY RUNTIME GUARD. Putting them after an
+  // `if (!CORE_HOLD_ON) return` meant they never ran in the default config, and three
+  // separate mutations — share ignored, top-up flattened, trim flattened — sailed
+  // straight through a green suite. A wiring check must not depend on the very setting
+  // whose wiring it is checking.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const under = src.slice(src.indexOf('function mostUnderweightCore'), src.indexOf('function coreHaltedByOperator'));
+  const over  = src.slice(src.indexOf('function mostOverweightCore'), src.indexOf('async function trimCoreHolding'));
+  const size  = src.slice(src.indexOf('function coreTopUpQty'), src.indexOf('function mostUnderweightCore'));
+  // If the top-up leaned toward a name while the trim pulled every name back to equal
+  // weight, the two would churn against each other — buy, trim, buy, trim, paying
+  // spread on every leg and ending exactly where they started.
+  ok(/coreWeightMap\(\)/.test(under), 'the top-up target must come from coreWeightMap');
+  ok(/coreWeightMap\(\)/.test(over),  'the trim target must come from the SAME coreWeightMap');
+  ok(/const short = val - total \* share;/.test(under),
+     'the top-up must measure each name against its OWN share, not the flat average');
+  ok(/coreTarget \* \(Number\.isFinite\(w\[sym\]\) \? w\[sym\] : 1 \/ nEq\)/.test(over),
+     'the trim target must be the tilted share, not a flat slice');
+  ok(/const frac = \(Number\.isFinite\(share\) && share > 0\) \? share : 1 \/ n;/.test(size),
+     'coreTopUpQty must honour the share it is given');
+  ok(/mostUnderweightCore\(\)/.test(src) && /pick\.share\)/.test(src),
+     'the buy path must pass the pick\'s share through to sizing');
+
+  if (!I.CORE_HOLD_ON) { ok(I.coreTopUpQty(100, 1000, 0, 1000, 10, 0.2) === 0, 'disabled core must never buy'); return; }
+  // A share must actually change the size bought — otherwise coreWeightMap is decoration.
+  const big   = I.coreTopUpQty(100, 1000, 0, 1000, 10, 0.20) * 100;
+  const small = I.coreTopUpQty(100, 1000, 0, 1000, 10, 0.05) * 100;
+  const equal = I.coreTopUpQty(100, 1000, 0, 1000, 10) * 100;
+  ok(big > equal && equal > small, `share must scale the buy: ${small.toFixed(2)} < ${equal.toFixed(2)} < ${big.toFixed(2)}`);
+  ok(Math.abs(big / small - 4) < 0.01, 'a 4x share must buy 4x the notional');
+});
+
+check('a tilted name is bought toward its own slice, not the average', () => {
+  if (!I.CORE_HOLD_ON) return;
+  const savedCore = I.portfolio.coreHolding, saved = {};
+  const syms = I.CORE_HOLD_SYMBOLS;
+  syms.forEach(s => { saved[s] = I.marketData[s];
+    I.marketData[s] = { price: 100, prevClose: 100, lastUpdate: Date.now() }; });
+  I.portfolio.coreHolding = {};
+  syms.forEach(s => { I.portfolio.coreHolding[s] = { qty: 1, avgPrice: 100, investedCash: 100 }; });
+  // Every name holds the same dollar value. With flat conviction nothing is underweight
+  // by much; with one name favoured, THAT name must become the pick.
+  const prevConv = I.getCoreConviction();
+  I.setCoreConviction({});
+  const flat = I.mostUnderweightCore();
+  I.setCoreConviction(Object.fromEntries(syms.map((s, i) => [s, i === 3 ? 1 : 0.4])));
+  const tilted = I.mostUnderweightCore();
+  I.setCoreConviction(prevConv);
+  I.portfolio.coreHolding = savedCore;
+  syms.forEach(s => { if (saved[s]) I.marketData[s] = saved[s]; else delete I.marketData[s]; });
+
+  ok(tilted && tilted.sym === syms[3],
+     `the favoured name must be the one topped up, got ${tilted && tilted.sym} (expected ${syms[3]})`);
+  ok(tilted && tilted.share > 1 / syms.length,
+     'the pick must carry its own share, above equal weight');
+  ok(flat && Number.isFinite(flat.share), 'the flat case must still report a share');
+});
+
+check('the core fills the basket in minutes, not an hour', () => {
+  // One name every five minutes needed 50 minutes for ten names, and Venus proposes
+  // late in the session — Monday 2026-08-31 the basket reached 6 of 10 and the account
+  // closed 43% in cash. Idle cash is the largest measured drag in the system: 57%
+  // deployed earns $0.41/day where 95% earns $0.82. This is a DOUBLING of daily profit
+  // that costs nothing and reduces drawdown (a 10-name basket drew 14.6% vs 16.7%).
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const stripped = src.split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = stripped.slice(stripped.indexOf('function maintainCoreHolding'),
+                            stripped.indexOf('function coreBuyStep'));
+  // WIRING, not just the helper: a loop that is never entered fills nothing.
+  ok(/for \(let step = 0; step < CORE_BUYS_PER_CYCLE; step\+\+\)/.test(fn),
+     'maintainCoreHolding must loop up to CORE_BUYS_PER_CYCLE times');
+  ok(/if \(!coreBuyStep\(\)\) break;/.test(fn),
+     'and must call coreBuyStep, stopping as soon as one pass buys nothing');
+  ok(I.CORE_BUYS_PER_CYCLE > 1, 'more than one buy per cycle, or the loop is pointless');
+  // The cadence must come from the constant, not a hard-coded 5 minutes.
+  ok(/setInterval\(maintainCoreHolding, CORE_INTERVAL_MS\)/.test(stripped),
+     'the core interval must be CORE_INTERVAL_MS');
+  ok(I.CORE_INTERVAL_MS <= 60000, `cadence must be a minute or faster, got ${I.CORE_INTERVAL_MS}ms`);
+  // Ten names must be reachable well inside a session.
+  const minutesToFill = (10 / I.CORE_BUYS_PER_CYCLE) * (I.CORE_INTERVAL_MS / 60000);
+  ok(minutesToFill <= 5, `a 10-name basket must fill within 5 minutes, takes ${minutesToFill.toFixed(1)}`);
+});
+
+check('faster core buying does not reopen the check-then-act race', () => {
+  // The ledger is debited synchronously; the broker leg resolves later. At five-minute
+  // spacing a second tick could not overlap in-flight orders. At sixty seconds with
+  // four buys a pass it can — and sizing against cash that pending orders have already
+  // claimed is exactly what put 18 HOOD orders in 50 seconds.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function maintainCoreHolding'), src.indexOf('function processProfitVault'));
+  ok(/if \(_coreBuyInFlight > 0\) return;/.test(fn), 'a tick must bail while core orders are in flight');
+  ok(/_coreBuyInFlight\+\+;/.test(fn), 'submitting a core buy must mark it in flight');
+  ok(/_coreBuyInFlight = Math\.max\(0, _coreBuyInFlight - 1\)/.test(fn),
+     'and it must be cleared when the broker answers');
+  // Cleared on BOTH paths — an order that errors and never settles would wedge the core
+  // permanently, which is worse than the race it guards against.
+  ok(/\.then\(r => \{ if \(!r\.ok\) rollback\(r\.error\); settle\(\); \}\)/.test(fn),
+     'the success path must settle');
+  ok(/\.catch\(e => \{ rollback\(e\.message\); settle\(\); \}\)/.test(fn),
+     'the failure path must settle too, or a single network error halts the core forever');
+  // The guard must sit BEFORE the loop; after it, it guards nothing.
+  ok(fn.indexOf('_coreBuyInFlight > 0') < fn.indexOf('step < CORE_BUYS_PER_CYCLE'),
+     'the in-flight guard must run before the buy loop, not after');
+});
+
+check('Venus conviction is a screen score with a safe default, never a forecast', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fn = src.slice(src.indexOf('async function proposeBasket'), src.indexOf('async function assess'));
+  // The anti-forecasting framing is the whole reason sizing on this is defensible.
+  ok(/NOT a prediction of\s*\n?return/i.test(fn) || /Conviction is NOT a prediction/i.test(fn),
+     'conviction must be defined as a screen score, not a return forecast');
+  ok(/HOW WELL THIS NAME\s*\n?MEETS THE SCREEN/i.test(fn),
+     'it must be anchored to the screen criteria');
+  ok(/flat set of scores is a valid/i.test(fn),
+     'a uniform answer must be explicitly allowed, or the model invents spread to seem useful');
+  // A missing or junk score must degrade to equal weight, not to a random tilt.
+  ok(/Number\.isFinite\(raw\) \? Math\.max\(0, Math\.min\(1, raw\)\) : 0\.5/.test(fn),
+     'missing conviction must default to 0.5 — the value coreWeightMap treats as equal weight');
+  ok(/for \(const sym of basket\)/.test(fn),
+     'conviction must be built from the VALIDATED basket, not the raw model output');
+  // 0.5 must genuinely be the neutral point, or the default silently tilts.
+  const neutral = I.coreWeightMap(['A', 'B', 'C', 'D'], { A: 0.5, B: 0.5, C: 0.5, D: 0.5 });
+  ok(Math.abs(neutral.A - 0.25) < 1e-9, '0.5 conviction must map to exactly equal weight');
+});
+
+check('conviction is adopted only with the basket it describes', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const swapIdx = src.indexOf('CORE_HOLD_SYMBOLS.push(...prop.basket)');
+  const branchEnd = src.indexOf('\n          }', swapIdx);
+  const branch = src.slice(swapIdx, branchEnd);
+  ok(/CORE_CONVICTION = prop\.conviction \|\| \{\}/.test(branch),
+     'conviction must be adopted inside the same branch that swaps the basket');
+  // Carried across a basket change, conviction would size NEW names by scores written
+  // about OLD ones — silently, and with no way to tell from the logs.
+  ok(src.split('CORE_CONVICTION = prop.conviction').length - 1 === 1,
+     'conviction must be adopted in exactly one place');
+});
+
 check('the boot sync does not adopt core holdings as trades', () => {
   // Core positions sit at the broker like any other. The adoption loop only checked
   // longPositions, so every restart pulled all ten into the TRADING book — attaching
@@ -2108,9 +2343,23 @@ check('venus basket mode buys nothing until Venus has actually proposed', () => 
   // The flag must be set where the basket is ACTUALLY swapped, not merely on a
   // proposal being logged — a logged proposal that did not replace the list would
   // leave the core buying the default basket while believing it had Venus's.
-  const idx = src.indexOf('CORE_HOLD_SYMBOLS.push(...prop.basket)');
-  ok(idx > 0 && src.slice(idx, idx + 120).includes('_venusBasketReceived = true'),
-     'the flag must be set at the point the basket is swapped');
+  // Anchored to the ENCLOSING BRANCH, not to a character count. A fixed-width window
+  // ("the next 120 chars") breaks the moment anything legitimate is added between the
+  // swap and the flag — which has now happened three times in this file — and a test
+  // that fails on correct code teaches you to edit the test, which is how a real
+  // regression eventually walks through. What actually matters is that the flag is set
+  // inside the branch that swaps the basket, never merely where a proposal is logged.
+  const swapIdx = src.indexOf('CORE_HOLD_SYMBOLS.push(...prop.basket)');
+  const branchIdx = src.lastIndexOf("if (CORE_BASKET_SOURCE === 'venus') {", swapIdx);
+  const branchEnd = src.indexOf('\n          }', swapIdx);
+  ok(swapIdx > 0 && branchIdx > 0 && branchEnd > swapIdx,
+     'the basket swap must sit inside an explicit CORE_BASKET_SOURCE=venus branch');
+  ok(src.slice(branchIdx, branchEnd).includes('_venusBasketReceived = true'),
+     'the flag must be set inside the branch that swaps the basket');
+  // And nowhere else — a second assignment outside the swap would let the core start
+  // buying the DEFAULT basket while believing it had Venus's.
+  ok(src.split('_venusBasketReceived = true').length - 1 === 1,
+     'the flag must be set in exactly one place');
 });
 
 check('an operator halt stops the core; an automatic one does not', () => {
