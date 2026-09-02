@@ -2622,12 +2622,26 @@ const BASKET_PROPOSAL_INTERVAL_MS = 24 * 3600 * 1000;
 // proposal still runs daily and is still scored; this governs only when money moves.
 const CORE_BASKET_MIN_HOLD_MS = Math.max(0,
   parseFloat(process.env.CORE_BASKET_MIN_HOLD_DAYS || '30')) * 86400000;
+// Ceiling on basket size once recovered holdings are carried in. On a $1000 account a
+// 20-name basket is ~$48 a slice, already close to the $5 minimum order and the point
+// where spread per name stops being worth the diversification.
+const CORE_BASKET_MAX_NAMES = Math.max(1,
+  parseInt(process.env.CORE_BASKET_MAX_NAMES || '20', 10));
 let _lastBasketSwapAt = 0;
 let _lastBasketProposalAt = 0;
 // Set once Venus has actually delivered a basket. Until then, venus mode buys nothing.
 let _venusBasketReceived = false;
 let _coreWaitLogAt = 0;
 let _trimWaitLogAt = 0;
+// Holdings ATLAS FOUND at the broker rather than chose — populated only when state was
+// missing at boot. A basket proposal written without knowing these exist must not be
+// allowed to force-sell them: off-basket names are trimmed to a target of ZERO, so the
+// first swap after a recovery would liquidate every recovered name the proposal happens
+// to omit. Observed 2026-09-01: PFE, the best performer on the book at +$2.70, was set
+// to be exited for exactly this reason. Cleared after the first swap, so a name only
+// gets this protection once — thereafter it is dropped like any other, which is a
+// deliberate decision taken after a full minimum-hold period rather than an accident.
+let _recoveredSymbols = new Set();
 // Core buys submitted to the broker but not yet acknowledged. Guards the check-then-act
 // race that the faster cadence below would otherwise reopen.
 let _coreBuyInFlight = 0;
@@ -3833,7 +3847,18 @@ async function runIntelCycle() {
           }
           if (CORE_BASKET_SOURCE === 'venus' && maySwap) {
             console.log(`[VENUS]    CORE_BASKET_SOURCE=venus — this proposal is now the live basket`);
-            CORE_HOLD_SYMBOLS.length = 0; CORE_HOLD_SYMBOLS.push(...prop.basket);
+            const merged = basketWithRecovered(prop.basket, _recoveredSymbols, portfolio.coreHolding);
+            if (merged.carried.length) {
+              console.log(`[VENUS]    carrying ${merged.carried.join(',')} into the new basket — ` +
+                `held but not proposed, and a recovered holding is not force-sold by a ` +
+                `proposal that did not know it existed`);
+            }
+            if (merged.dropped.length) {
+              console.warn(`[VENUS]    ${merged.dropped.join(',')} will be exited — ` +
+                `basket is capped at ${CORE_BASKET_MAX_NAMES} names`);
+            }
+            _recoveredSymbols.clear();       // one cycle of grace, not permanent tenure
+            CORE_HOLD_SYMBOLS.length = 0; CORE_HOLD_SYMBOLS.push(...merged.basket);
             _lastBasketSwapAt = Date.now();
             // Conviction only takes effect on the basket it was written for. Carrying it
             // across a basket change would size new names by a score describing old ones.
@@ -4826,6 +4851,37 @@ function coreHoldingValue() {
   return v;
 }
 
+// A RECOVERED HOLDING IS NOT FORCE-SOLD BY A PROPOSAL THAT NEVER KNEW IT EXISTED.
+// Off-basket names get a target of ZERO and are trimmed out completely — correct when
+// the basket deliberately changes, wrong when the "change" is merely a proposal written
+// while ATLAS had amnesia. Observed 2026-09-01: state was lost on a deploy, six
+// positions were recovered from the broker, and the next proposal omitted PFE — the
+// best performer on the book at +$2.70 — which would have exited it in full.
+//
+// Names ATLAS FOUND rather than chose are carried into the new basket for ONE cycle.
+// The caller clears the recovered set afterwards, so at the next swap (a full minimum
+// hold later) they are dropped like anything else if still unwanted — a deliberate
+// decision rather than an accident of recovery.
+//
+// Pure, and returns what it did, so the behaviour is testable without a live market.
+// It lived inline in the research loop until a mutation proved that unreachable code
+// passes every source assertion written about it.
+function basketWithRecovered(proposal, recovered, holdings, maxNames = CORE_BASKET_MAX_NAMES) {
+  const basket = [...(proposal || [])];
+  const out = { basket, carried: [], dropped: [] };
+  if (!recovered || !recovered.size) return out;
+  const held = Object.keys(holdings || {}).filter(s =>
+    recovered.has(s) && (holdings[s]?.qty > 0) && !basket.includes(s));
+  if (!held.length) return out;
+  // Cap the union so a broker full of strays cannot balloon the basket into slices too
+  // thin to be worth the spread per name.
+  const room = Math.max(0, maxNames - basket.length);
+  out.carried = held.slice(0, room);
+  out.dropped = held.slice(room);
+  basket.push(...out.carried);
+  return out;
+}
+
 // Each basket member's share of the CORE, as a map summing to 1.
 //
 // Equal weight unless Venus has supplied conviction AND the tilt is enabled — so the
@@ -5718,6 +5774,10 @@ async function syncFromBroker() {
               qty, avgPrice: bp.avg_entry_price,
               investedCash: qty * bp.avg_entry_price, openedAt: Date.now(),
             };
+            // Remember that ATLAS did not CHOOSE this holding, it found it. The next
+            // basket swap must not force-sell it merely because a proposal written in
+            // ignorance of it happens to leave it out. See _recoveredSymbols.
+            _recoveredSymbols.add(bp.symbol);
             const why = tradingImpossible ? 'trading is phase-locked, so it cannot be a trade'
                                           : 'it is a current basket member';
             console.log(`[SYNC] Recovered core holding ${bp.symbol} ×${qty} @ $${bp.avg_entry_price.toFixed(2)} — ${why}`);
@@ -8187,7 +8247,8 @@ module.exports = {
     FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
     CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore,
     CORE_PHASE1_FRACTION, effectiveCoreFraction, rebasePeakForCoreFlow, unlockStepDownIsActionable,
-    coreWeightMap, coreBuyStep, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, verifyStateDir,
+    coreWeightMap, basketWithRecovered, coreBuyStep, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, CORE_BASKET_MAX_NAMES, verifyStateDir,
+    getRecoveredSymbols: () => _recoveredSymbols,
     CORE_TILT_ON, CORE_TILT_STRENGTH, CORE_TILT_MAX, CORE_TILT_MIN, CORE_TILT_MAX_SHARE,
     getCoreConviction: () => CORE_CONVICTION,
     setCoreConviction: (v) => { CORE_CONVICTION = (v && typeof v === 'object') ? v : {}; },

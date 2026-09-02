@@ -47,6 +47,24 @@ function near(actual, expected, tol, label = '') {
 }
 function ok(cond, label) { if (!cond) throw new Error(label || 'assertion failed'); }
 
+// Source slice for the block opened by `header`, found by BRACE MATCHING rather than by
+// guessing at indentation. Anchors like src.indexOf('\n          }') silently shorten the
+// moment a nested block is added inside — which has now broken three separate tests on
+// otherwise-correct edits, and a test that fails on correct code teaches you to edit the
+// test, which is how a real regression eventually walks through.
+function blockAfter(src, header) {
+  const start = src.indexOf(header);
+  if (start < 0) return '';
+  const open = src.indexOf('{', start + header.length - 1);
+  if (open < 0) return '';
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') { depth--; if (depth === 0) return src.slice(start, i + 1); }
+  }
+  return src.slice(start);
+}
+
 // Reset shared module state between tests that mutate it.
 function resetBook() {
   Object.keys(I.portfolio.longPositions).forEach(k => delete I.portfolio.longPositions[k]);
@@ -2509,6 +2527,63 @@ check('a restart does not liquidate the basket Venus chose', () => {
      'a genuinely dropped name must still be exited in full');
 });
 
+check('a recovered holding is not force-sold by a proposal that never knew it existed', () => {
+  // Off-basket names get a target of ZERO and are trimmed out completely. That is right
+  // when the basket deliberately changes, and wrong when the "change" is a proposal
+  // written while ATLAS had amnesia. Observed 2026-09-01: state was lost, six positions
+  // were recovered from the broker, and Venus's next proposal omitted PFE — the best
+  // performer on the book at +$2.70 — which would have exited it in full.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/_recoveredSymbols\.add\(bp\.symbol\);/.test(src),
+     'a holding ATLAS FOUND rather than chose must be marked as recovered');
+  const branch = blockAfter(src, "if (CORE_BASKET_SOURCE === 'venus' && maySwap) {");
+  ok(/basketWithRecovered\(prop\.basket, _recoveredSymbols, portfolio\.coreHolding\)/.test(branch),
+     'the swap must merge recovered holdings before replacing the basket');
+  ok(/CORE_HOLD_SYMBOLS\.push\(\.\.\.merged\.basket\)/.test(branch),
+     'the MERGED basket, not the raw proposal, must become the live basket');
+  // ONE CYCLE OF GRACE. Without the clear, a recovered name could never be dropped —
+  // it would be re-carried at every future swap and hold tenure for ever.
+  ok(/_recoveredSymbols\.clear\(\);/.test(branch),
+     'the grace must be cleared after the swap, or a recovered name can never be dropped');
+  ok(I.CORE_BASKET_MAX_NAMES >= 10, `the cap must leave room for a normal basket, got ${I.CORE_BASKET_MAX_NAMES}`);
+
+  // BEHAVIOURAL, against 2026-09-01's actual book. Calling the real function, because a
+  // mutation proved that code disabled behind `if (0)` satisfies every source assertion
+  // written about it — the patterns are all still present, they just never run.
+  const proposal = ['AAPL','MSFT','JNJ','JPM','BAC','XOM','CVX','PG','KO','WMT'];
+  const holdings = {};
+  ['PFE','JNJ','JPM','XOM','BAC','KO'].forEach(s => { holdings[s] = { qty: 1 }; });
+  const rec = new Set(Object.keys(holdings));
+  const m = I.basketWithRecovered(proposal, rec, holdings);
+  ok(m.carried.length === 1 && m.carried[0] === 'PFE', `only PFE should need carrying, got ${m.carried}`);
+  ok(m.basket.includes('PFE'), 'PFE must survive the swap rather than being exited');
+  ok(m.basket.length === 11, `basket should become 11 names, got ${m.basket.length}`);
+  ok(m.dropped.length === 0, 'nothing should be dropped at this size');
+  ok(new Set(m.basket).size === m.basket.length, 'the merged basket must not contain duplicates');
+
+  // A name no longer held must NOT be resurrected into the basket.
+  const gone = I.basketWithRecovered(proposal, new Set(['ZZZZ']), { ZZZZ: { qty: 0 } });
+  ok(gone.carried.length === 0 && !gone.basket.includes('ZZZZ'),
+     'a sold-out recovered name must not be carried back in');
+
+  // Nothing recovered = the proposal is used verbatim.
+  const clean = I.basketWithRecovered(proposal, new Set(), {});
+  ok(clean.basket.length === 10 && clean.carried.length === 0,
+     'with nothing recovered the proposal must pass through unchanged');
+
+  // The cap must bind, and report what it excluded rather than silently losing it.
+  const many = {}; const manySet = new Set();
+  for (let i = 0; i < 8; i++) { many['X' + i] = { qty: 1 }; manySet.add('X' + i); }
+  const capped = I.basketWithRecovered(proposal, manySet, many, 12);
+  ok(capped.basket.length === 12, `cap must bind at 12, got ${capped.basket.length}`);
+  ok(capped.carried.length === 2 && capped.dropped.length === 6,
+     `2 carried / 6 dropped expected, got ${capped.carried.length}/${capped.dropped.length}`);
+
+  // And the recovered set must start empty, so a normal boot carries nothing.
+  ok(I.getRecoveredSymbols().size === 0, 'nothing may be marked recovered without a broker sync');
+});
+
 check('a basket meant to last months is not churned by a daily model call', () => {
   // The prompt asks Venus for a basket to HOLD FOR MONTHS, but the proposal runs every
   // 24h and was adopted every single time — so a name could be bought and sold out on
@@ -2541,9 +2616,7 @@ check('a basket meant to last months is not churned by a daily model call', () =
 check('conviction is adopted only with the basket it describes', () => {
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
                 .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
-  const swapIdx = src.indexOf('CORE_HOLD_SYMBOLS.push(...prop.basket)');
-  const branchEnd = src.indexOf('\n          }', swapIdx);
-  const branch = src.slice(swapIdx, branchEnd);
+  const branch = blockAfter(src, "if (CORE_BASKET_SOURCE === 'venus' && maySwap) {");
   ok(/CORE_CONVICTION = prop\.conviction \|\| \{\}/.test(branch),
      'conviction must be adopted inside the same branch that swaps the basket');
   // Carried across a basket change, conviction would size NEW names by scores written
@@ -2693,12 +2766,10 @@ check('venus basket mode buys nothing until Venus has actually proposed', () => 
   // that fails on correct code teaches you to edit the test, which is how a real
   // regression eventually walks through. What actually matters is that the flag is set
   // inside the branch that swaps the basket, never merely where a proposal is logged.
-  const swapIdx = src.indexOf('CORE_HOLD_SYMBOLS.push(...prop.basket)');
-  const branchIdx = src.lastIndexOf("if (CORE_BASKET_SOURCE === 'venus' && maySwap) {", swapIdx);
-  const branchEnd = src.indexOf('\n          }', swapIdx);
-  ok(swapIdx > 0 && branchIdx > 0 && branchEnd > swapIdx,
+  const branch = blockAfter(src, "if (CORE_BASKET_SOURCE === 'venus' && maySwap) {");
+  ok(branch && branch.includes('CORE_HOLD_SYMBOLS.push('),
      'the basket swap must sit inside an explicit CORE_BASKET_SOURCE=venus branch');
-  ok(src.slice(branchIdx, branchEnd).includes('_venusBasketReceived = true'),
+  ok(branch.includes('_venusBasketReceived = true'),
      'the flag must be set inside the branch that swaps the basket');
   // Exactly two legitimate places, and nowhere else — a stray assignment would let the
   // core start buying the DEFAULT basket while believing it had Venus's.
