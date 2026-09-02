@@ -2527,6 +2527,48 @@ check('a restart does not liquidate the basket Venus chose', () => {
      'a genuinely dropped name must still be exited in full');
 });
 
+check('the core can see a price for every name in its basket', () => {
+  // THE LARGEST DRAG FOUND SO FAR, and it was silent. The tick subscription and the
+  // snapshot fetch both used the TRADING watchlist only, so any basket member that was
+  // not also a trading name never got a price — and mostUnderweightCore() skips every
+  // symbol without a fresh price, so the core could never buy it.
+  //
+  // Measured 2026-09-02: basket AAPL,MSFT,JPM,BAC,XOM,CVX,KO,PG,JNJ,PFE, of which 6 are
+  // on the trading watchlist. The core topped out at 95% × 6/10 = 57.0%. Observed on the
+  // broker: 57.4%, with $430.99 in cash the engine was structurally unable to deploy.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  // Both feeds, not just one — a snapshot without a stream goes stale, a stream without
+  // a snapshot has no price until the next trade prints.
+  const subIdx = src.indexOf('const subSymbols =');
+  const fetchIdx = src.indexOf("console.log(`[PRICES] Fetching");
+  ok(subIdx > 0 && /CORE_HOLD_ON \? CORE_HOLD_SYMBOLS : \[\]/.test(src.slice(subIdx, subIdx + 320)),
+     'the tick subscription must include the core basket');
+  ok(fetchIdx > 0 && /CORE_HOLD_ON \? CORE_HOLD_SYMBOLS : \[\]/.test(src.slice(Math.max(0, fetchIdx - 320), fetchIdx)),
+     'the snapshot fetch must include the core basket');
+  // Deduped, or a name on both lists is subscribed twice.
+  ok(/const subSymbols = \[\.\.\.new Set\(/.test(src), 'the subscription list must be deduped');
+
+  // A swap mid-session is the case boot-time inclusion cannot cover: the stream was
+  // opened hours earlier, before those names were in the basket.
+  const branch = blockAfter(src, "if (CORE_BASKET_SOURCE === 'venus' && maySwap) {");
+  ok(/subscribeCoreSymbols\(merged\.basket\.filter\(s => !previous\.has\(s\)\)\)/.test(branch),
+     'a basket swap must subscribe the names it just added');
+  ok(/const previous = new Set\(CORE_HOLD_SYMBOLS\);/.test(branch),
+     'and must capture the old basket BEFORE overwriting it, or the diff is empty');
+  const prevIdx = branch.indexOf('const previous = new Set');
+  const wipeIdx = branch.indexOf('CORE_HOLD_SYMBOLS.length = 0');
+  ok(prevIdx > 0 && prevIdx < wipeIdx, 'the snapshot of the old basket must precede the wipe');
+
+  // Subscribing alone is not enough: a subscription only delivers the NEXT trade, which
+  // on a quiet tape can be minutes away, and until then the name still has no price.
+  const fn = src.slice(src.indexOf('function subscribeCoreSymbols'), src.indexOf('function symbolsForMarket'));
+  ok(/action: 'subscribe'/.test(fn), 'it must subscribe on the live stream');
+  ok(/fetchQuote\(sym\)/.test(fn), 'and pull a snapshot, rather than waiting for a trade to print');
+  ok(/if \(marketData\[sym\]\?\.price > 0\) continue;/.test(fn),
+     'a name that already has a price must not be re-fetched');
+});
+
 check('a recovered holding is not force-sold by a proposal that never knew it existed', () => {
   // Off-basket names get a target of ZERO and are trimmed out completely. That is right
   // when the basket deliberately changes, and wrong when the "change" is a proposal

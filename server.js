@@ -2965,6 +2965,31 @@ function getMarketStatus() {
   return { status: 'After Hours', openTime: '9:30 AM ET', closeTime: '4:00 PM ET' };
 }
 
+// Add symbols to the live tick stream and seed a price for each, so a basket member
+// added mid-session is immediately usable by the core. Without a price,
+// mostUnderweightCore() skips a name entirely and it is never bought.
+function subscribeCoreSymbols(symbols) {
+  const list = (symbols || []).filter(Boolean);
+  if (!list.length) return;
+  if (dataWs && dataWs.readyState === WebSocket.OPEN) {
+    try { dataWs.send(JSON.stringify({ action: 'subscribe', trades: list })); } catch (e) {}
+  }
+  // A subscription only delivers the NEXT trade. On a quiet tape that can be minutes,
+  // and until then the name still has no price — so pull a snapshot too rather than
+  // waiting for the market to volunteer one.
+  for (const sym of list) {
+    if (marketData[sym]?.price > 0) continue;
+    fetchQuote(sym).then(q => {
+      if (q && q.price > 0) {
+        marketData[sym] = { ...(marketData[sym] || {}), price: q.price,
+                            prevClose: q.prevClose ?? q.price, lastUpdate: Date.now() };
+      }
+    }).catch(() => {});
+  }
+  console.log(`[CORE] 📡 Subscribed ${list.join(',')} — new basket members need a price ` +
+              `before the core can buy them`);
+}
+
 function symbolsForMarket(market) {
   if (market !== 'nasdaq') return [];
   const core = [...WATCHLISTS.nasdaq, ...WATCHLISTS.nyse];
@@ -3089,8 +3114,17 @@ function connectWebSocket() {
 
   // Symbols we want trade ticks for (core + any live dynamic additions, so
   // dynamics survive a reconnect).
-  const subSymbols = [...WATCHLISTS.nasdaq, ...WATCHLISTS.nyse, 'SPY',
-                      ...Object.keys(dynamicSymbols)];
+  // THE CORE BASKET MUST BE IN HERE. Without it the core gets no ticks for any basket
+  // name that is not also a TRADING watchlist name, mostUnderweightCore() skips every
+  // symbol with no fresh price, and the core can never buy them. Measured 2026-09-02:
+  // the basket was AAPL,MSFT,JPM,BAC,XOM,CVX,KO,PG,JNJ,PFE, of which only 6 are on the
+  // trading watchlist — so the core topped out at 95% × 6/10 = 57.0% of the account.
+  // Observed on the broker that evening: 57.4%, with $430.99 sitting in cash that the
+  // engine was structurally incapable of deploying. Idle cash is the single largest
+  // measured drag in this system and this had been quietly capping it the whole time.
+  const subSymbols = [...new Set([...WATCHLISTS.nasdaq, ...WATCHLISTS.nyse, 'SPY',
+                      ...(CORE_HOLD_ON ? CORE_HOLD_SYMBOLS : []),
+                      ...Object.keys(dynamicSymbols)])];
 
   dataWs.on('open', () => {
     if (gen !== wsGeneration) return;
@@ -3337,7 +3371,11 @@ async function fetchInitialPrices() {
   if (_fetchInProgress) { console.log('[PRICES] Already fetching'); return; }
   _fetchInProgress = true;
   try {
-    const symbols = [...WATCHLISTS.nasdaq, ...WATCHLISTS.nyse, 'SPY', ...Object.keys(dynamicSymbols)];
+    // Same omission as the stream subscription: a core basket name that is not also a
+    // trading watchlist name got no snapshot either, so it had no price even at boot.
+    const symbols = [...new Set([...WATCHLISTS.nasdaq, ...WATCHLISTS.nyse, 'SPY',
+                     ...(CORE_HOLD_ON ? CORE_HOLD_SYMBOLS : []),
+                     ...Object.keys(dynamicSymbols)])];
     console.log(`[PRICES] Fetching ${symbols.length} snapshots from Alpaca (feed=${ALPACA_DATA_FEED})...`);
     // Alpaca multi-snapshot returns latest trade + daily + previous-daily bars for
     // ALL symbols in ONE call — no per-symbol batching or rate-limit dance needed.
@@ -3858,7 +3896,15 @@ async function runIntelCycle() {
                 `basket is capped at ${CORE_BASKET_MAX_NAMES} names`);
             }
             _recoveredSymbols.clear();       // one cycle of grace, not permanent tenure
+            const previous = new Set(CORE_HOLD_SYMBOLS);
             CORE_HOLD_SYMBOLS.length = 0; CORE_HOLD_SYMBOLS.push(...merged.basket);
+            // SUBSCRIBE THE NEW NAMES. The stream is subscribed once at connect, so a
+            // basket swapped mid-session leaves its new members with no ticks at all —
+            // and a member with no price is skipped by mostUnderweightCore and can
+            // never be bought. Boot-time inclusion alone does not cover this: the swap
+            // happens hours later, on a connection that was opened before the names
+            // existed.
+            subscribeCoreSymbols(merged.basket.filter(s => !previous.has(s)));
             _lastBasketSwapAt = Date.now();
             // Conviction only takes effect on the basket it was written for. Carrying it
             // across a basket change would size new names by a score describing old ones.
