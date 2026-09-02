@@ -2590,8 +2590,21 @@ check('state is written somewhere a deploy cannot destroy', () => {
   // running its no-ledger path and duplicating the whole basket.
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
                 .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
-  ok(/const DATA_DIR = process\.env\.ATLAS_DATA_DIR \|\| '\.';/.test(src),
-     'the state directory must be configurable so it can point at a mounted volume');
+  ok(/const DATA_DIR = process\.env\.ATLAS_DATA_DIR \|\| process\.env\.RAILWAY_VOLUME_MOUNT_PATH \|\| '\.';/.test(src),
+     'the state directory must pick up a Railway volume automatically, with an explicit override');
+  // Attaching the volume must be sufficient. Requiring a hand-set variable leaves room
+  // to set it to a path that does not match the mount, which fails exactly as silently
+  // as the original bug did.
+  ok(src.indexOf('process.env.ATLAS_DATA_DIR') < src.indexOf('process.env.RAILWAY_VOLUME_MOUNT_PATH'),
+     'the explicit override must take precedence over the auto-detected mount');
+  // A write that goes nowhere must be impossible to mistake for a write that works.
+  ok(/function verifyStateDir\(\)/.test(src), 'boot must verify the state directory');
+  ok(/fsx\.writeFileSync\(probe/.test(src), 'and prove it by actually writing, not just checking it exists');
+  ok(/State is being written to the WORKING DIRECTORY/.test(src),
+     'and warn plainly when state will not survive a deploy');
+  const bootIdx = src.indexOf('verifyStateDir();');
+  ok(bootIdx > 0 && bootIdx < src.indexOf('loadState();', bootIdx),
+     'the check must run before state is read, so the log explains the result that follows');
   ok(/const BACKUP_FILE   = dataPath\('atlas-solar-state\.json'\)/.test(src),
      'the state file must go through it');
   ok(!/BACKUP_FILE\s*=\s*'\.\//.test(src), 'and must no longer be hard-coded to the working directory');

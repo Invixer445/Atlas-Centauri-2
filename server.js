@@ -118,11 +118,47 @@ const START_CAPITAL = 1000;
 // every one — measured 2026-09-01: six positions duplicated, $477.55 mis-booked as
 // trades, cash drained to $0.63.
 //
-// Point ATLAS_DATA_DIR at the Railway volume's mount path and state survives deploys.
-// Defaults to '.' so local runs and tests are unchanged.
-const DATA_DIR = process.env.ATLAS_DATA_DIR || '.';
+// Railway sets RAILWAY_VOLUME_MOUNT_PATH automatically in any service with a volume
+// attached, so ATTACHING THE VOLUME IS THE WHOLE FIX — no variable to set, and no
+// chance of setting it to a path that does not match the mount. ATLAS_DATA_DIR stays as
+// an explicit override for other hosts or for pointing somewhere else deliberately.
+// Falls back to '.' so local runs and tests are unchanged.
+const DATA_DIR = process.env.ATLAS_DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
 const dataPath = (name) => require('path').join(DATA_DIR, name);
 const BACKUP_FILE   = dataPath('atlas-solar-state.json');
+
+// PROVE THE STATE DIRECTORY IS REAL AND WRITABLE, AT BOOT, OUT LOUD.
+// The whole failure was silent: state was written every 5 minutes to a directory that
+// evaporated on deploy, and the only symptom was one easily-missed "No backup" line at
+// the next startup. A write that goes nowhere must be impossible to mistake for a write
+// that works, so this says exactly where state lives and whether it will survive.
+function verifyStateDir() {
+  const fsx = require('fs'), pathx = require('path');
+  const durable = DATA_DIR !== '.';
+  try {
+    fsx.mkdirSync(DATA_DIR, { recursive: true });
+    const probe = pathx.join(DATA_DIR, '.atlas-write-probe');
+    fsx.writeFileSync(probe, String(Date.now()));
+    fsx.unlinkSync(probe);
+  } catch (e) {
+    console.error(`[STATE] ❌ CANNOT WRITE to "${DATA_DIR}" (${e.message}). Nothing will be ` +
+                  `remembered across restarts, and the boot sync will re-adopt every broker ` +
+                  `position from scratch. Fix the volume mount before trusting this run.`);
+    return false;
+  }
+  if (durable) {
+    const src = process.env.ATLAS_DATA_DIR ? 'ATLAS_DATA_DIR' : 'RAILWAY_VOLUME_MOUNT_PATH';
+    const existing = fsx.existsSync(BACKUP_FILE);
+    console.log(`[STATE] ✅ Durable storage at "${DATA_DIR}" (via ${src}) — ` +
+                `${existing ? 'existing state found, it will be restored' : 'no state yet, this is the first run on this volume'}`);
+  } else {
+    console.warn(`[STATE] ⚠️  State is being written to the WORKING DIRECTORY, which on a ` +
+                 `container host is deleted on every deploy. The bot will forget its positions ` +
+                 `each time you push. Attach a volume (Railway then sets RAILWAY_VOLUME_MOUNT_PATH ` +
+                 `automatically), or set ATLAS_DATA_DIR to a persistent path.`);
+  }
+  return true;
+}
 
 // ─── LIVE TRADING CONFIG ─────────────────────────────────────────────────
 // LIVE_TRADING must be the literal string "true" to route real orders.
@@ -7985,6 +8021,7 @@ if (require.main === module) app.listen(PORT, async () => {
   console.log(`[STRATEGY] EMA(${STRATEGY.EMA_FAST}/${STRATEGY.EMA_SLOW}) + RSI(${STRATEGY.RSI_PERIOD}) gate ${STRATEGY_GATE_ENABLED ? 'ON' : 'OFF'}`);
   console.log(`[MODE] Autonomous entries ${AUTONOMOUS_TRADING ? 'ON (ATLAS is the brain)' : 'OFF (pure executor — TradingView drives entries)'}`);
 
+  verifyStateDir();          // say where state lives BEFORE trying to read it
   loadState();
   if (!riskSystem.dailyResetDate) riskSystem.dailyResetDate = getEasternTimeParts().dateStr;
 
@@ -8126,7 +8163,7 @@ module.exports = {
     FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
     CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore,
     CORE_PHASE1_FRACTION, effectiveCoreFraction, rebasePeakForCoreFlow, unlockStepDownIsActionable,
-    coreWeightMap, coreBuyStep, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS,
+    coreWeightMap, coreBuyStep, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, verifyStateDir,
     CORE_TILT_ON, CORE_TILT_STRENGTH, CORE_TILT_MAX, CORE_TILT_MIN, CORE_TILT_MAX_SHARE,
     getCoreConviction: () => CORE_CONVICTION,
     setCoreConviction: (v) => { CORE_CONVICTION = (v && typeof v === 'object') ? v : {}; },
