@@ -2583,6 +2583,42 @@ check('the boot sync does not adopt core holdings as trades', () => {
   ok(/Recovered core holding/.test(src), 'and logged, so a recovery is visible in the boot output');
 });
 
+check('the reconciler can see the core book, not just the trading book', () => {
+  // It summed longPositions + shortPositions only. That was harmless while a state wipe
+  // dumped core holdings into longPositions anyway — but once v11.48 filed them
+  // correctly in coreHolding, every core position read as atlasQty 0 and the reconciler
+  // reported the WHOLE portfolio as drift on every boot (observed: 6 positions, all
+  // atlasQty 0). Worse than noise: an alarm that always fires trains you to ignore the
+  // one time it is real, and a genuine core discrepancy became undetectable.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('async function reconcileWithBroker'), src.indexOf("app.post('/api/reconcile'"));
+  ok(/portfolio\.coreHolding \|\| \{\}\)\.forEach/.test(fn),
+     'the reconciler must include core holdings in its picture of what ATLAS owns');
+  ok(/atlasMap\[s\] = \(atlasMap\[s\] \|\| 0\) \+ lot\.qty;/.test(fn),
+     'core quantities must be ADDED to the same map the broker is compared against');
+  ok(/book: bookOf\[sym\] \|\| 'none'/.test(fn),
+     'drift must name which book the position lives in, or the report cannot be acted on');
+  // Float tolerance: a holding split across two books is a SUM, and ~1 in 4 six-decimal
+  // pairs is not exactly representable. Exact equality invents drift from IEEE rounding.
+  ok(/Math\.abs\(atlasQty - brokerQty\) > 1e-6/.test(fn),
+     'quantities must compare with a tolerance, not exact float equality');
+  ok(!/if \(atlasQty !== brokerQty\)/.test(fn), 'exact equality must be gone');
+
+  // BEHAVIOURAL: a core-only holding that matches the broker must NOT be reported.
+  if (String(process.env.LIVE_TRADING).toLowerCase() === 'true') return;
+  const savedCore = I.portfolio.coreHolding, savedLong = I.portfolio.longPositions;
+  I.portfolio.coreHolding = { ZZTEST: { qty: 3.071078, avgPrice: 62, investedCash: 190 } };
+  I.portfolio.longPositions = {};
+  // Mirror the reconciler's own arithmetic over the two books, which is the thing that
+  // was wrong — summing only the trading book gave 0 for every core name.
+  const atlas = Object.entries(I.portfolio.longPositions).reduce((t, [, l]) => t + l.reduce((a, x) => a + x.qty, 0), 0)
+              + Object.entries(I.portfolio.coreHolding).reduce((t, [, l]) => t + l.qty, 0);
+  I.portfolio.coreHolding = savedCore; I.portfolio.longPositions = savedLong;
+  ok(Math.abs(atlas - 3.071078) < 1e-9,
+     `a core-only holding must count toward what ATLAS believes it owns, got ${atlas}`);
+});
+
 check('state is written somewhere a deploy cannot destroy', () => {
   // './atlas-solar-state.json' is a relative path inside the container working
   // directory. On Railway that filesystem is ephemeral, so every deploy discarded it —
