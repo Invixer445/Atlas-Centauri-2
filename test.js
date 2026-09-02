@@ -2613,8 +2613,11 @@ check('state is written somewhere a deploy cannot destroy', () => {
   ok(/const TRIM_DECISION_LOG = dataPath\(/.test(src), 'and the trim decision log');
   // Default must stay '.', or local runs and tests would write somewhere unexpected.
   const path = require('path');
-  ok(I.BACKUP_FILE === path.join(process.env.ATLAS_DATA_DIR || '.', 'atlas-solar-state.json'),
-     `the resolved path must honour the env var, got ${I.BACKUP_FILE}`);
+  const expectedDir = process.env.ATLAS_DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
+  ok(I.DATA_DIR === expectedDir,
+     `DATA_DIR must resolve override → volume → cwd, expected "${expectedDir}" got "${I.DATA_DIR}"`);
+  ok(I.BACKUP_FILE === path.join(expectedDir, 'atlas-solar-state.json'),
+     `the resolved path must honour whichever is set, got ${I.BACKUP_FILE}`);
 });
 
 check('a blocked entry names the check that FAILED, not the ones that passed', () => {
