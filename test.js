@@ -2509,6 +2509,35 @@ check('a restart does not liquidate the basket Venus chose', () => {
      'a genuinely dropped name must still be exited in full');
 });
 
+check('a basket meant to last months is not churned by a daily model call', () => {
+  // The prompt asks Venus for a basket to HOLD FOR MONTHS, but the proposal runs every
+  // 24h and was adopted every single time — so a name could be bought and sold out on
+  // nothing more than the model sampling differently two days running. Observed
+  // 2026-09-01: the new basket dropped PFE, the best performer in the book at +$2.70,
+  // and added five names. ~$500 of turnover from one LLM call, spread paid both ways.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/const maySwap = firstEver \|\| heldMs >= CORE_BASKET_MIN_HOLD_MS;/.test(src),
+     'a swap must require the current basket to have been held long enough');
+  ok(/const firstEver = !_venusBasketReceived;/.test(src),
+     'the FIRST basket must be adopted immediately, or the core never starts');
+  ok(/if \(CORE_BASKET_SOURCE === 'venus' && maySwap\)/.test(src),
+     'the swap branch must be gated on it');
+  ok(/_lastBasketSwapAt = Date\.now\(\);/.test(src), 'and the swap must reset the clock');
+  // Proposals must STILL be recorded every cycle — the register scores them out of
+  // sample, and skipping the record would quietly kill the experiment.
+  const propIdx = src.indexOf('recordBasketProposal(prop);');
+  const gateIdx = src.indexOf('const maySwap =');
+  ok(propIdx > 0 && propIdx < gateIdx,
+     'every proposal must be recorded BEFORE the adoption gate, so scoring is unaffected');
+  // The clock must survive a restart, or frequent deploys reintroduce the churn.
+  ok(/lastBasketSwapAt: _lastBasketSwapAt,/.test(src), 'the hold clock must be persisted');
+  ok(/_lastBasketSwapAt = Number\.isFinite\(state\.lastBasketSwapAt\)/.test(src),
+     'and restored, or every deploy resets it to zero and permits an immediate swap');
+  ok(I.CORE_BASKET_MIN_HOLD_MS >= 7 * 86400000,
+     `the minimum hold must be at least a week, got ${(I.CORE_BASKET_MIN_HOLD_MS/86400000).toFixed(1)}d`);
+});
+
 check('conviction is adopted only with the basket it describes', () => {
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
                 .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
@@ -2531,10 +2560,65 @@ check('the boot sync does not adopt core holdings as trades', () => {
   // guard keeping the core separate was undone at boot.
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
                 .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
-  ok(/portfolio\.coreHolding\[bp\.symbol\]\) \{/.test(src),
+  ok(/portfolio\.coreHolding && portfolio\.coreHolding\[bp\.symbol\]/.test(src),
      'the adoption loop must skip symbols already held in the core book');
   ok(/is a core holding — left out of the trading book/.test(src),
      'and say so, because a silent skip is indistinguishable from a missed position');
+
+  // THE GUARD MUST NOT DEPEND ON SAVED STATE. Asking the ledger which symbols are core
+  // is useless in the one situation this sync exists for — a wipe — because a wipe is
+  // what empties the ledger. Measured 2026-09-01: state lost on a Railway deploy, all
+  // six core holdings adopted into the trading book with stop-losses, the core then
+  // bought a SECOND copy of five of them, cash drained $429.66 → $0.63, heat ~83%.
+  ok(/const tradingImpossible = PHASE_GATE_ENABLED && tradingPhaseLocked\(\);/.test(src),
+     'while trading is phase-locked no position CAN be a trade — the sync must use that');
+  ok(/const isBasketMember = CORE_HOLD_SYMBOLS\.includes\(bp\.symbol\);/.test(src),
+     'and a current basket member must be recognised as core without any saved state');
+  ok(/if \(CORE_HOLD_ON && \(ledgerSaysCore \|\| tradingImpossible \|\| isBasketMember\)\)/.test(src),
+     'any of the three must be enough to keep it out of the trading book');
+  // Skipping alone is NOT enough: unrecorded shares are invisible to ATLAS, and the
+  // core buys them all over again. That is what actually doubled every position.
+  ok(/portfolio\.coreHolding\[bp\.symbol\] = \{\s*\n?\s*qty, avgPrice: bp\.avg_entry_price,/.test(src),
+     'a recovered core holding must be WRITTEN to the core book, not merely skipped');
+  ok(/Recovered core holding/.test(src), 'and logged, so a recovery is visible in the boot output');
+});
+
+check('state is written somewhere a deploy cannot destroy', () => {
+  // './atlas-solar-state.json' is a relative path inside the container working
+  // directory. On Railway that filesystem is ephemeral, so every deploy discarded it —
+  // the bot never once resumed from saved state, which is why the boot sync kept
+  // running its no-ledger path and duplicating the whole basket.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/const DATA_DIR = process\.env\.ATLAS_DATA_DIR \|\| '\.';/.test(src),
+     'the state directory must be configurable so it can point at a mounted volume');
+  ok(/const BACKUP_FILE   = dataPath\('atlas-solar-state\.json'\)/.test(src),
+     'the state file must go through it');
+  ok(!/BACKUP_FILE\s*=\s*'\.\//.test(src), 'and must no longer be hard-coded to the working directory');
+  // Everything the bot needs across a restart, not just the portfolio.
+  ok(/const BASKET_LOG = dataPath\(/.test(src), 'the basket register must persist too — it is scored over months');
+  ok(/const TRIM_DECISION_LOG = dataPath\(/.test(src), 'and the trim decision log');
+  // Default must stay '.', or local runs and tests would write somewhere unexpected.
+  const path = require('path');
+  ok(I.BACKUP_FILE === path.join(process.env.ATLAS_DATA_DIR || '.', 'atlas-solar-state.json'),
+     `the resolved path must honour the env var, got ${I.BACKUP_FILE}`);
+});
+
+check('a blocked entry names the check that FAILED, not the ones that passed', () => {
+  // "[RISK] Elevated [drawdown, dailyLoss]" listed the checks that PASSED. It reads as
+  // the exact opposite of what it means, and the one time it mattered it pointed the
+  // diagnosis at two healthy metrics while portfolio heat was the check actually
+  // blocking every entry.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(!/\[RISK\] Elevated \[\$\{riskSystem\.checksPassing\.join/.test(src),
+     'the log must not print the passing checks as though they were the problem');
+  ok(/filter\(k => !riskSystem\.checksPassing\.includes\(k\)\)/.test(src),
+     'it must select the checks that are NOT passing');
+  ok(/Entries blocked — FAILING:/.test(src), 'and say plainly that entries are blocked');
+  // The number and its limit, or the operator still cannot tell how far over it is.
+  ok(/\$\{\(all\[k\] \* 100\)\.toFixed\(1\)\}% > \$\{\(limits\[k\] \* 100\)\.toFixed\(0\)\}%/.test(src),
+     'each failing check must report its value against its limit');
 });
 
 check('venus basket mode buys nothing until Venus has actually proposed', () => {
@@ -2558,7 +2642,7 @@ check('venus basket mode buys nothing until Venus has actually proposed', () => 
   // regression eventually walks through. What actually matters is that the flag is set
   // inside the branch that swaps the basket, never merely where a proposal is logged.
   const swapIdx = src.indexOf('CORE_HOLD_SYMBOLS.push(...prop.basket)');
-  const branchIdx = src.lastIndexOf("if (CORE_BASKET_SOURCE === 'venus') {", swapIdx);
+  const branchIdx = src.lastIndexOf("if (CORE_BASKET_SOURCE === 'venus' && maySwap) {", swapIdx);
   const branchEnd = src.indexOf('\n          }', swapIdx);
   ok(swapIdx > 0 && branchIdx > 0 && branchEnd > swapIdx,
      'the basket swap must sit inside an explicit CORE_BASKET_SOURCE=venus branch');
