@@ -2272,14 +2272,23 @@ check('the core fills the basket in minutes, not an hour', () => {
      'maintainCoreHolding must loop up to CORE_BUYS_PER_CYCLE times');
   ok(/if \(!coreBuyStep\(\)\) break;/.test(fn),
      'and must call coreBuyStep, stopping as soon as one pass buys nothing');
-  ok(I.CORE_BUYS_PER_CYCLE > 1, 'more than one buy per cycle, or the loop is pointless');
+  // The DEFAULT must be >1, not the live value. Asserting the runtime value turns a
+  // legal operator override (CORE_BUYS_PER_CYCLE=1) into a red suite over correct code,
+  // which is the same trap that made CORE_HOLD_FRACTION=0.9 fail.
+  ok(/process\.env\.CORE_BUYS_PER_CYCLE \|\| '([2-9]|10)'/.test(src),
+     'the DEFAULT must be more than one buy per cycle, or the loop is pointless');
   // The cadence must come from the constant, not a hard-coded 5 minutes.
   ok(/setInterval\(maintainCoreHolding, CORE_INTERVAL_MS\)/.test(stripped),
      'the core interval must be CORE_INTERVAL_MS');
-  ok(I.CORE_INTERVAL_MS <= 60000, `cadence must be a minute or faster, got ${I.CORE_INTERVAL_MS}ms`);
+  const dBuys = Number((src.match(/process\.env\.CORE_BUYS_PER_CYCLE \|\| '(\d+)'/) || [])[1]);
+  const dInt  = Number((src.match(/process\.env\.CORE_INTERVAL_MS \|\| '(\d+)'/) || [])[1]);
+  ok(dBuys > 0 && dInt > 0, 'the cadence defaults must be readable from source');
+  ok(dInt <= 60000, `the DEFAULT cadence must be a minute or faster, got ${dInt}ms`);
   // Ten names must be reachable well inside a session.
-  const minutesToFill = (10 / I.CORE_BUYS_PER_CYCLE) * (I.CORE_INTERVAL_MS / 60000);
-  ok(minutesToFill <= 5, `a 10-name basket must fill within 5 minutes, takes ${minutesToFill.toFixed(1)}`);
+  // Computed from the DEFAULTS, so an operator deliberately slowing the core down does
+  // not turn this into a failure about code that is behaving exactly as configured.
+  const minutesToFill = (10 / dBuys) * (dInt / 60000);
+  ok(minutesToFill <= 5, `a 10-name basket must fill within 5 minutes by default, takes ${minutesToFill.toFixed(1)}`);
 });
 
 check('the buy loop actually deploys the account and then stops', () => {
@@ -2525,6 +2534,86 @@ check('a restart does not liquidate the basket Venus chose', () => {
   I.CORE_HOLD_SYMBOLS.forEach(s => { if (saved[s]) I.marketData[s] = saved[s]; else delete I.marketData[s]; });
   ok(pick && pick.sym === '__DROPPED' && pick.qty >= 5,
      'a genuinely dropped name must still be exited in full');
+});
+
+check('broker cash movements are adopted so dividends get reinvested', () => {
+  // portfolio.cash was written exactly twice: at boot from syncFromBroker, and from the
+  // restored state. Nothing reconciled it again all session. So a dividend credited at
+  // 10am was invisible to ATLAS until the next restart, and the core — which only ever
+  // spends portfolio.cash — never redeployed it. This basket yields ~2.8%, about $2.24
+  // a month on a $960 holding, and reinvesting it is the one compounding mechanism here
+  // that requires no forecast and cannot be wrong. It was silently leaking.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function adoptBrokerCashDrift'), src.indexOf('function executionDriftPct'));
+  ok(fn.length > 100, 'adoptBrokerCashDrift must exist');
+  ok(/portfolio\.cash = brokerMirror\.cash;/.test(fn), 'the ledger must conform to the broker');
+  // Anything in flight makes the difference a TIMING artefact: the ledger is debited on
+  // submission, the broker only on fill. Adopting then would double-count the spend.
+  // BOTH directions. Trims credit the ledger synchronously and the broker pays on fill,
+  // so a mid-flight trim leaves the ledger holding cash the broker does not — which
+  // reads as drift and would DELETE the credit, then re-adopt it after the fill.
+  ok(/if \(_coreBuyInFlight > 0 \|\| _coreSellInFlight > 0\) return 0;/.test(fn),
+     'must not adopt while core buys OR sells are in flight');
+  const trimFn = src.slice(src.indexOf('async function trimCoreStep'), src.indexOf('function maintainCoreHolding'));
+  ok(/_coreSellInFlight\+\+;/.test(trimFn), 'a submitted trim must be marked in flight');
+  ok(/_coreSellInFlight = Math\.max\(0, _coreSellInFlight - 1\)/.test(trimFn), 'and cleared when the broker answers');
+  ok(/\.then\(r => \{ if \(!r\.ok\) rollback\(r\.error\); settle\(\); \}\)/.test(trimFn) &&
+     /\.catch\(e => \{ rollback\(e\.message\); settle\(\); \}\)/.test(trimFn),
+     'both broker paths must settle, or one network error wedges cash adoption forever');
+  ok(/if \(pendingEntryNotional\(\) > 0\) return 0;/.test(fn), 'nor while trading entries are pending');
+  ok(/Object\.keys\(pendingOrders \|\| \{\}\)\.length > 0/.test(fn), 'nor while any order is open');
+  ok(/Math\.abs\(delta\) < CASH_DRIFT_MIN/.test(fn), 'a rounding-sized difference must be ignored');
+  // New outside cash is capital, not a trading gain — same rebase a core flow gets, or
+  // it reads as a drawdown exactly as funding the core once did.
+  ok(/rebasePeakForCoreFlow\(-delta\)/.test(fn), 'adopted cash must rebase the drawdown peak');
+  ok(/\[CASH\]/.test(fn), 'every adoption must be logged — a silent correction hides a bug');
+  // And it must actually be CALLED, from the one place that has a fresh snapshot.
+  const mStart = src.indexOf('async function refreshBrokerMirror');
+  ok(/adoptBrokerCashDrift\(\);/.test(src.slice(mStart, src.indexOf('\n}', mStart))),
+     'the mirror refresh must invoke it, or it never runs');
+});
+
+check('the trim keeps pace with the buy side', () => {
+  // The buy loop did four names a minute while the trim did one every five, so a
+  // rebalance that must SELL before it can buy left the account half-undeployed for
+  // ~25 minutes. Observed 2026-09-02: five names needed trimming at once.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const wrapper = src.slice(src.indexOf('async function trimCoreHolding'), src.indexOf('async function trimCoreStep'));
+  ok(/for \(let step = 0; step < CORE_TRIMS_PER_CYCLE; step\+\+\)/.test(wrapper),
+     'trimming must loop up to CORE_TRIMS_PER_CYCLE times');
+  ok(/if \(!\(await trimCoreStep\(\)\)\) break;/.test(wrapper),
+     'and stop as soon as a pass trims nothing');
+  ok(/process\.env\.CORE_TRIMS_PER_CYCLE \|\| '([2-9]|10)'/.test(src),
+     'the DEFAULT must be more than one trim per cycle, or the loop is pointless');
+  ok(/setInterval\(\(\) => \{ trimCoreHolding\(\)[\s\S]{0,120}?CORE_INTERVAL_MS\)/.test(src),
+     'the trim cadence must match the buy cadence, not a hard-coded 5 minutes');
+  // A step that never reports success would run once and stop; one that always reports
+  // success would loop to the cap every cycle.
+  const step = src.slice(src.indexOf('async function trimCoreStep'), src.indexOf('function maintainCoreHolding'));
+  ok(/return true;/.test(step) && /if \(!pick\) return false;/.test(step),
+     'the step must report whether it actually trimmed');
+});
+
+check('Venus is told what Jupiter can actually trade', () => {
+  // Venus kept proposing names the trading engine can never use — VIVK $0.77, PMVP
+  // $1.12, AMBR $1.30, PPBT on 1,307 shares — each burning a full research cycle before
+  // being thrown away at the screen. Cheaper to tell it the floor than to reject it after.
+  //
+  // BUILD the prompt rather than grep it: the constants it interpolates are declared
+  // AFTER buildPrompt and resolve only at call time, so a typo would surface on the
+  // first research cycle in production rather than at boot.
+  const V = require('./server.js').venus;
+  const p = V.buildPrompt([{ headline: 'x', symbols: ['AAA'], source: 's', created_at: 'now' }]);
+  ok(typeof p === 'string' && p.length > 500, 'the prompt must build without throwing');
+  ok(/share price MUST be between \$\d/.test(p), 'it must state the price floor with a real number');
+  ok(/daily volume MUST be at least [\d,]+ shares/.test(p), 'and the volume floor with a real number');
+  ok(!/\$NaN|undefined|\[object/.test(p), 'no unresolved interpolation may reach the model');
+  ok(/VIVK|PMVP|AMBR|PPBT/.test(p), 'naming the actual rejections makes the rule concrete');
+  // The floors quoted must be the ones the engine enforces, or the advice is a lie.
+  const m = p.match(/at least ([\d,]+) shares/);
+  ok(m && parseInt(m[1].replace(/,/g, ''), 10) > 0, 'the quoted volume floor must be a real threshold');
 });
 
 check('the core can see a price for every name in its basket', () => {
@@ -2847,10 +2936,17 @@ check('an operator halt stops the core; an automatic one does not', () => {
     const j = src.indexOf('\nfunction ', i + 1);
     return src.slice(i, j > i ? j : i + 4000);
   };
-  const buy  = body('maintainCoreHolding');
-  const trim = body('trimCoreHolding');
-  ok(/if \(coreHaltedByOperator\(\)\) return;/.test(buy), 'core BUYING must honour the operator halt');
-  ok(/if \(coreHaltedByOperator\(\)\) return;/.test(trim), 'core TRIMMING must honour the operator halt');
+  // Both sides are now a bounded LOOP over a step function, so the guard lives in the
+  // step — where it belongs, since a guard in the wrapper would be checked once per
+  // cycle instead of once per order.
+  const buy  = body('coreBuyStep');
+  const trim = body('trimCoreStep');
+  ok(/if \(coreHaltedByOperator\(\)\) return false;/.test(buy), 'core BUYING must honour the operator halt');
+  ok(/if \(coreHaltedByOperator\(\)\) return false;/.test(trim), 'core TRIMMING must honour the operator halt');
+  // And the guard must sit in the STEP, not only the wrapper: a wrapper-only check
+  // would let an operator halt mid-cycle still fire the remaining orders in the loop.
+  ok(!/function trimCoreHolding\(\)[\s\S]{0,200}?coreHaltedByOperator/.test(src),
+     'the halt must be checked per order, not once per cycle');
 });
 
 check('the core holding is invisible to every trading exit path', () => {

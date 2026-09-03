@@ -791,6 +791,16 @@ MECHANISMS — pick the one that genuinely applies, or "none":
 
 RULES:
 - US-listed common stocks only. Skip ETFs, indices, crypto, foreign listings, OTC.
+- HARD TRADEABILITY FLOOR — an idea that fails this is worse than useless, because it
+  consumes a research cycle and is then thrown away without ever being traded:
+    · share price MUST be between $${DYNAMIC_MIN_PRICE} and $${affordableMaxPrice().toFixed(0)}. Below the floor the spread
+      eats the trade and the name is easily manipulated; above the ceiling a single
+      share is too large for this account to size.
+    · daily volume MUST be at least ${(EFFECTIVE_MIN_DAY_VOL / 1000).toFixed(0)},000 shares. Thinner than that and the
+      quote is unreliable on this data feed.
+  Recent rejections you caused, all after a full research cycle was spent on them:
+  VIVK at $0.77, PMVP at $1.12, AMBR at $1.30, PPBT on 1,307 shares of volume. Screen
+  these out YOURSELF — the trading engine cannot use them under any circumstances.
 - A mega-cap reacting to widely-covered news is almost never an edge — it is priced in
   within seconds by participants far faster than us. Prefer neglect over headlines.
 - If the only thing you can say is "this seems bullish", the mechanism is "none".
@@ -1407,6 +1417,11 @@ const venus = {
   get AI_MODEL() { return AI_MODEL; },
   resolveAiModel,
   analyze, research, assess, assessTrim, proposeBasket, researchRecommendations, getResearch, getResearchFor, institutionalInterest,
+  // Exposed so the suite can BUILD the prompt rather than reason about whether the
+  // constants it interpolates are in scope. They are declared after this function and
+  // resolve only at call time, so a typo here would surface on the first research
+  // cycle in production, not at boot.
+  buildPrompt,
   learn, calibrateConviction, getCalibration, getState, serialize, loadState: venusLoadState,
   MECHANISMS, TRADEABLE_MECHANISMS, validateRec, isTradeableIdea, recsFromParsed,
   trainOffline, ingestCalibrationData, getTrainStats
@@ -2649,6 +2664,10 @@ let _coreBuyInFlight = 0;
 // so orders placed between refreshes are invisible to it; without tracking them the
 // funding check would clear the same dollars over and over.
 let _coreCommittedSinceMirror = 0;
+// Core SELLS submitted but not yet acknowledged. Trims credit the ledger synchronously
+// and are paid by the broker on fill, so without this the cash-drift adopter reads the
+// gap as real and wipes the credit.
+let _coreSellInFlight = 0;
 
 // HOW FAST THE BASKET FILLS. One name every five minutes needed 50 minutes to build ten
 // names, and Venus only proposes late in the session — so the account spent Monday
@@ -2656,6 +2675,9 @@ let _coreCommittedSinceMirror = 0;
 // The per-cycle cap is not timidity: each buy is a market order, and pacing them lets
 // the broker-rejection backoff engage before the whole allocation is committed.
 const CORE_BUYS_PER_CYCLE = Math.max(1, Math.min(10, parseInt(process.env.CORE_BUYS_PER_CYCLE || '4', 10)));
+// Trims per cycle, matching the buy side. One name every five minutes meant a rebalance
+// that must SELL before it can buy left the account half-undeployed for ~25 minutes.
+const CORE_TRIMS_PER_CYCLE = Math.max(1, Math.min(10, parseInt(process.env.CORE_TRIMS_PER_CYCLE || '4', 10)));
 const CORE_INTERVAL_MS    = Math.max(15000, parseInt(process.env.CORE_INTERVAL_MS || '60000', 10));
 const BASKET_LOG = dataPath('atlas-basket-proposals.json');
 
@@ -2678,6 +2700,10 @@ function recordBasketProposal(prop) {
 // mirror refreshes every 60s; 5 minutes tolerates a couple of missed refreshes without
 // letting genuinely stale cash figures veto trading.
 const BROKER_MIRROR_MAX_AGE_MS = 5 * 60 * 1000;
+// Smallest broker/ledger cash difference worth adopting. Below this it is rounding on a
+// fractional fill, and rewriting the ledger for a cent produces log noise that hides the
+// dividend credits this exists to catch.
+const CASH_DRIFT_MIN = Math.max(0.01, parseFloat(process.env.CASH_DRIFT_MIN || '0.25'));
 
 const FRACTIONAL_ENABLED = process.env.FRACTIONAL_ENABLED !== 'false';
 // Floor on position value, so a rescued trade is worth the spread it pays. Alpaca's
@@ -5096,10 +5122,23 @@ function mostOverweightCore(totalValue, band = CORE_TRIM_BAND) {
 // Sell the excess of whichever holding has run furthest past its slice. This is the
 // core's ONLY seller, and it is arithmetic: no view is taken on whether the price is
 // high, only on whether the position has outgrown its share of the basket.
+// MULTI-PASS, MATCHING THE BUY SIDE. The buy loop does four names a minute while the
+// trim did one name every five, so a rebalance that has to SELL before it can buy took
+// ~25 minutes with the account sitting half-undeployed the whole time. Observed
+// 2026-09-02: five names needed trimming after the duplication was unwound. The passes
+// are still bounded and still one order at a time — this changes the cadence, not the
+// arithmetic, and every pass re-reads the book so it stops the moment nothing is
+// meaningfully overweight.
 async function trimCoreHolding() {
-  if (!CORE_HOLD_ON) return;
-  if (!getCurrentMarket()) return;
-  if (coreHaltedByOperator()) return;
+  for (let step = 0; step < CORE_TRIMS_PER_CYCLE; step++) {
+    if (!(await trimCoreStep())) break;
+  }
+}
+
+async function trimCoreStep() {
+  if (!CORE_HOLD_ON) return false;
+  if (!getCurrentMarket()) return false;
+  if (coreHaltedByOperator()) return false;
   // THE SAME GUARD THE BUY SIDE HAS, AND FOR A WORSE REASON. maintainCoreHolding
   // refuses to act in venus mode until a proposal exists, so it cannot buy the default
   // basket by mistake. The trim had no such check — and its mistake is not buying the
@@ -5114,7 +5153,7 @@ async function trimCoreHolding() {
       console.log('[CORE] Trim paused until Venus proposes (CORE_BASKET_SOURCE=venus) — ' +
                   'without a live basket every holding would look off-basket and be sold out.');
     }
-    return;
+    return false;
   }
   const tv = getTotalValue();
 
@@ -5151,7 +5190,7 @@ async function trimCoreHolding() {
       }
     }
   }
-  if (!pick) return;
+  if (!pick) return false;
 
   const lot = portfolio.coreHolding[pick.sym];
   const proceeds = pick.qty * pick.px;
@@ -5185,12 +5224,20 @@ async function trimCoreHolding() {
       console.warn(`[CORE] trim failed (${why}) — ledger rolled back $${proceeds.toFixed(2)}`);
       queueSaveState();
     };
+    // COUNTED IN FLIGHT, exactly as buys are. The ledger is credited synchronously
+    // above while the broker only pays on fill, so between the two the ledger holds
+    // cash the broker does not. adoptBrokerCashDrift would read that gap as real drift
+    // and DELETE the credit, then re-adopt it once the fill landed — churning the
+    // ledger and letting the core size a buy against cash that was never there.
+    _coreSellInFlight++;
+    const settle = () => { _coreSellInFlight = Math.max(0, _coreSellInFlight - 1); };
     broker.submitOrder({ symbol: pick.sym, side: 'sell', qty: pick.qty, type: 'market',
                          tif: 'day', refPrice: pick.px })
-      .then(r => { if (!r.ok) rollback(r.error); })
-      .catch(e => rollback(e.message));
+      .then(r => { if (!r.ok) rollback(r.error); settle(); })
+      .catch(e => { rollback(e.message); settle(); });
   }
   queueSaveState();
+  return true;
 }
 
 function maintainCoreHolding() {
@@ -5236,6 +5283,9 @@ function maintainCoreHolding() {
 // One top-up. Returns true if it bought, so the caller can keep going until the basket
 // is full, cash runs out, or nothing is meaningfully underweight.
 function coreBuyStep() {
+  // PER ORDER, not per cycle. The wrapper checks this once and then fires up to four
+  // buys; an operator halting mid-cycle would have watched the rest go out anyway.
+  if (coreHaltedByOperator()) return false;
   const pick = mostUnderweightCore();
   if (!pick) return false;                               // no fresh price on any member
 
@@ -5898,7 +5948,43 @@ async function refreshBrokerMirror() {
     // running commitment total starts over. Without this reset it would grow without
     // bound and eventually block the core from buying anything at all.
     _coreCommittedSinceMirror = 0;
+    adoptBrokerCashDrift();
   } catch (e) { brokerMirror = { at: Date.now(), ok: false, error: e.message }; }
+}
+
+// DIVIDENDS, AND ANYTHING ELSE THE BROKER MOVES ON ITS OWN.
+// portfolio.cash was written exactly twice: at boot from syncFromBroker, and from the
+// restored state file. Nothing reconciled it again for the rest of the session. So a
+// dividend credited at 10am was invisible to ATLAS until the next restart, and the core
+// — which only ever spends portfolio.cash — never redeployed it.
+//
+// That matters more than it sounds. This basket yields roughly 2.8%, about $2.24 a
+// month on a $960 holding, and reinvesting it is the ONE compounding mechanism in this
+// entire system that requires no forecast and cannot be wrong. It was silently leaking.
+//
+// The broker is authoritative — that is the premise of this execution mode — so the
+// ledger conforms to it. Both directions are adopted, because a ledger that thinks it
+// has more cash than it does produces exactly the rejection storm RULE 3.2 exists to
+// prevent. Every adoption is logged; a silent correction is indistinguishable from a bug.
+function adoptBrokerCashDrift() {
+  if (!EXEC_BROKER_AUTH) return 0;
+  if (!brokerMirror.ok || !Number.isFinite(brokerMirror.cash)) return 0;
+  // Anything in flight makes the difference a TIMING artefact, not real drift: the
+  // ledger is debited the moment an order is submitted, the broker only when it fills.
+  if (_coreBuyInFlight > 0 || _coreSellInFlight > 0) return 0;
+  if (pendingEntryNotional() > 0) return 0;
+  if (Object.keys(pendingOrders || {}).length > 0) return 0;
+  const delta = brokerMirror.cash - portfolio.cash;
+  if (Math.abs(delta) < CASH_DRIFT_MIN) return 0;
+  portfolio.cash = brokerMirror.cash;
+  // Cash appearing from outside is NEW capital to the core, not a gain the trading side
+  // made — rebase the peak exactly as a core flow does, or it reads as a drawdown.
+  rebasePeakForCoreFlow(-delta);
+  console.log(`[CASH] ${delta > 0 ? '+' : ''}$${delta.toFixed(2)} adopted from the broker ` +
+              `(ledger $${(brokerMirror.cash - delta).toFixed(2)} → $${brokerMirror.cash.toFixed(2)}) — ` +
+              `${delta > 0 ? 'dividend or credit; the core will redeploy it' : 'fee or debit'}`);
+  queueSaveState();
+  return delta;
 }
 
 function executionDriftPct() {
@@ -8220,7 +8306,7 @@ if (require.main === module) app.listen(PORT, async () => {
   //     position that is never meant to be traded.
   if (CORE_HOLD_ON) setInterval(maintainCoreHolding, CORE_INTERVAL_MS);
   // Trim runs on its own timer, offset so a buy and a sell never fire in the same tick.
-  if (CORE_HOLD_ON) setInterval(() => { trimCoreHolding().catch(e => console.warn('[CORE] trim error:', e.message)); }, 300000);
+  if (CORE_HOLD_ON) setInterval(() => { trimCoreHolding().catch(e => console.warn("[CORE] trim error:", e.message)); }, CORE_INTERVAL_MS);
 
   // 6. Profit vault — every 5 min
   setInterval(processProfitVault, 300000);
@@ -8293,7 +8379,7 @@ module.exports = {
     FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
     CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore,
     CORE_PHASE1_FRACTION, effectiveCoreFraction, rebasePeakForCoreFlow, unlockStepDownIsActionable,
-    coreWeightMap, basketWithRecovered, coreBuyStep, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, CORE_BASKET_MAX_NAMES, verifyStateDir,
+    coreWeightMap, basketWithRecovered, coreBuyStep, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, CORE_BASKET_MAX_NAMES, CORE_TRIMS_PER_CYCLE, CASH_DRIFT_MIN, adoptBrokerCashDrift, verifyStateDir,
     getRecoveredSymbols: () => _recoveredSymbols,
     CORE_TILT_ON, CORE_TILT_STRENGTH, CORE_TILT_MAX, CORE_TILT_MIN, CORE_TILT_MAX_SHARE,
     getCoreConviction: () => CORE_CONVICTION,
