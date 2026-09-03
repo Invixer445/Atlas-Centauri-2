@@ -2668,6 +2668,12 @@ let _coreCommittedSinceMirror = 0;
 // and are paid by the broker on fill, so without this the cash-drift adopter reads the
 // gap as real and wipes the credit.
 let _coreSellInFlight = 0;
+// True while a trim CYCLE is in progress. Guards the window between reading the book
+// and mutating it, which spans an LLM call.
+let _trimCycleRunning = false;
+// Last observed broker/ledger cash difference. A drift is only adopted once the SAME
+// difference has been seen twice running — see adoptBrokerCashDrift.
+let _lastCashDelta = 0;
 
 // HOW FAST THE BASKET FILLS. One name every five minutes needed 50 minutes to build ten
 // names, and Venus only proposes late in the session — so the account spent Monday
@@ -5130,8 +5136,23 @@ function mostOverweightCore(totalValue, band = CORE_TRIM_BAND) {
 // arithmetic, and every pass re-reads the book so it stops the moment nothing is
 // meaningfully overweight.
 async function trimCoreHolding() {
-  for (let step = 0; step < CORE_TRIMS_PER_CYCLE; step++) {
-    if (!(await trimCoreStep())) break;
+  // RE-ENTRANCY GUARD — the same one the buy side got when IT became a loop.
+  // trimCoreStep reads which name is overweight, then AWAITS an LLM call
+  // (venus.assessTrim) before decrementing the ledger. A second cycle starting inside
+  // that window reads the same unmutated book, picks the same name, and sells the same
+  // excess twice. Four steps, each with an LLM call and a broker round trip, can easily
+  // outrun the 60s interval, so the overlap is not hypothetical. This is precisely the
+  // check-then-act race that once put 18 HOOD orders in 50 seconds.
+  if (_trimCycleRunning) return;
+  _trimCycleRunning = true;
+  try {
+    for (let step = 0; step < CORE_TRIMS_PER_CYCLE; step++) {
+      if (!(await trimCoreStep())) break;
+    }
+  } finally {
+    // finally, not a trailing assignment: a throw anywhere in the loop would otherwise
+    // leave the flag stuck true and silently disable trimming for the rest of the run.
+    _trimCycleRunning = false;
   }
 }
 
@@ -5976,6 +5997,20 @@ function adoptBrokerCashDrift() {
   if (Object.keys(pendingOrders || {}).length > 0) return 0;
   const delta = brokerMirror.cash - portfolio.cash;
   if (Math.abs(delta) < CASH_DRIFT_MIN) return 0;
+  // THE DRIFT MUST PERSIST ACROSS TWO SNAPSHOTS BEFORE IT IS BELIEVED.
+  // The in-flight counters close the window while an order is outstanding, but they are
+  // cleared when the BROKER ACKNOWLEDGES the order, not when it FILLS. Alpaca moves cash
+  // on settlement, so between acknowledgement and fill the ledger has already been
+  // debited while broker cash has not — which looks exactly like money arriving. Adopting
+  // there would hand back cash that is already spent, and the core would spend it twice.
+  // A real credit (a dividend) is still there on the next refresh; a settling order is
+  // not. One extra minute of latency on dividends is a trivial price for not
+  // double-spending.
+  if (!(Math.abs(delta - _lastCashDelta) < CASH_DRIFT_MIN)) {
+    _lastCashDelta = delta;
+    return 0;
+  }
+  _lastCashDelta = 0;
   portfolio.cash = brokerMirror.cash;
   // Cash appearing from outside is NEW capital to the core, not a gain the trading side
   // made — rebase the peak exactly as a core flow does, or it reads as a drawdown.

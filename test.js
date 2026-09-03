@@ -2574,6 +2574,77 @@ check('broker cash movements are adopted so dividends get reinvested', () => {
      'the mirror refresh must invoke it, or it never runs');
 });
 
+check('two trim cycles cannot sell the same excess twice', () => {
+  // trimCoreStep reads which name is overweight, then AWAITS an LLM call
+  // (venus.assessTrim) before decrementing the ledger. A second cycle starting inside
+  // that window reads the same unmutated book, picks the same name, and sells the same
+  // excess again — the check-then-act race that once put 18 HOOD orders in 50 seconds.
+  // PRE-EXISTING: 11.51 had no guard either; the multi-pass loop only widened the window.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const wrapper = src.slice(src.indexOf('async function trimCoreHolding'), src.indexOf('async function trimCoreStep'));
+  ok(/if \(_trimCycleRunning\) return;/.test(wrapper), 'a second trim cycle must bail while one is running');
+  ok(/_trimCycleRunning = true;/.test(wrapper), 'and the flag must be raised before the loop');
+  // The guard must precede the loop; after it, it guards nothing.
+  ok(wrapper.indexOf('_trimCycleRunning) return') < wrapper.indexOf('step < CORE_TRIMS_PER_CYCLE'),
+     'the guard must run before the loop');
+  // Released in `finally`, or one throw inside the loop disables trimming permanently.
+  ok(/\} finally \{[\s\S]*?_trimCycleRunning = false;[\s\S]*?\}/.test(wrapper),
+     'the flag must be released in finally — a throw would otherwise wedge trimming for the whole run');
+  ok(!/\}\s*_trimCycleRunning = false;\s*\}$/.test(wrapper.trim()),
+     'releasing it only on the success path is not enough');
+});
+
+check('a settling order is not mistaken for a dividend', () => {
+  // The in-flight counters clear when the broker ACKNOWLEDGES an order, not when it
+  // FILLS. Alpaca moves cash on settlement, so between acknowledgement and fill the
+  // ledger is already debited while broker cash is not — which looks exactly like money
+  // arriving. Adopting there hands back cash that is already spent, and the core spends
+  // it twice. A real credit persists to the next refresh; a settling order does not.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function adoptBrokerCashDrift'), src.indexOf('function executionDriftPct'));
+  ok(/if \(!\(Math\.abs\(delta - _lastCashDelta\) < CASH_DRIFT_MIN\)\) \{/.test(fn),
+     'a drift must be seen twice before it is believed');
+  ok(/_lastCashDelta = delta;\s*\n\s*return 0;/.test(fn),
+     'the first sighting must record the delta and adopt nothing');
+  ok(/_lastCashDelta = 0;\s*\n\s*portfolio\.cash = brokerMirror\.cash;/.test(fn),
+     'adopting must clear the record, or the next unrelated drift adopts immediately');
+  // The persistence check must come AFTER the size check, or a stream of sub-threshold
+  // rounding differences would keep resetting the record and nothing would ever adopt.
+  ok(fn.indexOf('Math.abs(delta) < CASH_DRIFT_MIN') < fn.indexOf('delta - _lastCashDelta'),
+     'the size gate must run before the persistence gate');
+
+  // BEHAVIOURAL — run in a CHILD PROCESS with LIVE_TRADING=true, because the whole
+  // function is gated on EXEC_BROKER_AUTH (= LIVE_TRADING) and would otherwise return 0
+  // before reaching any logic worth testing. Safe: adoptBrokerCashDrift places no orders,
+  // it only reconciles the ledger, and merely requiring server.js does not start trading.
+  const probe = `
+    const I = require('${require('path').join(__dirname, 'server.js').replace(/\\/g, '/')}')._internals;
+    I.portfolio.cash = 100; I.riskSystem.peakValue = 1000;
+    I.setBrokerMirror({ at: Date.now(), ok: true, cash: 110, buying_power: 110, positions: [] });
+    const first = I.adoptBrokerCashDrift(), afterFirst = I.portfolio.cash;
+    const second = I.adoptBrokerCashDrift(), afterSecond = I.portfolio.cash;
+    const peak = I.riskSystem.peakValue;
+    console.log(JSON.stringify({ first, afterFirst, second, afterSecond, peak }));
+  `;
+  let r;
+  try {
+    const out = require('child_process').execFileSync(process.execPath, ['-e', probe], {
+      env: { ...process.env, LIVE_TRADING: 'true' }, encoding: 'utf8', timeout: 60000,
+    });
+    r = JSON.parse(out.trim().split('\n').filter(l => l.startsWith('{')).pop());
+  } catch (e) { throw new Error('probe failed: ' + (e.stdout || e.message)); }
+
+  ok(r.first === 0 && r.afterFirst === 100,
+     `the first sighting must adopt nothing, got ${r.first} / $${r.afterFirst}`);
+  ok(Math.abs(r.second - 10) < 1e-9 && Math.abs(r.afterSecond - 110) < 1e-9,
+     `the second must adopt the $10, got ${r.second} / $${r.afterSecond}`);
+  // New outside cash is capital, not a trading gain: the peak must rise with it, or the
+  // dividend reads as a drawdown exactly as funding the core once did.
+  ok(Math.abs(r.peak - 1010) < 1e-9, `the drawdown peak must rise by the adopted $10, got $${r.peak}`);
+});
+
 check('the trim keeps pace with the buy side', () => {
   // The buy loop did four names a minute while the trim did one every five, so a
   // rebalance that must SELL before it can buy left the account half-undeployed for
