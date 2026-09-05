@@ -1699,13 +1699,24 @@ check('the core banks profit by trimming winners back to target', () => {
   // turned a 2.09:1 payoff into 1.2:1 — so nothing here forms a view on price.
   if (!I.CORE_HOLD_ON) { ok(I.mostOverweightCore(1000) === null, 'disabled core must never trim'); return; }
   const savedCore = I.portfolio.coreHolding, savedCash = I.portfolio.cash;
+  const savedUnlocked = I.capitalSystem.tradingUnlocked;
   const saved = {};
+  // PIN THE PHASE. This test is about the TRIM, not about how much the account chooses
+  // to hold. The old fixture hardcoded a 50%-core layout (qty 0.5, cash 500) and broke
+  // the moment the unlock stopped stepping to a flat 50% — a fixture failing on a
+  // deliberate design change, not a regression. Locked, effectiveCoreFraction is
+  // CORE_PHASE1_FRACTION, so the holdings can be sized to whatever the engine actually
+  // targets and the arithmetic is exact under any allocation policy.
+  const F = (() => { I.capitalSystem.tradingUnlocked = false; return I.effectiveCoreFraction(); })();
+  const PER = 1000 * F / I.CORE_HOLD_SYMBOLS.length;      // dollar target per name
+  const QTY = PER / 100;                                  // at a $100 price
   const setup = () => {
-    I.portfolio.cash = 500; I.portfolio.coreHolding = {};
+    I.capitalSystem.tradingUnlocked = false;
+    I.portfolio.cash = 1000 * (1 - F); I.portfolio.coreHolding = {};
     I.CORE_HOLD_SYMBOLS.forEach(s => {
       saved[s] = I.marketData[s];
       I.marketData[s] = { price: 100, prevClose: 100, lastUpdate: Date.now() };
-      I.portfolio.coreHolding[s] = { qty: 0.5, avgPrice: 100, investedCash: 50 };
+      I.portfolio.coreHolding[s] = { qty: QTY, avgPrice: 100, investedCash: PER };
     });
   };
   const [a, b] = I.CORE_HOLD_SYMBOLS;
@@ -1719,7 +1730,7 @@ check('the core banks profit by trimming winners back to target', () => {
   setup(); I.marketData[a].price = 140;                       // +40%, past the band
   const pick = I.mostOverweightCore(I.getTotalValue());
   ok(pick && pick.sym === a, `a name well past its slice must be trimmed, got ${pick && pick.sym}`);
-  ok(pick.qty < 0.5, 'it must sell only the EXCESS — a hold is never fully exited');
+  ok(pick.qty < QTY, 'it must sell only the EXCESS — a hold is never fully exited');
 
   // Dust guard: on a tiny account the "excess" can be worth less than the spread costs
   // to sell. Trimming $0.40 is a pure loss. (Note: the `qty < lot.qty` half of that
@@ -1748,6 +1759,7 @@ check('the core banks profit by trimming winners back to target', () => {
   delete I.portfolio.coreHolding.__ORPHAN; delete I.marketData.__ORPHAN;
 
   I.portfolio.coreHolding = savedCore; I.portfolio.cash = savedCash;
+  I.capitalSystem.tradingUnlocked = savedUnlocked;
   I.CORE_HOLD_SYMBOLS.forEach(s => { if (saved[s]) I.marketData[s] = saved[s]; else delete I.marketData[s]; });
 });
 
@@ -1843,9 +1855,21 @@ check('the unlock step-down actually reaches the new weight', () => {
     cycles++;
   }
   const ratio = I.coreHoldingValue() / I.getTotalValue();
-  ok(cycles > 0 && cycles < 40, `the step-down must terminate, took ${cycles} cycles`);
-  ok(Math.abs(ratio - I.CORE_HOLD_FRACTION) < 0.03,
-     `core should land near ${(I.CORE_HOLD_FRACTION*100).toFixed(0)}%, got ${(ratio*100).toFixed(1)}%`);
+  const target = I.effectiveCoreFraction();
+  // PROPORTIONAL, not flat. The step-down is no longer "sell down to CORE_HOLD_FRACTION"
+  // — it frees exactly the trading allowance and no more, so the landing point depends
+  // on how much the holding side has actually won. Asserting the old flat target here
+  // would be asserting the very bug this release fixes: a $11 allowance liquidating $465.
+  ok(cycles < 40, `the step-down must terminate, took ${cycles} cycles`);
+  ok(Math.abs(ratio - target) < 0.03,
+     `core should land on its computed target ${(target*100).toFixed(1)}%, got ${(ratio*100).toFixed(1)}%`);
+  ok(target >= I.CORE_HOLD_FRACTION - 1e-9,
+     `the target must never fall below the ${(I.CORE_HOLD_FRACTION*100).toFixed(0)}% floor, got ${(target*100).toFixed(1)}%`);
+  // And the freed cash must equal the winnings, not an arbitrary slice of the account.
+  const freed = I.getTotalValue() * (1 - target);
+  const allowance = Math.max(0, I.tradingFundsAvailable());
+  ok(freed <= allowance + I.getTotalValue() * (1 - I.CORE_PHASE1_FRACTION) + 1,
+     `freed cash ($${freed.toFixed(0)}) must not exceed the allowance ($${allowance.toFixed(0)}) plus the cash buffer`);
 
   I.portfolio.cash = sc; I.portfolio.coreHolding = sh;
   I.capitalSystem.tradingDrawn = sd; I.capitalSystem.tradingUnlocked = su;
@@ -1870,13 +1894,23 @@ check('the phase does not flip on ordinary daily noise', () => {
   const unlocked = I.effectiveCoreFraction();
   setTradingFunds(t - 0.5);                       // wobble straight back
   const after = I.effectiveCoreFraction();
-  ok(before > unlocked, 'crossing the threshold must step the core down');
+  // Crossing the threshold no longer forces a step-down: with a threshold-sized
+  // allowance there is almost nothing to free, which is the point of this release.
+  // What must hold is that the allocation never moves UP on an unlock, and that a
+  // wobble back across the line does not undo it — that is the churn this guards.
+  ok(unlocked <= before + 1e-9, 'unlocking must never RAISE the core allocation');
   ok(Math.abs(after - unlocked) < 1e-9,
      `a wobble back must NOT flip the core again (${(unlocked*100).toFixed(0)}% -> ${(after*100).toFixed(0)}%)`);
 
   // Only a real give-back, well below the threshold, re-locks it.
   setTradingFunds(t * I.TRADING_RELOCK_RATIO - 0.5);
-  ok(I.effectiveCoreFraction() > unlocked, 'a genuine give-back must re-lock and restore phase 1');
+  // Restores the PHASE-1 weight exactly. Not "strictly greater than unlocked": with a
+  // small allowance, or a high CORE_HOLD_FRACTION floor, unlocking legitimately changes
+  // nothing, so re-locking has nothing to undo. The invariant is the level it lands on.
+  const relocked = I.effectiveCoreFraction();
+  ok(Math.abs(relocked - Math.max(I.CORE_HOLD_FRACTION, I.CORE_PHASE1_FRACTION)) < 1e-9,
+     `a genuine give-back must re-lock and restore the phase-1 weight, got ${(relocked*100).toFixed(1)}%`);
+  ok(relocked >= unlocked - 1e-9, 're-locking must never leave the core LOWER than while unlocked');
 
   I.portfolio.cash = sc; I.portfolio.coreHolding = sh;
   I.capitalSystem.tradingDrawn = sd; I.capitalSystem.tradingUnlocked = su;
@@ -2478,7 +2512,7 @@ check('a step-down too small for the trim band is warned about, not left silent'
                 .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
   ok(/if \(CORE_HOLD_ON && PHASE_GATE_ENABLED && !unlockStepDownIsActionable\(\)\)/.test(src),
      'the boot banner must warn when the configured step-down cannot execute');
-  ok(/free little or NO cash/.test(src), 'and say plainly what will happen');
+  ok(/never be funded with more than/.test(src), 'and say plainly what the floor implies for trading');
   // The condition must be a real comparison, not a constant.
   ok(/\(CORE_PHASE1_FRACTION - CORE_HOLD_FRACTION\) \/ CORE_HOLD_FRACTION > CORE_TRIM_BAND/.test(src),
      'the threshold must be derived from the trim band, not hard-coded');
@@ -2572,6 +2606,89 @@ check('broker cash movements are adopted so dividends get reinvested', () => {
   const mStart = src.indexOf('async function refreshBrokerMirror');
   ok(/adoptBrokerCashDrift\(\);/.test(src.slice(mStart, src.indexOf('\n}', mStart))),
      'the mirror refresh must invoke it, or it never runs');
+});
+
+check('unlocking frees only what trading may actually risk', () => {
+  // The gate's premise, printed at every boot, is that trading "risks only banked
+  // profit". The allocation did not honour it: the core stepped to a FLAT
+  // CORE_HOLD_FRACTION the instant the gate opened, however little trading was entitled
+  // to. Measured live 2026-09-04 — allowance $11, step-down sold $465. $454 was
+  // liquidated for nothing: trading could not touch it, it earned zero, and the selling
+  // went into a falling market.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function effectiveCoreFraction'), src.indexOf('function coreHoldingValue'));
+  ok(/const allowance = Math\.max\(0, tradingFundsAvailable\(\)\);/.test(fn),
+     'the freed amount must come from the trading allowance');
+  ok(/Math\.max\(CORE_HOLD_FRACTION, Math\.min\(CORE_PHASE1_FRACTION, 1 - freed\)\)/.test(fn),
+     'CORE_HOLD_FRACTION must act as a FLOOR and phase-1 as the ceiling');
+  // A negative allowance must not push the core past its ceiling and eat the cash buffer.
+  ok(/Math\.max\(0, tradingFundsAvailable\(\)\)/.test(fn), 'a losing trading book frees nothing extra');
+
+  if (!I.CORE_HOLD_ON) return;
+  const save = { cash: I.portfolio.cash, core: I.portfolio.coreHolding,
+                 unl: I.capitalSystem.tradingUnlocked, drawn: I.capitalSystem.tradingDrawn,
+                 longs: I.portfolio.longPositions, md: {} };
+  // PROPERTY SWEEP. The allocation must be finite and inside [floor, ceiling] for EVERY
+  // reachable account state — not just the happy path. Written as a sweep rather than a
+  // single NaN case because the NaN case turned out to be unreachable (it needs a zero
+  // allowance AND zero account value, and being unlocked requires a positive allowance),
+  // whereas this catches any clamp being removed, which is a real regression.
+  {
+    const c = I.portfolio.cash, ch = I.portfolio.coreHolding, lp = I.portfolio.longPositions;
+    const u = I.capitalSystem.tradingUnlocked, d = I.capitalSystem.tradingDrawn;
+    const lo = Math.min(I.CORE_HOLD_FRACTION, I.CORE_PHASE1_FRACTION);
+    const hi = Math.max(I.CORE_HOLD_FRACTION, I.CORE_PHASE1_FRACTION);
+    let worst = null;
+    for (const tv of [0, 1, 500, 1000, 1011, 1500, 5000]) {
+      for (const drawn of [0, 100, 1000, 2000]) {
+        I.portfolio.coreHolding = {}; I.portfolio.longPositions = {};
+        I.portfolio.cash = tv;
+        I.capitalSystem.tradingUnlocked = true; I.capitalSystem.tradingDrawn = drawn;
+        const f = I.effectiveCoreFraction();
+        if (!Number.isFinite(f) || f < lo - 1e-9 || f > hi + 1e-9) { worst = { tv, drawn, f }; }
+      }
+    }
+    Object.assign(I.portfolio, { cash: c, coreHolding: ch, longPositions: lp });
+    I.capitalSystem.tradingUnlocked = u; I.capitalSystem.tradingDrawn = d;
+    ok(!worst, `every account state must give a finite fraction within [${(lo*100).toFixed(0)}%, ${(hi*100).toFixed(0)}%], failed at ${JSON.stringify(worst)}`);
+  }
+  const syms = I.CORE_HOLD_SYMBOLS;
+  syms.forEach(s => { save.md[s] = I.marketData[s];
+    I.marketData[s] = { price: 100, prevClose: 100, lastUpdate: Date.now() }; });
+  I.portfolio.longPositions = {};
+  const fracAt = (total) => {
+    I.capitalSystem.tradingUnlocked = true; I.capitalSystem.tradingDrawn = 0;
+    I.portfolio.coreHolding = {};
+    syms.forEach(s => { I.portfolio.coreHolding[s] = { qty: total * 0.95 / syms.length / 100, avgPrice: 100, investedCash: 0 }; });
+    I.portfolio.cash = total - I.coreHoldingValue();
+    return { f: I.effectiveCoreFraction(), tv: I.getTotalValue() };
+  };
+  // target = 1000/total, so pick the total that lands MIDWAY between the floor and the
+  // phase-1 ceiling for whatever those constants actually are. Hardcoding $1400 assumed
+  // a 0.5 floor and failed at 0.8 — a test that only passes on one configuration.
+  const midTarget = (I.CORE_HOLD_FRACTION + I.CORE_PHASE1_FRACTION) / 2;
+  const small = fracAt(1011);              // $11 of winnings
+  const mid   = fracAt(1000 / midTarget);  // winnings that land squarely between floor and ceiling
+  const big   = fracAt(3000);              // winnings far exceed the floor
+  Object.assign(I.portfolio, { cash: save.cash, coreHolding: save.core, longPositions: save.longs });
+  I.capitalSystem.tradingUnlocked = save.unl; I.capitalSystem.tradingDrawn = save.drawn;
+  syms.forEach(s => { if (save.md[s]) I.marketData[s] = save.md[s]; else delete I.marketData[s]; });
+
+  // Tiny winnings must NOT trigger a mass liquidation — the whole point.
+  ok(Math.abs(small.f - I.CORE_PHASE1_FRACTION) < 1e-9,
+     `with $11 of winnings the core must stay at the phase-1 weight, got ${(small.f*100).toFixed(1)}%`);
+  ok(small.tv * (1 - small.f) < 60,
+     `idle cash must stay small, got $${(small.tv*(1-small.f)).toFixed(0)} (the live bug left $507)`);
+  // Bigger winnings free proportionally more, never arbitrarily.
+  ok(mid.f < small.f && mid.f > I.CORE_HOLD_FRACTION,
+     `a larger allowance must free more but not hit the floor, got ${(mid.f*100).toFixed(1)}%`);
+  const midWinnings = mid.tv - 1000;
+  ok(Math.abs(mid.tv * (1 - mid.f) - midWinnings) < 5,
+     `the freed cash must equal the winnings ($${midWinnings.toFixed(0)}), got $${(mid.tv*(1-mid.f)).toFixed(0)}`);
+  // And the floor holds no matter how large the allowance gets.
+  ok(Math.abs(big.f - I.CORE_HOLD_FRACTION) < 1e-9,
+     `CORE_HOLD_FRACTION must floor the core, got ${(big.f*100).toFixed(1)}%`);
 });
 
 check('two trim cycles cannot sell the same excess twice', () => {

@@ -4910,10 +4910,47 @@ function rebasePeakForCoreFlow(cashDelta) {
 
 // The core's target weight RIGHT NOW. Higher while trading is locked, because idle
 // cash earns nothing and the gate cannot open any faster for it sitting there.
+// THE UNLOCK MUST FREE ONLY WHAT TRADING IS ACTUALLY ALLOWED TO RISK.
+//
+// The phase gate's whole premise, printed at every boot, is that after unlocking
+// trading "risks only banked profit". The allocation did not honour that. It stepped
+// the core from CORE_PHASE1_FRACTION to a FLAT CORE_HOLD_FRACTION the instant the gate
+// opened, regardless of how little trading was entitled to.
+//
+// Measured live 2026-09-04. The account was $1,011, so tradingFundsAvailable() — total
+// value less starting capital — was $11. That is the entire trading allowance. The
+// step-down sold $465 of stock to cash. $454 of that was liquidated for nothing: the
+// trading engine was never permitted to touch it, so it simply sat earning zero, and
+// the selling happened into a falling market. It is the single largest self-inflicted
+// drag the system has left.
+//
+// Now the core gives up only the allowance itself. With $11 of winnings the core stays
+// at 95% and trading draws its $11 from the 5% cash buffer. As trading genuinely earns
+// more, the allowance grows and the core steps down in proportion — which is what
+// "funded by winnings" was always supposed to mean.
+//
+// CORE_HOLD_FRACTION becomes a FLOOR rather than a target: the core will never be
+// driven below it no matter how large the allowance grows. That matches the name, and
+// it means an operator who sets 0.5 is saying "never less than half invested" rather
+// than "sell down to half the moment the gate opens".
 function effectiveCoreFraction() {
   if (!CORE_HOLD_ON) return 0;
   if (PHASE_GATE_ENABLED && tradingPhaseLocked()) return Math.max(CORE_HOLD_FRACTION, CORE_PHASE1_FRACTION);
-  return CORE_HOLD_FRACTION;
+  if (!PHASE_GATE_ENABLED) return CORE_HOLD_FRACTION;
+  const tv = getTotalValue();
+  // No tv>0 guard: reaching this line requires the gate to be UNLOCKED, which requires
+  // a positive allowance, so tv/allowance can never be 0/0. A zero-value account with a
+  // positive allowance yields Infinity, and the clamps below resolve that to the floor.
+  // Swept every reachable (totalValue, tradingDrawn) state — zero non-finite results.
+  // Only POSITIVE winnings free anything. A negative allowance must not push the core
+  // above its phase-1 ceiling and spend the cash buffer the engine needs to operate.
+  const allowance = Math.max(0, tradingFundsAvailable());
+  // No cap needed on `freed`: an allowance larger than the account drives 1-freed
+  // negative, and the max(CORE_HOLD_FRACTION, ...) below clamps it to the floor anyway.
+  // A Math.min(1, ...) here was provably a no-op — verified against allowances of 2x and
+  // 5x the account — and dead code that no mutation can kill is code that rots.
+  const freed = allowance / tv;
+  return Math.max(CORE_HOLD_FRACTION, Math.min(CORE_PHASE1_FRACTION, 1 - freed));
 }
 
 // Total market value of the core basket.
@@ -8221,12 +8258,17 @@ if (require.main === module) app.listen(PORT, async () => {
                   ` across ${CORE_HOLD_SYMBOLS.length} names${(CORE_BASKET_SOURCE === 'venus' && !_venusBasketReceived) ? ' — awaiting Venus\'s picks' : ` (${CORE_HOLD_SYMBOLS.slice(0,4).join(',')}${CORE_HOLD_SYMBOLS.length>4?'…':''}${CORE_BASKET_SOURCE === 'venus' ? ', restored' : ''})`}`
                 : `core holding OFF (set CORE_HOLD_FRACTION=0.5 to hold half across ${CORE_HOLD_SYMBOLS.length} names)`));
   if (CORE_HOLD_ON && PHASE_GATE_ENABLED && !unlockStepDownIsActionable()) {
-    console.warn(`[CONFIG] ⚠️  CORE_HOLD_FRACTION=${CORE_HOLD_FRACTION} sits only ` +
+    // The warning's premise changed with v11.53. The unlock no longer steps to a flat
+    // CORE_HOLD_FRACTION; it frees exactly the trading allowance. So the gap between the
+    // two constants no longer determines the step SIZE — but CORE_HOLD_FRACTION is now a
+    // FLOOR, and a floor set close to the phase-1 weight caps how much trading can ever
+    // be funded, no matter how much the holding side wins.
+    console.warn(`[CONFIG] ⚠️  CORE_HOLD_FRACTION=${CORE_HOLD_FRACTION} is a FLOOR sitting only ` +
       `${((CORE_PHASE1_FRACTION - CORE_HOLD_FRACTION) * 100).toFixed(0)}pp below the phase-1 weight ` +
-      `(${(CORE_PHASE1_FRACTION * 100).toFixed(0)}%), which is inside the ${(CORE_TRIM_BAND * 100).toFixed(0)}% trim band. ` +
-      `When trading unlocks, the step-down will free little or NO cash — the trim correctly ` +
-      `refuses to pay spread for a move that small, so trading would unlock with nothing to ` +
-      `trade. Lower CORE_HOLD_FRACTION (0.5 is the tested value) or raise CORE_TRIM_BAND.`);
+      `(${(CORE_PHASE1_FRACTION * 100).toFixed(0)}%). The core will never drop below it, so trading can ` +
+      `never be funded with more than ${((1 - CORE_HOLD_FRACTION) * 100).toFixed(0)}% of the account however much the holding ` +
+      `side earns. That is a legitimate choice — it keeps almost everything invested — but ` +
+      `if you intend the trading side to grow, lower CORE_HOLD_FRACTION.`);
   }
 
   // ── Wire JUPITER to Terra's live state + indicator helpers ──
@@ -8413,7 +8455,7 @@ module.exports = {
     extractJsonArray, extractJsonObject, affordableMaxPrice, MAX_SINGLE_SHARE_FRACTION, fetchBars,
     FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
     CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore,
-    CORE_PHASE1_FRACTION, effectiveCoreFraction, rebasePeakForCoreFlow, unlockStepDownIsActionable,
+    CORE_PHASE1_FRACTION, effectiveCoreFraction, rebasePeakForCoreFlow, unlockStepDownIsActionable, tradingFundsAvailable,
     coreWeightMap, basketWithRecovered, coreBuyStep, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, CORE_BASKET_MAX_NAMES, CORE_TRIMS_PER_CYCLE, CASH_DRIFT_MIN, adoptBrokerCashDrift, verifyStateDir,
     getRecoveredSymbols: () => _recoveredSymbols,
     CORE_TILT_ON, CORE_TILT_STRENGTH, CORE_TILT_MAX, CORE_TILT_MIN, CORE_TILT_MAX_SHARE,
