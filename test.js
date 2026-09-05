@@ -1839,9 +1839,17 @@ check('the unlock step-down actually reaches the new weight', () => {
   I.CORE_HOLD_SYMBOLS.forEach(sym => {
     saved[sym] = I.marketData[sym];
     I.marketData[sym] = { price: 105, prevClose: 105, lastUpdate: Date.now() };
-    I.portfolio.coreHolding[sym] = { qty: 0.95, avgPrice: 100, investedCash: 95 };   // each +5%
+    I.portfolio.coreHolding[sym] = { qty: 0.95, avgPrice: 100, investedCash: 95 };
   });
-  ok(!I.tradingPhaseLocked(), 'a 5% gain on the core should clear the unlock bar');
+  // The gain must CLEAR THE ACTUAL BAR, not a hardcoded $15. The bar is now a percentage
+  // of starting capital, so a fixture pinned to "+5%" silently stops testing an unlock
+  // the moment that percentage changes — it just asserts a locked gate forever.
+  const bar = I.tradingUnlockThreshold();
+  const need = 1000 + bar * 1.5;                       // comfortably past the bar
+  const pxNeeded = need / (0.95 * I.CORE_HOLD_SYMBOLS.length) ;
+  I.CORE_HOLD_SYMBOLS.forEach(sym => { I.marketData[sym].price = pxNeeded; });
+  ok(!I.tradingPhaseLocked(),
+     `a gain past the $${bar.toFixed(2)} bar should unlock, funds $${I.tradingFundsAvailable().toFixed(2)}`);
 
   // Drain the step-down the way the 5-minute timer would.
   let cycles = 0;
@@ -1899,8 +1907,12 @@ check('the phase does not flip on ordinary daily noise', () => {
   // What must hold is that the allocation never moves UP on an unlock, and that a
   // wobble back across the line does not undo it — that is the churn this guards.
   ok(unlocked <= before + 1e-9, 'unlocking must never RAISE the core allocation');
-  ok(Math.abs(after - unlocked) < 1e-9,
-     `a wobble back must NOT flip the core again (${(unlocked*100).toFixed(0)}% -> ${(after*100).toFixed(0)}%)`);
+  // The allocation now tracks the allowance CONTINUOUSLY, so a $1 wobble legitimately
+  // moves it by a hair. What must not happen is a FLIP — the 45-point lurch between
+  // phase-1 and the floor that churned ~$450 of stock on daily noise. Assert the
+  // magnitude, not bit-equality, or this fails on correct behaviour.
+  ok(Math.abs(after - unlocked) < 0.02,
+     `a wobble back must NOT flip the core again (${(unlocked*100).toFixed(2)}% -> ${(after*100).toFixed(2)}%)`);
 
   // Only a real give-back, well below the threshold, re-locks it.
   setTradingFunds(t * I.TRADING_RELOCK_RATIO - 0.5);
@@ -2037,13 +2049,14 @@ check('once unlocked, trading risks only banked profit', () => {
   const savedBank = I.capitalSystem.bankedProfit, savedCap = I.capitalSystem.tradingCapital;
   const savedDrawn2 = I.capitalSystem.tradingDrawn;
   I.capitalSystem.tradingCapital = 700;
-  I.capitalSystem.bankedProfit = 60;
+  I.capitalSystem.bankedProfit = Math.max(60, I.tradingUnlockThreshold() * 1.2);
   I.capitalSystem.tradingDrawn = 0;
   const allowed = I.tradingCapitalAllowed();
   I.capitalSystem.bankedProfit = savedBank; I.capitalSystem.tradingCapital = savedCap;
   I.capitalSystem.tradingDrawn = savedDrawn2;
-  ok(allowed <= 60 * I.TRADING_PROFIT_SHARE + 0.01,
-     `trading must be funded by banked profit ($60), not the $700 book — got $${allowed.toFixed(2)}`);
+  const banked = Math.max(60, I.tradingUnlockThreshold() * 1.2);
+  ok(allowed <= banked * I.TRADING_PROFIT_SHARE + 0.01,
+     `trading must be funded by banked profit ($${banked.toFixed(2)}), not the whole book — got $${allowed.toFixed(2)}`);
   ok(allowed < 700, 'it must never reach for the whole trading book');
 });
 
@@ -2140,6 +2153,11 @@ check('core top-up sizing buys the gap, never churns, never sells', () => {
 
 // ── CONVICTION WEIGHTING & DEPLOYMENT SPEED (v11.46) ────────────────────────
 check('conviction weighting stays equal-weight unless conviction actually differs', () => {
+  // A test OF tilting must skip when tilting is switched off, exactly as the core tests
+  // skip when the core is off. Without this it asserts that a disabled feature is
+  // working — a red suite over a legal configuration.
+  if (!I.CORE_TILT_ON) { ok(Object.values(I.coreWeightMap(['A','B'], { A: 1, B: 0 })).every(v => Math.abs(v - 0.5) < 1e-9),
+    'with the tilt off every name must get equal weight'); return; }
   const syms = Array.from({ length: 10 }, (_, i) => 'S' + i);
   const w = (conv) => Object.values(I.coreWeightMap(syms, conv));
   const sum = (a) => a.reduce((x, y) => x + y, 0);
@@ -2267,6 +2285,7 @@ check('the tilt reaches sizing, and buying and trimming use the SAME weights', (
 
 check('a tilted name is bought toward its own slice, not the average', () => {
   if (!I.CORE_HOLD_ON) return;
+  if (!I.CORE_TILT_ON) { ok(true, 'tilt disabled — nothing to favour'); return; }
   const savedCore = I.portfolio.coreHolding, saved = {};
   const syms = I.CORE_HOLD_SYMBOLS;
   syms.forEach(s => { saved[s] = I.marketData[s];
@@ -2606,6 +2625,81 @@ check('broker cash movements are adopted so dividends get reinvested', () => {
   const mStart = src.indexOf('async function refreshBrokerMirror');
   ok(/adoptBrokerCashDrift\(\);/.test(src.slice(mStart, src.indexOf('\n}', mStart))),
      'the mirror refresh must invoke it, or it never runs');
+});
+
+check('starting capital is detected from the broker, not assumed', () => {
+  // START_CAPITAL was hardcoded at 1000, and tradingFundsAvailable() is literally
+  // (totalValue - START_CAPITAL). Fund at anything else and the engine reads the
+  // difference as profit it already earned. On Alpaca's $100,000 paper default that is
+  // $99,000 of phantom winnings: the gate unlocks in the first second, the core drops to
+  // its floor, and the whole account is handed to an engine measured at no edge.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/const gained = getTotalValue\(\) - startingCapital\(\);/.test(src),
+     'profit must be measured from the DETECTED baseline, not the constant');
+  ok(/detectStartingCapital\(Number\.isFinite\(acct\.equity\) \? acct\.equity : acct\.cash\)/.test(src),
+     'the boot sync must detect it from the broker');
+  ok(/startingCapital: _startingCapital,/.test(src), 'and it must be persisted');
+  ok(/_startingCapital = state\.startingCapital;/.test(src), 'and restored');
+  // Restore must precede detection, or a grown account re-detects and redefines profit.
+  ok(src.indexOf('loadState();') < src.indexOf('await syncFromBroker()'),
+     'state must load before the broker sync, so a restored baseline wins');
+  ok(/if \(!force && Number\.isFinite\(_startingCapital\) && _startingCapital > 0\) return _startingCapital;/.test(src),
+     'detection must refuse to overwrite an existing baseline');
+
+  // BEHAVIOURAL — the exact scenario that would have broken the reset.
+  const prev = I.startingCapital();
+  I.detectStartingCapital(100000, { force: true });
+  const bar100k = I.tradingUnlockThreshold();
+  const base100k = I.startingCapital();
+  I.detectStartingCapital(1000, { force: true });
+  const bar1k = I.tradingUnlockThreshold();
+  // Non-positive equity must never be adopted. FORCED, because without force the
+  // "already detected" guard returns first and the equity check is never reached —
+  // the original version of this assertion tested nothing, and a mutation removing the
+  // equity check survived it.
+  I.detectStartingCapital(0,   { force: true }); const afterZero = I.startingCapital();
+  I.detectStartingCapital(-5,  { force: true }); const afterNeg  = I.startingCapital();
+  I.detectStartingCapital(NaN, { force: true }); const afterNaN  = I.startingCapital();
+  // And a second detection without force must be ignored.
+  I.detectStartingCapital(50000); const afterSecond = I.startingCapital();
+  I.detectStartingCapital(prev, { force: true });
+
+  ok(Math.abs(base100k - 100000) < 1e-9, `a $100k account must detect $100k, got $${base100k}`);
+  // The scaling assertions only apply when no explicit dollar override is set. With
+  // TRADING_UNLOCK_USD the operator has deliberately chosen a fixed bar, and asserting
+  // it scales anyway would fail on correct, documented behaviour.
+  if (process.env.TRADING_UNLOCK_USD === undefined) {
+    ok(Math.abs(bar100k - 100000 * I.TRADING_UNLOCK_PCT) < 1e-6,
+       `the bar must scale with the account, got $${bar100k}`);
+    ok(Math.abs(bar1k - 1000 * I.TRADING_UNLOCK_PCT) < 1e-6,
+       `on $1000 the bar must be $${(1000*I.TRADING_UNLOCK_PCT).toFixed(0)}, got $${bar1k}`);
+    ok(bar100k > bar1k, 'a bigger account must face a proportionally bigger bar, not the same dollars');
+  } else {
+    ok(Math.abs(bar100k - bar1k) < 1e-9,
+       'an explicit TRADING_UNLOCK_USD must override the percentage at every account size');
+  }
+  ok(Math.abs(afterZero - 1000) < 1e-9 && Math.abs(afterNeg - 1000) < 1e-9 && Math.abs(afterNaN - 1000) < 1e-9,
+     `a zero, negative or NaN equity must never become the baseline (got ${afterZero}/${afterNeg}/${afterNaN})`);
+  ok(Math.abs(afterSecond - 1000) < 1e-9,
+     're-detection without force must be ignored, or a grown account redefines its own profit');
+});
+
+check('the phase messages describe what actually happens', () => {
+  // The unlock message said "The core steps down to 50%". That was v11.52 behaviour and
+  // stating it now would describe a liquidation that no longer occurs — the same class of
+  // error as the startup banner that misreported the phase-1 weight for weeks.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function tradingPhaseLocked'), src.indexOf('function tradingCapitalAllowed'));
+  ok(/TRADING UNLOCKED/.test(fn), 'the unlock must still be announced');
+  ok(!/The core steps down to \$\{\(CORE_HOLD_FRACTION\*100\)/.test(fn),
+     'it must not claim a step-down to CORE_HOLD_FRACTION — that is not what happens');
+  ok(/may now risk that \$\$\{funds\.toFixed\(2\)\}/.test(fn) && /and nothing more/.test(fn),
+     'it must state the actual allowance');
+  ok(/floor \$\{\(CORE_HOLD_FRACTION\*100\)\.toFixed\(0\)\}%/.test(fn),
+     'and describe CORE_HOLD_FRACTION as the floor it now is');
+  ok(/tradingUnlockThreshold\(\)\.toFixed\(2\)/.test(fn), 'and quote the real, derived bar');
 });
 
 check('unlocking frees only what trading may actually risk', () => {

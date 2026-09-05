@@ -106,7 +106,36 @@ const ALPACA_DATA_FEED    = (process.env.ALPACA_DATA_FEED || 'iex').toLowerCase(
 const ALPACA_DATA_REST    = 'data.alpaca.markets';
 const ALPACA_DATA_WS      = `wss://stream.data.alpaca.markets/v2/${ALPACA_DATA_FEED}`;
 
+// The DEFAULT starting capital. The live figure is auto-detected from the broker on the
+// first boot of a fresh account — see startingCapital().
 const START_CAPITAL = 1000;
+
+// ── AUTO-DETECTED STARTING CAPITAL ──────────────────────────────────────────
+// This was a hardcoded 1000, and tradingFundsAvailable() is literally
+// (totalValue - START_CAPITAL). Fund the account at anything else and the engine
+// believes the difference is PROFIT it has already earned. Modelled against Alpaca's
+// $100,000 paper default: winnings read as $99,000, the phase gate unlocks in the first
+// second, the core drops to its floor, and the entire remainder is handed to a trading
+// engine measured at no edge. Every safeguard bypassed before the first bar.
+//
+// Detected once, from the broker's own equity, on the first boot with no saved state —
+// then persisted, so it never drifts and never re-detects against a grown account.
+let _startingCapital = null;
+function startingCapital() {
+  return (Number.isFinite(_startingCapital) && _startingCapital > 0) ? _startingCapital : START_CAPITAL;
+}
+// Called once at boot with the broker's equity. Ignores anything non-positive, and
+// refuses to overwrite a value already restored from state — re-detecting later would
+// silently redefine "profit" as the account grew.
+function detectStartingCapital(equity, { force = false } = {}) {
+  if (!force && Number.isFinite(_startingCapital) && _startingCapital > 0) return _startingCapital;
+  if (!Number.isFinite(equity) || equity <= 0) return startingCapital();
+  _startingCapital = equity;
+  console.log(`[CAPITAL] 📐 Starting capital detected as $${equity.toFixed(2)} from the broker — ` +
+              `profit, the unlock threshold and every percentage are measured from this. ` +
+              `Persisted, so it will not move as the account grows.`);
+  return _startingCapital;
+}
 
 // WHERE STATE LIVES, AND WHY IT IS CONFIGURABLE.
 // This was './atlas-solar-state.json' — a relative path inside the container's working
@@ -2605,7 +2634,20 @@ let CORE_CONVICTION = {};
 // Once unlocked, trading is sized from BANKED PROFIT, not the whole account, so the
 // original $1000 is never what is being risked on an unproven strategy.
 const PHASE_GATE_ENABLED  = process.env.PHASE_GATE_ENABLED !== 'false';
-const TRADING_UNLOCK_USD  = Math.max(0, parseFloat(process.env.TRADING_UNLOCK_USD || '15'));
+// THE UNLOCK BAR, AS A FRACTION OF STARTING CAPITAL.
+// A fixed dollar figure cannot survive the account-size portability the auto-detection
+// above just bought: $100 is a serious 10% hurdle on $1,000 and a meaningless 0.1% on
+// $100,000, reached inside an hour. Expressing it as a percentage keeps the gate's
+// MEANING constant — "the holding side must earn a real return before trading gets a
+// cent" — at any account size. TRADING_UNLOCK_USD remains as an explicit override for
+// anyone who genuinely wants a fixed dollar bar.
+const TRADING_UNLOCK_PCT  = Math.max(0, Math.min(1, parseFloat(process.env.TRADING_UNLOCK_PCT || '0.10')));
+const TRADING_UNLOCK_USD_OVERRIDE = process.env.TRADING_UNLOCK_USD !== undefined
+  ? Math.max(0, parseFloat(process.env.TRADING_UNLOCK_USD)) : null;
+function tradingUnlockThreshold() {
+  if (Number.isFinite(TRADING_UNLOCK_USD_OVERRIDE)) return TRADING_UNLOCK_USD_OVERRIDE;
+  return startingCapital() * TRADING_UNLOCK_PCT;
+}
 // Once unlocked, what share of banked profit the trading side may put at risk.
 const TRADING_PROFIT_SHARE = Math.max(0, Math.min(1, parseFloat(process.env.TRADING_PROFIT_SHARE || '1.0')));
 
@@ -5749,7 +5791,7 @@ function tradingFundsAvailable() {
   if (TRADING_UNLOCK_BASIS === 'total') {
     // Everything the account has gained over its starting capital, minus whatever
     // trading has already given back. Unrealised gains count: they are still winnings.
-    const gained = getTotalValue() - START_CAPITAL;
+    const gained = getTotalValue() - startingCapital();
     return gained + (capitalSystem.tradingDrawn || 0);
   }
   return (capitalSystem.bankedProfit || 0) + (capitalSystem.tradingDrawn || 0);
@@ -5764,17 +5806,24 @@ function tradingPhaseLocked() {
   if (!CORE_HOLD_ON) return false;          // no holding phase configured — nothing to gate behind
   const funds = tradingFundsAvailable();
   const wasUnlocked = !!capitalSystem.tradingUnlocked;
-  if (!wasUnlocked && funds >= TRADING_UNLOCK_USD) {
+  if (!wasUnlocked && funds >= tradingUnlockThreshold()) {
     capitalSystem.tradingUnlocked = true;
-    console.log(`[PHASE] ✅ TRADING UNLOCKED — the holding side has earned $${funds.toFixed(2)}. ` +
-                `The core steps down to ${(CORE_HOLD_FRACTION*100).toFixed(0)}% and the trading engine wakes up.`);
+    // NOT "steps down to CORE_HOLD_FRACTION" any more — that was the v11.52 behaviour
+    // and stating it here would describe a liquidation that no longer happens. The core
+    // gives up only the winnings; CORE_HOLD_FRACTION is now merely the floor it can
+    // never fall below. Reporting the wrong number is how the earlier startup banner
+    // misled for weeks.
+    console.log(`[PHASE] ✅ TRADING UNLOCKED — the holding side has earned $${funds.toFixed(2)} ` +
+                `of the $${tradingUnlockThreshold().toFixed(2)} bar. Trading may now risk that $${funds.toFixed(2)} ` +
+                `and nothing more; the core keeps the rest invested (floor ${(CORE_HOLD_FRACTION*100).toFixed(0)}%).`);
     queueSaveState();
     return false;
   }
-  if (wasUnlocked && funds < TRADING_UNLOCK_USD * TRADING_RELOCK_RATIO) {
+  if (wasUnlocked && funds < tradingUnlockThreshold() * TRADING_RELOCK_RATIO) {
     capitalSystem.tradingUnlocked = false;
-    console.warn(`[PHASE] Trading has given back most of its funding ($${funds.toFixed(2)}) — RE-LOCKED. ` +
-                 `The core goes back to ${(CORE_PHASE1_FRACTION*100).toFixed(0)}% until it earns the right again.`);
+    console.warn(`[PHASE] Trading has given back most of its funding ($${funds.toFixed(2)} of the ` +
+                 `$${tradingUnlockThreshold().toFixed(2)} bar) — RE-LOCKED. The core goes back to ` +
+                 `${(Math.max(CORE_HOLD_FRACTION, CORE_PHASE1_FRACTION)*100).toFixed(0)}% until it earns the right again.`);
     queueSaveState();
     return true;
   }
@@ -5884,6 +5933,9 @@ async function syncFromBroker() {
     if (acct.ok && Number.isFinite(acct.cash)) {
       const prev = portfolio.cash;
       portfolio.cash = acct.cash;
+      // FIRST BOOT ONLY. detectStartingCapital refuses to overwrite a value restored
+      // from state, so a grown account never silently redefines its own baseline.
+      detectStartingCapital(Number.isFinite(acct.equity) ? acct.equity : acct.cash);
       if (Number.isFinite(acct.equity)) riskSystem.peakValue = Math.max(riskSystem.peakValue || 0, acct.equity);
       console.log(`[SYNC] Ledger cash ${prev.toFixed(2)} → broker cash $${acct.cash.toFixed(2)} (authoritative)`);
     }
@@ -6130,7 +6182,7 @@ function logDailyTradeDigest() {
   if (PHASE_GATE_ENABLED && CORE_HOLD_ON && tradingPhaseLocked()) {
     const funds = tradingFundsAvailable();
     console.log(`       PHASE GATE — trading is intentionally locked. The holding side has earned ` +
-                `$${funds.toFixed(2)} of the $${TRADING_UNLOCK_USD.toFixed(2)} needed. This is the ` +
+                `$${funds.toFixed(2)} of the $${tradingUnlockThreshold().toFixed(2)} needed. This is the ` +
                 `system working, not a fault: the core keeps buying and trimming meanwhile.`);
     return;
   }
@@ -6817,6 +6869,9 @@ function buildStateObject() {
     // deployed often would swap its basket every time — exactly the churn the hold exists
     // to prevent, reintroduced through the back door.
     lastBasketSwapAt: _lastBasketSwapAt,
+    // The baseline every percentage is measured from. Persisted so it is detected ONCE,
+    // on the first boot of a fresh account, and never re-derived from a grown one.
+    startingCapital: _startingCapital,
     closedTrades:   portfolio.closedTrades.slice(-500),
     marketTransition: marketTransitionData,
     capitalSystem,
@@ -6977,6 +7032,11 @@ function loadState() {
               && Number.isFinite(lot.avgPrice) && lot.avgPrice > 0) portfolio.coreHolding[sym] = lot;
         }
       }
+    }
+    if (Number.isFinite(state.startingCapital) && state.startingCapital > 0) {
+      _startingCapital = state.startingCapital;
+      console.log(`[LOAD] Starting capital $${_startingCapital.toFixed(2)} restored — ` +
+                  `profit and the unlock bar stay measured from the original account size`);
     }
     // Restore the live basket BEFORE any interval can fire, or the first trim pass
     // measures Venus's holdings against the env default and sells everything that does
@@ -7538,7 +7598,7 @@ function evaluateAndTrade() {
       evaluateAndTrade._lastPhaseLog = Date.now();
       const banked = tradingFundsAvailable();
       console.log(`[PHASE] Trading locked — holding phase has banked $${banked.toFixed(2)} of the ` +
-                  `$${TRADING_UNLOCK_USD.toFixed(2)} needed. The core keeps buying, holding and trimming; ` +
+                  `$${tradingUnlockThreshold().toFixed(2)} needed. The core keeps buying, holding and trimming; ` +
                   `no trades are taken until the holding side has paid for them.`);
     }
     return;
@@ -7797,8 +7857,8 @@ evaluateAndTrade._lastAtrLog      = 0;
 app.get('/api/portfolio', (req, res) => {
   const market     = getCurrentMarket();
   const totalValue = getTotalValue();
-  const pnl        = totalValue - START_CAPITAL;
-  const returnPct  = (pnl / START_CAPITAL) * 100;
+  const pnl        = totalValue - startingCapital();
+  const returnPct  = (pnl / startingCapital()) * 100;
 
   const positions = [];
   Object.entries(portfolio.longPositions).forEach(([ticker, posArr]) => {
@@ -8241,7 +8301,7 @@ if (require.main === module) app.listen(PORT, async () => {
               `net R:R >= ${STRATEGY.MIN_RR_NET} | cost ceiling ${(STRATEGY.MAX_ROUND_TRIP_COST*100).toFixed(2)}%`);
   if (PHASE_GATE_ENABLED && CORE_HOLD_ON)
     console.log(`[CONFIG] PHASE GATE ON — trading stays locked until the holding side banks ` +
-                `$${TRADING_UNLOCK_USD.toFixed(2)}; after that it risks only banked profit`);
+                `$${tradingUnlockThreshold().toFixed(2)} (${(TRADING_UNLOCK_PCT*100).toFixed(0)}% of starting capital); after that it risks only banked profit`);
   console.log(`[CONFIG] fractional sizing ${FRACTIONAL_ENABLED ? `ON (min $${MIN_FRACTIONAL_NOTIONAL} position)` : 'OFF'} | ` +
               (CORE_HOLD_ON
                 // Report the weight it will ACTUALLY target, not the configured one.
@@ -8469,7 +8529,9 @@ module.exports = {
     resetCoreCommitted: () => { _coreCommittedSinceMirror = 0; },
     logDailyTradeDigest, rejectionBucket, noteDailyRejection, tradableValue, wouldExceedHeat,
     noteEntryRejection, entriesPausedByBroker, clearEntryRejectBackoff, entryPauseRemainingMs, pendingEntryNotional,
-    tradingPhaseLocked, tradingCapitalAllowed, PHASE_GATE_ENABLED, TRADING_UNLOCK_USD, TRADING_PROFIT_SHARE,
+    tradingPhaseLocked, tradingCapitalAllowed, PHASE_GATE_ENABLED, TRADING_PROFIT_SHARE,
+    TRADING_UNLOCK_PCT, tradingUnlockThreshold, startingCapital, detectStartingCapital,
+    get TRADING_UNLOCK_USD() { return tradingUnlockThreshold(); },
     TRADING_UNLOCK_BASIS, TRADING_RELOCK_RATIO,
     bankTradingPnL, tradingFundsAvailable,
     onCooldown, clearSymbolCooldown: (s) => { delete symbolCooldowns[s]; }, EXEC_BROKER_AUTH,
