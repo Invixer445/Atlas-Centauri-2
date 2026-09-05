@@ -2616,7 +2616,11 @@ check('broker cash movements are adopted so dividends get reinvested', () => {
      'both broker paths must settle, or one network error wedges cash adoption forever');
   ok(/if \(pendingEntryNotional\(\) > 0\) return 0;/.test(fn), 'nor while trading entries are pending');
   ok(/Object\.keys\(pendingOrders \|\| \{\}\)\.length > 0/.test(fn), 'nor while any order is open');
-  ok(/Math\.abs\(delta\) < CASH_DRIFT_MIN/.test(fn), 'a rounding-sized difference must be ignored');
+  ok(/Math\.abs\(delta\) < cashDriftMin\(\)/.test(fn), 'a rounding-sized difference must be ignored');
+  // The threshold must SCALE — a flat $0.25 is sensible on $1,000 and rounding noise on
+  // $1,000,000, so the adopter would fire on meaningless differences at size.
+  ok(/Math\.max\(CASH_DRIFT_ABS, startingCapital\(\) \* CASH_DRIFT_PCT\)/.test(src),
+     'the drift floor must scale with the account, not stay a flat dollar amount');
   // New outside cash is capital, not a trading gain — same rebase a core flow gets, or
   // it reads as a drawdown exactly as funding the core once did.
   ok(/rebasePeakForCoreFlow\(-delta\)/.test(fn), 'adopted cash must rebase the drawdown peak');
@@ -2625,6 +2629,67 @@ check('broker cash movements are adopted so dividends get reinvested', () => {
   const mStart = src.indexOf('async function refreshBrokerMirror');
   ok(/adoptBrokerCashDrift\(\);/.test(src.slice(mStart, src.indexOf('\n}', mStart))),
      'the mirror refresh must invoke it, or it never runs');
+});
+
+check('the engine refuses trades too large for the stock it is trading', () => {
+  // The liquidity floor is an absolute SHARE count while position size is a fraction of
+  // the book, so the two diverge as the account grows. Without a relative check, a large
+  // account tries to take a double-digit percentage of a thin stock's daily volume and
+  // moves the price against itself on both legs. This is the wall that made the trading
+  // side un-scalable, and no risk-percentage tuning reaches it: the failure is in shares.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/const dayNotional = \(q\.volume \|\| 0\) \* q\.price \/ Math\.max\(0\.01, FEED_VOLUME_FACTOR\);/.test(src),
+     'daily turnover must be de-scaled by the feed factor — iex shows only a few % of consolidated volume');
+  ok(/intended > dayNotional \* MAX_DAY_VOLUME_SHARE/.test(src),
+     'the intended POSITION must be compared against that turnover');
+  ok(/const intended = intendedPositionNotional\(q\.price\);/.test(src),
+     'and it must use the same sizing the sizer uses, not a guess');
+
+  // The sizer inputs must be REAL keys. `??` fallbacks turn a typo into a silent wrong
+  // number, so assert the fields exist rather than trusting the default.
+  ok(Number.isFinite(I.STRATEGY.RISK_PER_TRADE_BASE), 'RISK_PER_TRADE_BASE must exist');
+  ok(Number.isFinite(I.STRATEGY.ATR_STOP_MULT), 'ATR_STOP_MULT must exist');
+
+  // BEHAVIOURAL: the position must scale with the account, and the cap must bite.
+  const save = { cash: I.portfolio.cash, core: I.portfolio.coreHolding, longs: I.portfolio.longPositions };
+  const posAt = (equity) => {
+    I.portfolio.coreHolding = {}; I.portfolio.longPositions = {}; I.portfolio.cash = equity;
+    return I.intendedPositionNotional(5);
+  };
+  const small = posAt(1000), big = posAt(1000000);
+  Object.assign(I.portfolio, { cash: save.cash, coreHolding: save.core, longPositions: save.longs });
+
+  ok(small > 0 && big > 0, 'a position size must be produced at both ends');
+  ok(Math.abs(big / small - 1000) < 50,
+     `position size must scale ~linearly with the account, got ${(big/small).toFixed(0)}x for 1000x the money`);
+  // A name sitting exactly on the absolute floor: 30k iex shares at $5 is ~$3.75M
+  // consolidated turnover once de-scaled. A $1m account wants ~$239k of it — 6.4%.
+  const thinDayNotional = (I.EFFECTIVE_MIN_DAY_VOL * 5) / I.FEED_VOLUME_FACTOR;
+  ok(small <= thinDayNotional * I.MAX_DAY_VOLUME_SHARE,
+     'a small account must still be allowed to trade a floor-level name');
+  ok(big > thinDayNotional * I.MAX_DAY_VOLUME_SHARE,
+     'a large account must be screened out of that same name');
+  ok(I.MAX_DAY_VOLUME_SHARE > 0 && I.MAX_DAY_VOLUME_SHARE <= 0.25,
+     `the cap must be a sane fraction, got ${I.MAX_DAY_VOLUME_SHARE}`);
+});
+
+check('nothing is priced out of reach purely by share price', () => {
+  // affordableMaxPrice returned a flat $1,000 whenever fractional sizing was on. With
+  // fractional the price does not constrain affordability at all — the sizer buys 0.002
+  // of a $1,500 share as happily as 30 shares of $10 — so the flat cap rejected
+  // perfectly tradeable names on any account big enough to want them.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/if \(fractional\) return Math\.max\(DYNAMIC_MAX_PRICE, tradableValue\(\)\);/.test(src),
+     'the fractional ceiling must scale with the account, not sit at a flat $1,000');
+  const save = { cash: I.portfolio.cash, core: I.portfolio.coreHolding, longs: I.portfolio.longPositions };
+  I.portfolio.coreHolding = {}; I.portfolio.longPositions = {};
+  I.portfolio.cash = 1000;    const capSmall = I.affordableMaxPrice(true);
+  I.portfolio.cash = 500000;  const capBig   = I.affordableMaxPrice(true);
+  Object.assign(I.portfolio, { cash: save.cash, coreHolding: save.core, longPositions: save.longs });
+  ok(capBig > capSmall, `a bigger account must tolerate a higher share price (${capSmall} -> ${capBig})`);
+  ok(capSmall >= 1000, 'and the small-account ceiling must not regress below the old flat value');
 });
 
 check('starting capital is detected from the broker, not assumed', () => {
@@ -2815,7 +2880,7 @@ check('a settling order is not mistaken for a dividend', () => {
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
                 .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
   const fn = src.slice(src.indexOf('function adoptBrokerCashDrift'), src.indexOf('function executionDriftPct'));
-  ok(/if \(!\(Math\.abs\(delta - _lastCashDelta\) < CASH_DRIFT_MIN\)\) \{/.test(fn),
+  ok(/if \(!\(Math\.abs\(delta - _lastCashDelta\) < cashDriftMin\(\)\)\) \{/.test(fn),
      'a drift must be seen twice before it is believed');
   ok(/_lastCashDelta = delta;\s*\n\s*return 0;/.test(fn),
      'the first sighting must record the delta and adopt nothing');
@@ -2823,7 +2888,7 @@ check('a settling order is not mistaken for a dividend', () => {
      'adopting must clear the record, or the next unrelated drift adopts immediately');
   // The persistence check must come AFTER the size check, or a stream of sub-threshold
   // rounding differences would keep resetting the record and nothing would ever adopt.
-  ok(fn.indexOf('Math.abs(delta) < CASH_DRIFT_MIN') < fn.indexOf('delta - _lastCashDelta'),
+  ok(fn.indexOf('Math.abs(delta) < cashDriftMin()') < fn.indexOf('delta - _lastCashDelta'),
      'the size gate must run before the persistence gate');
 
   // BEHAVIOURAL — run in a CHILD PROCESS with LIVE_TRADING=true, because the whole

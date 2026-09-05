@@ -2751,7 +2751,14 @@ const BROKER_MIRROR_MAX_AGE_MS = 5 * 60 * 1000;
 // Smallest broker/ledger cash difference worth adopting. Below this it is rounding on a
 // fractional fill, and rewriting the ledger for a cent produces log noise that hides the
 // dividend credits this exists to catch.
-const CASH_DRIFT_MIN = Math.max(0.01, parseFloat(process.env.CASH_DRIFT_MIN || '0.25'));
+// Smallest broker/ledger cash difference worth adopting: the greater of an absolute
+// floor and a tiny fraction of the account, so it stays meaningful at any size. A flat
+// $0.25 is a sensible floor on $1,000 and pure rounding noise on $1,000,000.
+const CASH_DRIFT_ABS = Math.max(0.01, parseFloat(process.env.CASH_DRIFT_MIN || '0.25'));
+const CASH_DRIFT_PCT = Math.max(0, Math.min(0.01, parseFloat(process.env.CASH_DRIFT_PCT || '0.0002')));
+function cashDriftMin() {
+  return Math.max(CASH_DRIFT_ABS, startingCapital() * CASH_DRIFT_PCT);
+}
 
 const FRACTIONAL_ENABLED = process.env.FRACTIONAL_ENABLED !== 'false';
 // Floor on position value, so a rescued trade is worth the spread it pays. Alpaca's
@@ -2792,7 +2799,7 @@ const GAP_BLOCK_MS       = 30 * 60 * 1000;
 //    • TP ladder:      +3% → sell 40%, +6% → sell 30% of remainder
 //    • Hard take:      +HARD_TP_PCT                     (+8%)
 //
-//  RISK (enforced by computePositionSize() + kill switches):
+//  RISK (enforced by jupiter.computeSize() + kill switches):
 //    • Risk per trade:   BASE_RISK of trading capital, capped at MAX_RISK
 //    • Daily loss limit: 5% of CURRENT equity (not frozen start capital) halts entries
 //    • Max positions:    8 concurrent; max 2 per sector
@@ -4026,13 +4033,37 @@ async function runIntelCycle() {
 // Scales automatically as the account grows, so this stops being a constraint once
 // the balance can support it.
 const MAX_SINGLE_SHARE_FRACTION = 0.25;   // 1 share ≤ 25% of the trading book
+
+// The largest slice of a stock's daily dollar turnover a single position may represent.
+// 1% is the conventional retail/small-fund ceiling for taking liquidity without visibly
+// moving the price. This is what makes the engine account-size-agnostic: the absolute
+// share floor keeps junk out, and this keeps the ORDER proportionate to the tape.
+const MAX_DAY_VOLUME_SHARE = Math.max(0.0005, Math.min(0.25,
+  parseFloat(process.env.MAX_DAY_VOLUME_SHARE || '0.01')));
+
+// What this account would actually put into one position at `price`, using the same
+// risk budget and stop geometry the sizer uses. Kept in one place so the liquidity
+// screen and the sizer can never drift apart.
+function intendedPositionNotional(price) {
+  const trading = Math.max(0, tradableValue() * (1 - capitalSystem.reserveRatio));
+  const riskFrac = STRATEGY.RISK_PER_TRADE_BASE ?? 0.015;
+  const stopFrac = Math.max(0.005, (STRATEGY.ATR_STOP_MULT ?? 2.2) * 0.02);
+  const byRisk = (trading * riskFrac) / stopFrac;
+  return Math.max(0, Math.min(byRisk, trading));
+}
 function affordableMaxPrice(fractional = FRACTIONAL_ENABLED) {
   // With fractional sizing the share price stops mattering: the sizer buys 0.18 of a
   // $967 share just as happily as 20 shares of $9, and lands on the SAME notional
   // (risk / stop%). The affordability ceiling only exists because whole-share rounding
   // made expensive stocks unsizeable, so it is lifted when that constraint is gone.
   // It remains as the fallback for non-fractional operation.
-  if (fractional) return DYNAMIC_MAX_PRICE;
+  // With fractional sizing the price genuinely does not constrain affordability — the
+  // sizer buys 0.002 of a $1,500 share as happily as 30 shares of $10. A flat $1,000
+  // ceiling here was a leftover from whole-share days and rejected perfectly tradeable
+  // names on any account big enough to want them. The remaining ceiling exists only as a
+  // sanity bound against bad data, so it scales with the account: one share may not cost
+  // more than the whole tradable book.
+  if (fractional) return Math.max(DYNAMIC_MAX_PRICE, tradableValue());
   const tv = getTotalValue();
   const trading = Math.max(0, tv * (1 - capitalSystem.reserveRatio));
   return Math.max(DYNAMIC_MIN_PRICE, Math.min(DYNAMIC_MAX_PRICE, trading * MAX_SINGLE_SHARE_FRACTION));
@@ -4068,6 +4099,32 @@ async function addDynamicSymbol(sym, sig) {
   }
   if ((q.volume || 0) < EFFECTIVE_MIN_DAY_VOL) {
     console.log(`[JUPITER] ${sym} rejected — day volume ${q.volume} < ${EFFECTIVE_MIN_DAY_VOL} (too thin on the ${ALPACA_DATA_FEED} feed)`);
+    return false;
+  }
+  // MARKET IMPACT — the one screen that has to know how big THIS account is.
+  //
+  // The floor above is an absolute share count while position size is a fraction of the
+  // book, so the two diverge as the account grows and the absolute floor stops meaning
+  // anything. Modelled across account sizes against a name sitting exactly on the floor
+  // (30,000 shares at $5 = $150,000 of daily turnover):
+  //
+  //     account      position     share of that stock's ENTIRE day
+  //      $1,000          $310                              0.2%
+  //     $10,000        $3,099                              2.1%
+  //    $100,000       $30,992                             20.7%
+  //  $1,000,000      $309,917                            206.6%
+  //
+  // At $100k the engine would be trying to take a fifth of a stock's daily volume in one
+  // order, moving the price against itself on the way in and again on the way out. At
+  // $1m the order cannot fill at all. This is the wall that made the trading side
+  // un-scalable past roughly $10-20k, and no amount of risk-percentage tuning reaches it
+  // because the failure is in SHARES, not in percent of equity.
+  const dayNotional = (q.volume || 0) * q.price / Math.max(0.01, FEED_VOLUME_FACTOR);
+  const intended = intendedPositionNotional(q.price);
+  if (dayNotional > 0 && intended > dayNotional * MAX_DAY_VOLUME_SHARE) {
+    console.log(`[JUPITER] ${sym} rejected — a $${intended.toFixed(0)} position is ` +
+                `${(100 * intended / dayNotional).toFixed(1)}% of its $${(dayNotional/1e6).toFixed(1)}M daily turnover ` +
+                `(cap ${(MAX_DAY_VOLUME_SHARE*100).toFixed(1)}%); this account is too large to trade it without moving the price`);
     return false;
   }
 
@@ -5500,10 +5557,6 @@ function processProfitVault() {
 //    RISK_PER_TRADE_MAX. Terra just delegates and lets the rest of the entry
 //    pipeline (heat, sector, daily caps) apply on top.
 // ════════════════════════════════════════════════════════════════════════════
-function computePositionSize(symbol, price, direction) {
-  return jupiter.computeSize(symbol, price, direction);
-}
-
 // Drawdown + peak, with the divisor guarded. A peakValue of 0 (corrupt or hand-edited
 // state — `?? START_CAPITAL` on load does NOT catch 0, only null/undefined) makes this
 // 0/0 = NaN when equity is also 0. That matters because EVERY downstream risk check is
@@ -6085,7 +6138,7 @@ function adoptBrokerCashDrift() {
   if (pendingEntryNotional() > 0) return 0;
   if (Object.keys(pendingOrders || {}).length > 0) return 0;
   const delta = brokerMirror.cash - portfolio.cash;
-  if (Math.abs(delta) < CASH_DRIFT_MIN) return 0;
+  if (Math.abs(delta) < cashDriftMin()) return 0;
   // THE DRIFT MUST PERSIST ACROSS TWO SNAPSHOTS BEFORE IT IS BELIEVED.
   // The in-flight counters close the window while an order is outstanding, but they are
   // cleared when the BROKER ACKNOWLEDGES the order, not when it FILLS. Alpaca moves cash
@@ -6095,7 +6148,7 @@ function adoptBrokerCashDrift() {
   // A real credit (a dividend) is still there on the next refresh; a settling order is
   // not. One extra minute of latency on dividends is a trivial price for not
   // double-spending.
-  if (!(Math.abs(delta - _lastCashDelta) < CASH_DRIFT_MIN)) {
+  if (!(Math.abs(delta - _lastCashDelta) < cashDriftMin())) {
     _lastCashDelta = delta;
     return 0;
   }
@@ -8221,7 +8274,7 @@ app.post('/api/reconcile', async (req, res) => {
 //   { "passphrase": "<TRADINGVIEW_WEBHOOK_SECRET>",
 //     "action": "buy" | "sell" | "close",
 //     "symbol": "PLTR",
-//     "qty": 10  (optional; if omitted ATLAS sizes it via computePositionSize) }
+//     "qty": 10  (optional; if omitted ATLAS sizes it via jupiter.computeSize) }
 //
 // SECURITY: the payload is untrusted. We (1) require the shared secret, (2) only
 // accept a strict schema, (3) constrain symbol to the known watchlist, (4) bound
@@ -8516,7 +8569,8 @@ module.exports = {
     FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
     CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore,
     CORE_PHASE1_FRACTION, effectiveCoreFraction, rebasePeakForCoreFlow, unlockStepDownIsActionable, tradingFundsAvailable,
-    coreWeightMap, basketWithRecovered, coreBuyStep, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, CORE_BASKET_MAX_NAMES, CORE_TRIMS_PER_CYCLE, CASH_DRIFT_MIN, adoptBrokerCashDrift, verifyStateDir,
+    coreWeightMap, basketWithRecovered, coreBuyStep, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, CORE_BASKET_MAX_NAMES, CORE_TRIMS_PER_CYCLE, cashDriftMin, CASH_DRIFT_ABS, adoptBrokerCashDrift,
+    MAX_DAY_VOLUME_SHARE, intendedPositionNotional, verifyStateDir,
     getRecoveredSymbols: () => _recoveredSymbols,
     CORE_TILT_ON, CORE_TILT_STRENGTH, CORE_TILT_MAX, CORE_TILT_MIN, CORE_TILT_MAX_SHARE,
     getCoreConviction: () => CORE_CONVICTION,
