@@ -8363,7 +8363,12 @@ if (require.main === module) app.listen(PORT, async () => {
                 // would not reach for weeks and made the first live log misleading.
                 ? `core holding ${(effectiveCoreFraction()*100).toFixed(0)}% now` +
                   (PHASE_GATE_ENABLED && tradingPhaseLocked()
-                    ? ` (steps to ${(CORE_HOLD_FRACTION*100).toFixed(0)}% when trading unlocks)` : '') +
+                    // NOT "steps to CORE_HOLD_FRACTION". Since v11.53 the unlock frees only
+                    // the trading allowance, and CORE_HOLD_FRACTION is merely the floor the
+                    // core can never fall below. Printing the old number told the operator
+                    // to expect a 45-point liquidation that no longer happens — the third
+                    // time a stale figure in this banner has misdescribed live behaviour.
+                    ? ` (then gives up only what trading has earned, never below ${(CORE_HOLD_FRACTION*100).toFixed(0)}%)` : '') +
                   // "awaiting Venus's picks" is only true when there is no live basket.
                   // After a restart the basket is restored from state, and printing
                   // "awaiting" then describes a state the bot is not in — the same

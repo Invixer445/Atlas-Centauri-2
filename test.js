@@ -2750,6 +2750,19 @@ check('starting capital is detected from the broker, not assumed', () => {
      're-detection without force must be ignored, or a grown account redefines its own profit');
 });
 
+check('the startup banner does not promise a liquidation that never happens', () => {
+  // Third time a stale figure in this banner has misdescribed live behaviour: it
+  // reported the wrong phase-1 weight (f3a4108), then claimed "awaiting Venus's picks"
+  // on a restored basket (v11.48), and until now promised the core "steps to 50% when
+  // trading unlocks" — a 45-point liquidation that v11.53 deliberately removed.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(!/steps to \$\{\(CORE_HOLD_FRACTION\*100\)\.toFixed\(0\)\}% when trading unlocks/.test(src),
+     'the banner must not promise a step-down to CORE_HOLD_FRACTION');
+  ok(/gives up only what trading has earned, never below/.test(src),
+     'it must describe the allowance-based behaviour and name the floor');
+});
+
 check('the phase messages describe what actually happens', () => {
   // The unlock message said "The core steps down to 50%". That was v11.52 behaviour and
   // stating it now would describe a liquidation that no longer occurs — the same class of
