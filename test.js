@@ -2642,6 +2642,86 @@ check('broker cash movements are adopted so dividends get reinvested', () => {
      'the mirror refresh must invoke it, or it never runs');
 });
 
+check('defensive mode is bounded, off by default, and cannot exit a holding', () => {
+  // Built because the operator asked twice. The measurement it argues against is in the
+  // code comment: every mechanical "sell when it looks like it is falling" rule lost to
+  // holding on this basket at every trigger, and still lost with costs set to zero.
+  // What ships is therefore bounded and instrumented rather than trusted.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/const DEFENSIVE_MODE = process\.env\.DEFENSIVE_MODE === 'true';/.test(src),
+     'it must be OFF unless explicitly enabled');
+  ok(I.DEFENSIVE_FLOOR > 0, 'the floor must be above zero — a holding that can be fully exited is not a holding');
+  ok(I.DEFENSIVE_CONFIDENCE >= 0.6, `the confidence bar must be high, got ${I.DEFENSIVE_CONFIDENCE}`);
+  // THE CLAMPS, not just the defaults. Mutations that set the default to 0 and to a coin
+  // flip both survived, because Math.max() silently rescued them — so the assertions were
+  // testing the default rather than the guard that actually protects the account.
+  ok(/DEFENSIVE_FLOOR = Math\.max\(0\.1, Math\.min\(0\.9,/.test(src),
+     'the floor must be clamped so no configuration can permit a full exit');
+  ok(/DEFENSIVE_CONFIDENCE = Math\.max\(0\.6, Math\.min\(0\.99,/.test(src),
+     'the confidence bar must be clamped so no configuration can make it a coin flip');
+  // The reduction must be executed by the EXISTING trim, which only ever sells the
+  // excess above a target. Nothing new is allowed to place a sell.
+  const fn = src.slice(src.indexOf('async function defensiveScan'), src.indexOf('function maintainCoreHolding'));
+  ok(!/submitOrder|closeLong|closePosition/.test(fn),
+     'the scan must not place orders itself — it changes the target and lets the trim act');
+  ok(/_defensiveUntil\[worst\.sym\] = Date\.now\(\) \+ DEFENSIVE_HOLD_MS;/.test(fn),
+     'a flag must be time-boxed, not permanent');
+  // Rate limited: this is a judgement about a company, not a tick signal.
+  ok(/Date\.now\(\) - _lastDefensiveAt < 3600000/.test(fn), 'at most one call an hour');
+  // Must not invite the model to explain a decline that is not happening.
+  ok(/if \(!worst \|\| worst\.dayPct >= 0\) return false;/.test(fn),
+     'it must not ask about a name that is not actually down');
+  ok(/recordDefensiveDecision\(\{/.test(fn), 'every decision must be recorded');
+  ok(/price: worst\.px/.test(fn),
+     'WITH the price, or the register can never score it against having done nothing');
+  // Recorded whether or not it acted — a feature that only logs its own actions can
+  // never be shown to be worthless.
+  ok(fn.indexOf('recordDefensiveDecision') < fn.indexOf('if (!acted) return false;'),
+     'the record must be written BEFORE the early return, so refusals are logged too');
+  // UNCONDITIONALLY. Placing it before the early return is not enough if it is wrapped
+  // in `if (acted)` — a mutation proved exactly that, and a log of only its own actions
+  // can never show the feature to be worthless.
+  ok(/\n  recordDefensiveDecision\(\{/.test(fn),
+     'the record must be unconditional, not gated on having acted');
+  ok(!/if \(acted\)\s*recordDefensiveDecision/.test(fn), 'and must not be wrapped in an acted check');
+
+  // BEHAVIOURAL: the flag must reduce the target, others absorb it, and it must expire.
+  if (!I.CORE_HOLD_ON) return;
+  const syms = I.CORE_HOLD_SYMBOLS;
+  const before = I.coreWeightMap();
+  I.setDefensiveUntil({ [syms[0]]: Date.now() + 3600000 });
+  const during = I.coreWeightMap();
+  const sup = I.defensiveSuppressed(syms[0]);
+  I.setDefensiveUntil({ [syms[0]]: Date.now() - 1 });
+  const expiredSup = I.defensiveSuppressed(syms[0]);
+  const after = I.coreWeightMap();
+  I.setDefensiveUntil({});
+
+  ok(sup === true && expiredSup === false, 'suppression must be time-boxed and self-clearing');
+  ok(during[syms[0]] < before[syms[0]] * 0.6,
+     `a flagged name must be materially reduced (${(before[syms[0]]*100).toFixed(2)}% -> ${(during[syms[0]]*100).toFixed(2)}%)`);
+  ok(during[syms[0]] > 0, 'but never reduced to zero');
+  ok(during[syms[1]] > before[syms[1]], 'the freed weight must go to the other names');
+  ok(Math.abs(Object.values(during).reduce((a, b) => a + b, 0) - 1) < 1e-9,
+     'weights must still sum to 1 while a name is suppressed');
+  ok(Math.abs(after[syms[0]] - before[syms[0]]) < 1e-9,
+     'and full weight must return once the hold expires');
+});
+
+check('a defensive hold survives a restart', () => {
+  // Without persistence a restart clears every flag and the core immediately buys back
+  // what it just sold down — selling and repurchasing the same shares, paying spread
+  // twice, which is the exact churn this feature exists to avoid.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/defensiveUntil: _defensiveUntil,/.test(src), 'the suppression map must be persisted');
+  ok(/if \(state\.defensiveUntil && typeof state\.defensiveUntil === 'object'\)/.test(src),
+     'and restored');
+  ok(/if \(Number\.isFinite\(until\) && until > Date\.now\(\)\) _defensiveUntil\[sym\] = until;/.test(src),
+     'expired flags must be dropped on load, not resurrected');
+});
+
 check('the engine refuses trades too large for the stock it is trading', () => {
   // The liquidity floor is an absolute SHARE count while position size is a fraction of
   // the book, so the two diverge as the account grows. Without a relative check, a large

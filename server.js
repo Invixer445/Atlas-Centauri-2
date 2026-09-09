@@ -1394,6 +1394,67 @@ Output ONLY JSON:
            why: String(r.why || '').slice(0, 200) };
 }
 
+// ── DEFENSIVE MODE (v12.56) — ask Venus whether a holding is about to fall ──
+// The operator asked for this directly and twice, so it is built. What it costs is
+// stated here rather than buried, because the measurement is unusually clear.
+//
+// The mechanical version of this idea was tested on this exact 10-name basket over 6.1
+// years: sell when a name falls X% from its high, re-buy when it recovers to the sell
+// price. EVERY trigger level lost to simply holding, monotonically —
+//
+//     trigger   final value   vs holding   round trips
+//       2%          $1,310      -$1,501           135
+//       5%          $1,792      -$1,019            72
+//      10%          $2,234        -$577            29
+//      20%          $2,618        -$193             7
+//      hold         $2,811            —             0
+//
+// — and it still lost with trading costs set to ZERO, so the loss is not friction. It
+// is that a re-buy cannot fill at the price you sold: the stock gaps or runs past that
+// level and you repurchase higher than you sold, systematically, because these names
+// drift up. Three slow trend filters (100/150/200-day) lost too, $1,459-$1,516 vs
+// $2,811. Jupiter's own directional calls measure +0.005R at t=0.08 over 562 trades.
+//
+// THIS VERSION IS DIFFERENT IN ONE RESPECT ONLY: the judgement comes from an LLM
+// reading news rather than from a price rule. That has never been measured here, which
+// is precisely why it ships OFF, bounded, and instrumented:
+//   · it can only REDUCE a holding to DEFENSIVE_FLOOR, never exit it. A holding that
+//     can be fully sold on a view is not a holding, and the trailing stop that could do
+//     that turned a 2.09:1 payoff into 1.2:1.
+//   · a very high confidence bar, because the default answer must be "no".
+//   · every decision is written to the register WITH the price at the time, so it can
+//     be scored out-of-sample. If it does not beat holding, the log will say so.
+async function assessDecline(sym, ctx = {}) {
+  const prompt =
+`You are VENUS. You hold ${sym} as a long-term position and must judge one narrow
+question: is there a CONCRETE, IDENTIFIABLE reason to expect a meaningful decline in
+this specific name over the next few days?
+
+Holding: ${sym}
+  move today                     ${(ctx.dayPct ?? 0).toFixed(2)}%
+  move over the last week        ${(ctx.weekPct ?? 0).toFixed(2)}%
+  distance below its recent high ${(ctx.offHighPct ?? 0).toFixed(2)}%
+  gain since purchase            ${(ctx.gainPct ?? 0).toFixed(2)}%
+
+A reason means something you can NAME: an earnings miss or guidance cut, a regulatory
+or legal action, a sector-wide shock, a broken product cycle, a credit event, an
+announced dilution. A falling price is NOT a reason — it is the thing you are being
+asked to explain, and reacting to it alone has been measured to destroy value here.
+General market softness is NOT a reason, because it reverses and you cannot time it.
+
+Answering false is the correct and expected answer almost every time. Say true only if
+you could defend the specific cause to someone who disagreed with you.
+
+Output ONLY JSON:
+{"decline":true|false,"confidence":0.0-1.0,"why":"one short sentence naming the cause"}`;
+
+  const r = await llmReason(prompt);
+  if (!r || typeof r.decline !== 'boolean') return null;
+  return { decline: !!r.decline,
+           confidence: Math.max(0, Math.min(1, Number(r.confidence) || 0)),
+           why: String(r.why || '').slice(0, 200) };
+}
+
 async function assess(ctx = {}) {
   const names = researchData.watchlist.slice(0, 12).map(w =>
     `${w.symbol}: 13F=${(w.institutional||0).toFixed(2)} (${w.institutionalFilings||0} filings), news=${(w.newsConviction||0).toFixed(2)}${w.catalyst?` [${w.catalyst}]`:''}, RVOL=${(w.rvol||0).toFixed(1)}`
@@ -1457,7 +1518,7 @@ const venus = {
   // list at boot, so a copied value here would report the stale configured name.
   get AI_MODEL() { return AI_MODEL; },
   resolveAiModel,
-  analyze, research, assess, assessTrim, proposeBasket, researchRecommendations, getResearch, getResearchFor, institutionalInterest,
+  analyze, research, assess, assessTrim, assessDecline, proposeBasket, researchRecommendations, getResearch, getResearchFor, institutionalInterest,
   // Exposed so the suite can BUILD the prompt rather than reason about whether the
   // constants it interpolates are in scope. They are declared after this function and
   // resolve only at call time, so a typo here would surface on the first research
@@ -2560,6 +2621,54 @@ const CORE_TRIM_EARLY_BAND = Math.max(0.05, parseFloat(process.env.CORE_TRIM_EAR
 // is "no", and acting on a weak view is the behaviour that cost 2.09:1 -> 1.2:1.
 const CORE_TRIM_AI_CONFIDENCE = Math.max(0.5, parseFloat(process.env.CORE_TRIM_AI_CONFIDENCE || '0.75'));
 const CORE_TRIM_AI = process.env.CORE_TRIM_AI !== 'false';
+
+// ── DEFENSIVE MODE ──────────────────────────────────────────────────────────
+// OFF by default. See assessDecline() for the measurement that says why: every
+// mechanical version of "sell when it looks like it is falling" lost to holding on
+// this basket, at every trigger level, even with zero costs. This ships because the
+// operator asked for it twice and because the LLM-judgement variant has never actually
+// been measured — not because the evidence favours it.
+const DEFENSIVE_MODE = process.env.DEFENSIVE_MODE === 'true';
+// How sure Venus must be before any money moves. Deliberately high: the default answer
+// is "no", and acting on a weak view is what turned a 2.09:1 payoff into 1.2:1.
+const DEFENSIVE_CONFIDENCE = Math.max(0.6, Math.min(0.99,
+  parseFloat(process.env.DEFENSIVE_CONFIDENCE || '0.85')));
+// The floor a flagged name is reduced TO, as a fraction of its normal slice. Never 0:
+// a holding that can be fully exited on a view is not a holding.
+const DEFENSIVE_FLOOR = Math.max(0.1, Math.min(0.9,
+  parseFloat(process.env.DEFENSIVE_FLOOR || '0.40')));
+// How long a flag suppresses top-ups. Without this the core sees the reduced name as
+// the most underweight and buys it straight back on the next cycle — selling and
+// repurchasing the same shares inside a minute, paying spread twice for nothing.
+const DEFENSIVE_HOLD_MS = Math.max(3600000,
+  parseFloat(process.env.DEFENSIVE_HOLD_HOURS || '24') * 3600000);
+const DEFENSIVE_LOG = dataPath('atlas-defensive-decisions.json');
+let _defensiveUntil = {};      // SYM -> timestamp while suppressed
+let _lastDefensiveAt = 0;
+
+// A flagged name is held down for a while, then allowed back to full weight.
+function defensiveSuppressed(sym) {
+  const until = _defensiveUntil[sym];
+  if (!until) return false;
+  if (Date.now() >= until) { delete _defensiveUntil[sym]; return false; }
+  return true;
+}
+// Its target slice while suppressed. Applied to BOTH the buy and the trim, or the two
+// would fight each other exactly as they would with mismatched conviction weights.
+function defensiveShareFactor(sym) {
+  return defensiveSuppressed(sym) ? DEFENSIVE_FLOOR : 1;
+}
+// Append-only record WITH the price at decision time, so the register can score
+// out-of-sample whether this beat doing nothing. Without the price it cannot.
+function recordDefensiveDecision(rec) {
+  try {
+    let log = [];
+    try { log = JSON.parse(fs.readFileSync(DEFENSIVE_LOG, 'utf8')); } catch {}
+    if (!Array.isArray(log)) log = [];
+    log.push({ at: new Date().toISOString(), ...rec });
+    fs.writeFileSync(DEFENSIVE_LOG, JSON.stringify(log.slice(-500), null, 2));
+  } catch (e) { console.warn(`[DEFENSE] could not record decision: ${e.message}`); }
+}
 const TRIM_DECISION_LOG = dataPath('atlas-trim-decisions.json');
 let _lastTrimAiAt = 0;
 
@@ -5152,9 +5261,12 @@ function coreWeightMap(symbols = CORE_HOLD_SYMBOLS, conv = CORE_CONVICTION) {
     const m = 1 + CORE_TILT_STRENGTH * (2 * clamped - 1);
     return Math.max(CORE_TILT_MIN, Math.min(CORE_TILT_MAX, m));
   });
-  const tot = mult.reduce((a, b) => a + b, 0);
+  // Defensive suppression rides on top of conviction, and applies to the buy and the
+  // trim identically — a name reduced by one and topped up by the other would churn.
+  const withDef = mult.map((m, i) => m * defensiveShareFactor(list[i]));
+  const tot = withDef.reduce((a, b) => a + b, 0);
   if (!(tot > 0)) { for (const s of list) out[s] = eq; return out; }
-  let w = mult.map(m => m / tot);
+  let w = withDef.map(m => m / tot);
 
   // HARD RAIL ON THE FINAL SHARE. The per-name multiplier is bounded, but shares are
   // normalised, so bounding the multiplier is not the same as bounding the result:
@@ -5420,6 +5532,69 @@ async function trimCoreStep() {
       .then(r => { if (!r.ok) rollback(r.error); settle(); })
       .catch(e => { rollback(e.message); settle(); });
   }
+  queueSaveState();
+  return true;
+}
+
+// Ask Venus whether the WEAKEST currently-held name is falling for a nameable reason,
+// and if so hold it down to DEFENSIVE_FLOOR for a while. The reduction itself is
+// executed by the ordinary trim, which already knows how to sell only the excess above
+// a target — so this changes the TARGET and lets the tested machinery do the selling.
+// Nothing here can exit a position.
+async function defensiveScan() {
+  if (!DEFENSIVE_MODE || !CORE_HOLD_ON) return false;
+  if (!getCurrentMarket()) return false;
+  if (coreHaltedByOperator()) return false;
+  // One LLM call an hour at most. This is a judgement about a specific company, not a
+  // tick-by-tick signal, and asking every minute would be both expensive and a way of
+  // reacting to price — the exact behaviour the prompt forbids.
+  if (Date.now() - _lastDefensiveAt < 3600000) return false;
+
+  const held = Object.entries(portfolio.coreHolding || {})
+    .filter(([sym, lot]) => lot && lot.qty > 0 && !defensiveSuppressed(sym)
+                         && Number.isFinite(marketData[sym]?.price) && marketData[sym].price > 0);
+  if (!held.length) return false;
+
+  // Look at the WORST performer today. If anything is breaking, it is most likely here,
+  // and asking about one name keeps this to a single call.
+  let worst = null, worstPct = Infinity;
+  for (const [sym, lot] of held) {
+    const px = marketData[sym].price, prev = marketData[sym].prevClose || px;
+    const dayPct = prev > 0 ? (px / prev - 1) * 100 : 0;
+    if (dayPct < worstPct) { worstPct = dayPct; worst = { sym, lot, px, dayPct }; }
+  }
+  // Nothing is actually down — there is no decline to explain, so do not spend a call
+  // inviting the model to invent one.
+  if (!worst || worst.dayPct >= 0) return false;
+
+  _lastDefensiveAt = Date.now();
+  const hist = marketData[worst.sym].history || [];
+  const weekAgo = hist.length > 5 ? hist[Math.max(0, hist.length - 6)] : worst.px;
+  const high = hist.length ? Math.max(...hist, worst.px) : worst.px;
+  const verdict = await venus.assessDecline(worst.sym, {
+    dayPct: worst.dayPct,
+    weekPct: weekAgo > 0 ? (worst.px / weekAgo - 1) * 100 : 0,
+    offHighPct: high > 0 ? (worst.px / high - 1) * 100 : 0,
+    gainPct: worst.lot.avgPrice > 0 ? (worst.px / worst.lot.avgPrice - 1) * 100 : 0,
+  });
+
+  const acted = !!(verdict && verdict.decline && verdict.confidence >= DEFENSIVE_CONFIDENCE);
+  // RECORDED EITHER WAY, with the price, so the register can score what actually
+  // happened next against what holding would have done. A feature that only logs its
+  // own actions can never be shown to be worthless.
+  recordDefensiveDecision({
+    symbol: worst.sym, price: worst.px, dayPct: +worst.dayPct.toFixed(2),
+    said: verdict ? verdict.decline : null,
+    confidence: verdict ? +verdict.confidence.toFixed(2) : null,
+    bar: DEFENSIVE_CONFIDENCE, acted, why: verdict ? verdict.why : 'no verdict',
+  });
+  if (!acted) return false;
+
+  _defensiveUntil[worst.sym] = Date.now() + DEFENSIVE_HOLD_MS;
+  console.warn(`[DEFENSE] 🛡 ${worst.sym} reduced to ${(DEFENSIVE_FLOOR*100).toFixed(0)}% of its slice for ` +
+               `${(DEFENSIVE_HOLD_MS/3600000).toFixed(0)}h — Venus ${(verdict.confidence*100).toFixed(0)}% confident: ` +
+               `${verdict.why}. The trim will sell the excess; it is NOT exited, and it returns to ` +
+               `full weight when the hold expires.`);
   queueSaveState();
   return true;
 }
@@ -6952,6 +7127,7 @@ function buildStateObject() {
     // The baseline every percentage is measured from. Persisted so it is detected ONCE,
     // on the first boot of a fresh account, and never re-derived from a grown one.
     startingCapital: _startingCapital,
+    defensiveUntil: _defensiveUntil,
     closedTrades:   portfolio.closedTrades.slice(-500),
     marketTransition: marketTransitionData,
     capitalSystem,
@@ -7134,6 +7310,14 @@ function loadState() {
         _lastBasketSwapAt = Number.isFinite(state.lastBasketSwapAt) ? state.lastBasketSwapAt : Date.now();
         console.log(`[LOAD] Restored Venus basket (${CORE_HOLD_SYMBOLS.join(',')}) — ` +
                     `without this the trim would sell every holding outside the default list`);
+      }
+    }
+    // Without this a restart clears every defensive hold and the core immediately buys
+    // back what it just sold down — the churn this feature exists to avoid.
+    if (state.defensiveUntil && typeof state.defensiveUntil === 'object') {
+      _defensiveUntil = {};
+      for (const [sym, until] of Object.entries(state.defensiveUntil)) {
+        if (Number.isFinite(until) && until > Date.now()) _defensiveUntil[sym] = until;
       }
     }
     marketTransitionData      = state.marketTransition ?? marketTransitionData;
@@ -8529,6 +8713,7 @@ if (require.main === module) app.listen(PORT, async () => {
   if (CORE_HOLD_ON) setInterval(maintainCoreHolding, CORE_INTERVAL_MS);
   // Trim runs on its own timer, offset so a buy and a sell never fire in the same tick.
   if (CORE_HOLD_ON) setInterval(() => { trimCoreHolding().catch(e => console.warn("[CORE] trim error:", e.message)); }, CORE_INTERVAL_MS);
+  if (CORE_HOLD_ON && DEFENSIVE_MODE) setInterval(() => { defensiveScan().catch(e => console.warn('[DEFENSE] scan error:', e.message)); }, CORE_INTERVAL_MS);
 
   // 6. Profit vault — every 5 min
   setInterval(processProfitVault, 300000);
@@ -8601,7 +8786,9 @@ module.exports = {
     FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
     CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore,
     CORE_PHASE1_FRACTION, effectiveCoreFraction, rebasePeakForCoreFlow, unlockStepDownIsActionable, tradingFundsAvailable,
-    coreWeightMap, basketWithRecovered, coreBuyStep, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, CORE_BASKET_MAX_NAMES, CORE_TRIMS_PER_CYCLE, cashDriftMin, CASH_DRIFT_ABS, adoptBrokerCashDrift,
+    coreWeightMap, basketWithRecovered, coreBuyStep, defensiveScan, defensiveSuppressed,
+    defensiveShareFactor, DEFENSIVE_MODE, DEFENSIVE_FLOOR, DEFENSIVE_CONFIDENCE, DEFENSIVE_HOLD_MS,
+    setDefensiveUntil: (m) => { _defensiveUntil = m || {}; }, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, CORE_BASKET_MAX_NAMES, CORE_TRIMS_PER_CYCLE, cashDriftMin, CASH_DRIFT_ABS, adoptBrokerCashDrift,
     MAX_DAY_VOLUME_SHARE, intendedPositionNotional, verifyStateDir,
     getRecoveredSymbols: () => _recoveredSymbols,
     CORE_TILT_ON, CORE_TILT_STRENGTH, CORE_TILT_MAX, CORE_TILT_MIN, CORE_TILT_MAX_SHARE,
