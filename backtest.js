@@ -353,7 +353,12 @@ function metrics(trades, equity, startCap) {
     const cf = `${CACHE_DIR}/${s}-${BARS}-${DAYS}d-${FEED}-${end.toISOString().slice(0,10)}.json`;
     if (fs.existsSync(cf)) { hist[s] = JSON.parse(fs.readFileSync(cf,'utf8')); process.stdout.write(`    ${s} (cached) `); }
     else { process.stdout.write(`    fetching ${s} … `); hist[s] = await fetchBars(s, start.toISOString(), end.toISOString());
-           try { fs.writeFileSync(cf, JSON.stringify(hist[s])); } catch {} }
+           // NEVER CACHE AN EMPTY RESULT. A failed fetch — expired keys, a rate limit, a
+           // network blip — returns [], and writing that to disk poisons this date
+           // permanently: every later run reads "(cached) 0 bars" and the tool reports
+           // "not enough bars" forever, even once the cause is fixed. Observed after an
+           // API key rotation. Only a non-empty result is worth remembering.
+           if (hist[s].length) { try { fs.writeFileSync(cf, JSON.stringify(hist[s])); } catch {} } }
     console.log(`${hist[s].length} bars`);
     if (TF > 1 && !DAILY) hist[s] = aggregate(hist[s], TF);
   }
