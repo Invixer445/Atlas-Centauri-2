@@ -728,13 +728,24 @@ check('garbage direction values are rejected', () => {
 
 // ════════════════════════════════════════════════════════════════════════════
 group('LIQUIDITY THRESHOLD — must match the data feed in use');
+// These two describe the IEX feed specifically. On `sip` the engine receives full
+// consolidated volume, FEED_VOLUME_FACTOR is 1.0, and the threshold correctly does NOT
+// scale — so asserting that it does would be a red suite over correct behaviour, the
+// same trap as asserting tilt behaviour with CORE_TILT=false.
+const ON_IEX = (process.env.ALPACA_DATA_FEED || 'iex').toLowerCase() === 'iex';
 check('iex feed scales the consolidated threshold down', () => {
+  if (!ON_IEX) {
+    ok(I.FEED_VOLUME_FACTOR === 1.0 && I.EFFECTIVE_MIN_DAY_VOL === I.DYNAMIC_MIN_DAY_VOL,
+       'on a consolidated feed the threshold must be used unscaled');
+    return;
+  }
   ok(I.EFFECTIVE_MIN_DAY_VOL < I.DYNAMIC_MIN_DAY_VOL,
      'IEX reports ~3% of consolidated volume; threshold must scale or it rejects everything');
 });
 check('the symbols rejected live would now pass', () => {
   // From the live log: MP 220090, NBIS 314679, BYND 91975 — all real, liquid mid-caps
   // wrongly rejected as "too thin" because IEX volume was compared to a consolidated bar.
+  if (!ON_IEX) { ok(true, 'consolidated feed — these IEX-scaled figures do not apply'); return; }
   for (const [sym, vol] of [['MP', 220090], ['NBIS', 314679], ['BYND', 91975]]) {
     ok(vol >= I.EFFECTIVE_MIN_DAY_VOL, `${sym} (${vol}) still rejected by ${I.EFFECTIVE_MIN_DAY_VOL}`);
   }
@@ -2639,8 +2650,17 @@ check('the engine refuses trades too large for the stock it is trading', () => {
   // side un-scalable, and no risk-percentage tuning reaches it: the failure is in shares.
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
                 .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
-  ok(/const dayNotional = \(q\.volume \|\| 0\) \* q\.price \/ Math\.max\(0\.01, FEED_VOLUME_FACTOR\);/.test(src),
+  ok(/const dayNotional = liqVolume \* q\.price \/ Math\.max\(0\.01, FEED_VOLUME_FACTOR\);/.test(src),
      'daily turnover must be de-scaled by the feed factor — iex shows only a few % of consolidated volume');
+  // And it must use the SAME best-evidence volume the liquidity floor uses. Sizing
+  // impact against a half-built session bar is far too strict in the morning and far
+  // too loose at the close.
+  ok(/const liqVolume = Math\.max\(q\.volume \|\| 0, q\.prevVolume \|\| 0\);/.test(src),
+     'liquidity must fall back to yesterday\'s complete volume before the session has built its own');
+  ok(src.indexOf('const liqVolume =') < src.indexOf('const dayNotional = liqVolume'),
+     'liqVolume must be computed before the impact check uses it');
+  ok(/prevVolume: pdb\.v \|\| 0/.test(src), 'the snapshot must carry yesterday\'s complete volume');
+  ok(/dailyVolume: liqVolume,/.test(src), 'the stored dailyVolume must use it too, or RVOL is wrong all morning');
   ok(/intended > dayNotional \* MAX_DAY_VOLUME_SHARE/.test(src),
      'the intended POSITION must be compared against that turnover');
   ok(/const intended = intendedPositionNotional\(q\.price\);/.test(src),
@@ -2954,6 +2974,38 @@ check('the trim keeps pace with the buy side', () => {
   const step = src.slice(src.indexOf('async function trimCoreStep'), src.indexOf('function maintainCoreHolding'));
   ok(/return true;/.test(step) && /if \(!pick\) return false;/.test(step),
      'the step must report whether it actually trimmed');
+});
+
+check('a failed parse is retried with a DIFFERENT prompt, not the same one', () => {
+  // The retry re-sent the identical prompt, so a model that failed to produce clean
+  // JSON once had every reason to fail the same way again. Observed 2026-09-08:
+  // "retrying once" followed by "Analysis failed (groq): unparseable-json — 8
+  // article(s) requeued", twice in one session. Repeating an input that just failed is
+  // not a retry strategy.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('const prompt = buildPrompt(articles.slice(0, 15));'),
+                       src.indexOf('const recommendations = recsFromParsed(parsed);'));
+  ok(/const call = \(p\) =>/.test(fn), 'the caller must accept a prompt rather than closing over one');
+  ok(/r = await call\(strict\);/.test(fn), 'the retry must send the STRICTER prompt');
+  ok(!/r = await call\(prompt\);[\s\S]*r = await call\(prompt\);/.test(fn),
+     'the retry must not re-send the identical prompt');
+  ok(/YOUR PREVIOUS REPLY COULD NOT BE PARSED/.test(fn),
+     'the correction must name the actual failure, not just repeat the instructions');
+  ok(/the correct and complete reply is exactly/.test(fn),
+     'and give the model a valid escape hatch, or it invents content to satisfy the format');
+  // Still exactly ONE retry — a loop here would hammer the provider on a bad day.
+  ok((fn.match(/await call\(/g) || []).length === 2,
+     `exactly two calls: the attempt and one retry, got ${(fn.match(/await call\(/g) || []).length}`);
+  // Counting call sites is not enough — a loop wrapped around ONE site hammers the
+  // provider just as hard and the count stays at two. A mutation proved exactly that.
+  ok(!/(for|while)\s*\([^)]*\)\s*r = await call/.test(fn),
+     'the retry must not be wrapped in a loop');
+  ok(/^\s*r = await call\(strict\);\s*$/m.test(fn),
+     'the retry must be a single unconditional statement');
+  // And still no retry on transport or rate errors, where a second call makes it worse.
+  ok(/if \(!r\.ok\) return \{ ok:false, error: r\.error \};/.test(fn),
+     'a transport failure must return, never retry');
 });
 
 check('Venus is told what Jupiter can actually trade', () => {

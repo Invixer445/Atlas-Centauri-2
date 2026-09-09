@@ -1030,17 +1030,29 @@ async function analyze(articles) {
   if (!Array.isArray(articles) || articles.length === 0) return { ok:true, recommendations: [], usage: null };
 
   const prompt = buildPrompt(articles.slice(0, 15));
-  const call = () => PROVIDER === 'groq' ? callGroq(prompt) : callAnthropic(prompt);
+  const call = (p) => PROVIDER === 'groq' ? callGroq(p) : callAnthropic(p);
 
-  let r = await call();
+  let r = await call(prompt);
   if (!r.ok) return { ok:false, error: r.error };
 
   let parsed = extractJsonArray(r.text);
   // ONE retry, and only for a malformed body — never for a rate limit or a
   // transport error, where an immediate second call makes the problem worse.
+  //
+  // THE RETRY MUST DIFFER FROM THE FIRST ATTEMPT. It used to re-send the identical
+  // prompt, so a model that failed to produce clean JSON once had every reason to fail
+  // the same way again — which is exactly what happened on 2026-09-08: "retrying once"
+  // followed by "Analysis failed (groq): unparseable-json — 8 article(s) requeued",
+  // twice in one session. Repeating an input that just failed is not a retry strategy.
+  // The second attempt appends an explicit, narrow correction naming the failure.
   if (!parsed) {
-    console.warn('[VENUS] Response was not parseable JSON — retrying once');
-    r = await call();
+    console.warn('[VENUS] Response was not parseable JSON — retrying with a stricter instruction');
+    const strict = prompt +
+      `\n\nCRITICAL — YOUR PREVIOUS REPLY COULD NOT BE PARSED.` +
+      `\nReturn ONE JSON array and nothing else. No markdown code fences of any kind, no prose` +
+      `\nbefore or after, no trailing commas, no comments. If you have no ideas worth` +
+      `\nhanding over, the correct and complete reply is exactly:\n[]`;
+    r = await call(strict);
     if (!r.ok) return { ok:false, error: r.error };
     parsed = extractJsonArray(r.text);
   }
@@ -3438,7 +3450,15 @@ function snapshotToQuote(s) {
     dayOpen:   db.o > 0 ? db.o : null,   // official session open — stable anchor for gap + vol math
     high:      db.h > 0 ? db.h : price,
     low:       db.l > 0 ? db.l : price,
-    volume:    db.v || 0
+    volume:    db.v || 0,
+    // YESTERDAY'S COMPLETE VOLUME, kept alongside today's partial figure.
+    // db.v is the session's CUMULATIVE volume so far, so at 09:35 it is a small
+    // fraction of a full day. Comparing it against a FULL-DAY liquidity threshold
+    // rejects genuinely liquid names purely because the session is young. Observed
+    // 2026-09-08: QCOM — Qualcomm, a mega-cap — rejected as "too thin" on 22,802
+    // shares, a partial-session count. Venus's best ideas are news-driven and arrive
+    // in the morning, so the screen was hardest exactly when it mattered most.
+    prevVolume: pdb.v || 0
   };
 }
 
@@ -4097,8 +4117,13 @@ async function addDynamicSymbol(sym, sig) {
                 `(1 share must stay under $${affordCeiling.toFixed(2)}; it could never be sized)`);
     return false;
   }
-  if ((q.volume || 0) < EFFECTIVE_MIN_DAY_VOL) {
-    console.log(`[JUPITER] ${sym} rejected — day volume ${q.volume} < ${EFFECTIVE_MIN_DAY_VOL} (too thin on the ${ALPACA_DATA_FEED} feed)`);
+  // Liquidity is judged on the BEST EVIDENCE AVAILABLE: today's volume once the
+  // session has built some, yesterday's complete figure before then. A name that was
+  // liquid yesterday is liquid this morning; the clock is not evidence about the stock.
+  const liqVolume = Math.max(q.volume || 0, q.prevVolume || 0);
+  if (liqVolume < EFFECTIVE_MIN_DAY_VOL) {
+    console.log(`[JUPITER] ${sym} rejected — volume ${liqVolume} < ${EFFECTIVE_MIN_DAY_VOL} ` +
+                `(today ${q.volume || 0}, yesterday ${q.prevVolume || 0}; too thin on the ${ALPACA_DATA_FEED} feed)`);
     return false;
   }
   // MARKET IMPACT — the one screen that has to know how big THIS account is.
@@ -4119,7 +4144,9 @@ async function addDynamicSymbol(sym, sig) {
   // $1m the order cannot fill at all. This is the wall that made the trading side
   // un-scalable past roughly $10-20k, and no amount of risk-percentage tuning reaches it
   // because the failure is in SHARES, not in percent of equity.
-  const dayNotional = (q.volume || 0) * q.price / Math.max(0.01, FEED_VOLUME_FACTOR);
+  // Same partial-session problem: sizing impact against a half-built volume bar makes
+  // the check far too strict in the morning and far too loose at the close.
+  const dayNotional = liqVolume * q.price / Math.max(0.01, FEED_VOLUME_FACTOR);
   const intended = intendedPositionNotional(q.price);
   if (dayNotional > 0 && intended > dayNotional * MAX_DAY_VOLUME_SHARE) {
     console.log(`[JUPITER] ${sym} rejected — a $${intended.toFixed(0)} position is ` +
@@ -4131,7 +4158,7 @@ async function addDynamicSymbol(sym, sig) {
   // Seed market data from the snapshot
   marketData[sym] = {
     price: q.price, prevClose: q.prevClose, high: q.high, low: q.low,
-    dailyVolume: q.volume || 0,
+    dailyVolume: liqVolume,
     lastUpdate: Date.now(), lastTradeTime: 0, history: [q.price]
   };
   dynamicSymbols[sym] = { addedAt: Date.now(), source: 'venus', catalyst: sig?.catalyst || 'other' };
