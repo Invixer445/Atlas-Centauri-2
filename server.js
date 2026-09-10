@@ -121,6 +121,22 @@ const START_CAPITAL = 1000;
 // Detected once, from the broker's own equity, on the first boot with no saved state —
 // then persisted, so it never drifts and never re-detects against a grown account.
 let _startingCapital = null;
+// THE BENCHMARK ANCHOR AND THE DIVIDEND TALLY.
+//
+// The account has been judged on its raw dollar change every single day it has run, and
+// that number is almost pure noise: the daily swing on this basket is ±$8.49 against an
+// expected +$0.70. Reading it alone has repeatedly made a 0.19-sigma day look like a
+// failure, and the changes that "fix" such a day are the ones measured to cost the most.
+//
+// The only figure that answers "is this working" is the account against the thing you
+// would otherwise have bought. SPY's price is captured at the same instant starting
+// capital is detected, persisted, and never moved — so every later comparison is against
+// a fixed, honest anchor rather than a rolling one.
+//
+// Dividends are tallied for the same reason: they are the one compounding mechanism here
+// that requires no forecast and cannot be wrong, and until now they arrived invisibly.
+let _benchmarkStart = null;      // SPY price at inception
+let _dividendsTotal = 0;         // cumulative cash adopted from the broker
 function startingCapital() {
   return (Number.isFinite(_startingCapital) && _startingCapital > 0) ? _startingCapital : START_CAPITAL;
 }
@@ -131,6 +147,11 @@ function detectStartingCapital(equity, { force = false } = {}) {
   if (!force && Number.isFinite(_startingCapital) && _startingCapital > 0) return _startingCapital;
   if (!Number.isFinite(equity) || equity <= 0) return startingCapital();
   _startingCapital = equity;
+  // Anchor the benchmark at the same instant. If SPY has no price yet it stays null and
+  // the digest simply omits the comparison rather than inventing a baseline.
+  if (_benchmarkStart == null && Number.isFinite(spyData.price) && spyData.price > 0) {
+    _benchmarkStart = spyData.price;
+  }
   console.log(`[CAPITAL] 📐 Starting capital detected as $${equity.toFixed(2)} from the broker — ` +
               `profit, the unlock threshold and every percentage are measured from this. ` +
               `Persisted, so it will not move as the account grows.`);
@@ -6222,6 +6243,7 @@ function adoptBrokerCashDrift() {
   // Cash appearing from outside is NEW capital to the core, not a gain the trading side
   // made — rebase the peak exactly as a core flow does, or it reads as a drawdown.
   rebasePeakForCoreFlow(-delta);
+  if (delta > 0) _dividendsTotal += delta;
   console.log(`[CASH] ${delta > 0 ? '+' : ''}$${delta.toFixed(2)} adopted from the broker ` +
               `(ledger $${(brokerMirror.cash - delta).toFixed(2)} → $${brokerMirror.cash.toFixed(2)}) — ` +
               `${delta > 0 ? 'dividend or credit; the core will redeploy it' : 'fee or debit'}`);
@@ -6282,8 +6304,44 @@ function noteDailyRejection(reason) {
   const b = rejectionBucket(reason);
   _dailyRejectTally[b] = (_dailyRejectTally[b] || 0) + 1;
 }
+// THE LINE THAT ANSWERS "IS THIS WORKING".
+//
+// Reported every session close, whether or not anything traded. A raw dollar change is
+// noise at this size — ±$8.49 a day against an expected +$0.70 — and judging the system
+// by it has repeatedly made an ordinary day look like a failure. What is informative is
+// the account against the thing you would otherwise have bought, measured from a fixed
+// anchor, plus the two facts nothing else surfaces: how much is actually invested, and
+// how much the dividends have quietly added.
+//
+// Deliberately reports the comparison whether it flatters the bot or not. A scoreboard
+// you can only lose on is the only kind worth keeping.
+function logPerformanceDigest() {
+  const total = getTotalValue();
+  const base  = startingCapital();
+  if (!(base > 0)) return;
+  const pnl   = total - base;
+  const pctMe = (pnl / base) * 100;
+
+  let bench = '';
+  if (Number.isFinite(_benchmarkStart) && _benchmarkStart > 0
+      && Number.isFinite(spyData.price) && spyData.price > 0) {
+    const pctSpy = (spyData.price / _benchmarkStart - 1) * 100;
+    const diff   = pctMe - pctSpy;
+    bench = `  ·  SPY ${pctSpy >= 0 ? '+' : ''}${pctSpy.toFixed(2)}%  ·  ` +
+            `${diff >= 0 ? 'AHEAD' : 'behind'} by ${Math.abs(diff).toFixed(2)}%`;
+  }
+  const core = coreHoldingValue();
+  const deployed = total > 0 ? (core / total) * 100 : 0;
+  console.log(`[PERF] $${total.toFixed(2)}  ·  ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} ` +
+              `(${pctMe >= 0 ? '+' : ''}${pctMe.toFixed(2)}%) since $${base.toFixed(0)}${bench}`);
+  console.log(`[PERF] ${deployed.toFixed(1)}% invested across ${Object.keys(portfolio.coreHolding || {}).length} names` +
+              `  ·  dividends collected $${_dividendsTotal.toFixed(2)}` +
+              `  ·  typical daily swing on this basket is about ±$${(total * 0.0088).toFixed(2)}`);
+}
+
 // Called at the session close. If the bot did not trade, this says what stopped it.
 function logDailyTradeDigest() {
+  logPerformanceDigest();
   const day = _dailyRejectDay || new Date().toISOString().slice(0, 10);
   const traded = portfolio.trades.filter(t => String(t.openedAt || t.at || '').slice(0, 10) === day).length;
   const top = Object.entries(_dailyRejectTally).sort((a, b) => b[1] - a[1]).slice(0, 4);
@@ -6990,6 +7048,8 @@ function buildStateObject() {
     // The baseline every percentage is measured from. Persisted so it is detected ONCE,
     // on the first boot of a fresh account, and never re-derived from a grown one.
     startingCapital: _startingCapital,
+    benchmarkStart:  _benchmarkStart,
+    dividendsTotal:  _dividendsTotal,
     closedTrades:   portfolio.closedTrades.slice(-500),
     marketTransition: marketTransitionData,
     capitalSystem,
@@ -7153,6 +7213,8 @@ function loadState() {
     }
     if (Number.isFinite(state.startingCapital) && state.startingCapital > 0) {
       _startingCapital = state.startingCapital;
+      if (Number.isFinite(state.benchmarkStart) && state.benchmarkStart > 0) _benchmarkStart = state.benchmarkStart;
+      if (Number.isFinite(state.dividendsTotal)) _dividendsTotal = state.dividendsTotal;
       console.log(`[LOAD] Starting capital $${_startingCapital.toFixed(2)} restored — ` +
                   `profit and the unlock bar stay measured from the original account size`);
     }
@@ -8639,7 +8701,9 @@ module.exports = {
     FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
     CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore,
     CORE_PHASE1_FRACTION, effectiveCoreFraction, rebasePeakForCoreFlow, unlockStepDownIsActionable, tradingFundsAvailable,
-    coreWeightMap, basketWithRecovered, coreBuyStep, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, CORE_BASKET_MAX_NAMES, CORE_TRIMS_PER_CYCLE, cashDriftMin, CASH_DRIFT_ABS, adoptBrokerCashDrift,
+    coreWeightMap, basketWithRecovered, coreBuyStep, logPerformanceDigest,
+    getBenchmarkStart: () => _benchmarkStart, getDividendsTotal: () => _dividendsTotal,
+    setBenchmarkStart: (v) => { _benchmarkStart = v; }, setDividendsTotal: (v) => { _dividendsTotal = v; }, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, CORE_BASKET_MAX_NAMES, CORE_TRIMS_PER_CYCLE, cashDriftMin, CASH_DRIFT_ABS, adoptBrokerCashDrift,
     MAX_DAY_VOLUME_SHARE, intendedPositionNotional, verifyStateDir,
     getRecoveredSymbols: () => _recoveredSymbols,
     CORE_TILT_ON, CORE_TILT_STRENGTH, CORE_TILT_MAX, CORE_TILT_MIN, CORE_TILT_MAX_SHARE,

@@ -2712,6 +2712,55 @@ check('nothing is priced out of reach purely by share price', () => {
   ok(capSmall >= 1000, 'and the small-account ceiling must not regress below the old flat value');
 });
 
+check('the session close reports the account against a benchmark, not a bare dollar figure', () => {
+  // A raw daily change is noise at this size: ±$8.49 against an expected +$0.70. Judging
+  // the system by it has repeatedly made a 0.19-sigma day look like a failure, and the
+  // changes that "fix" such a day are the ones measured to cost the most. The only
+  // figure that answers "is this working" is the account against what you'd otherwise
+  // have bought, from a FIXED anchor.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function logPerformanceDigest'), src.indexOf('function logDailyTradeDigest'));
+  ok(fn.length > 200, 'logPerformanceDigest must exist');
+  ok(/spyData\.price \/ _benchmarkStart - 1/.test(fn), 'it must compare against SPY from the anchor');
+  ok(/AHEAD/.test(fn) && /behind/.test(fn),
+     'and report BOTH directions — a scoreboard you can only win on is worthless');
+  ok(/dividends collected/.test(fn), 'it must surface dividends, the one compounding mechanism that cannot be wrong');
+  ok(/typical daily swing/.test(fn), 'and the noise band, so a normal day is not read as a failure');
+  // Called on EVERY session close, not only when something traded.
+  const digest = src.slice(src.indexOf('function logDailyTradeDigest'), src.indexOf('function logDailyTradeDigest') + 400);
+  ok(/logPerformanceDigest\(\);/.test(digest), 'the daily digest must always invoke it');
+  ok(digest.indexOf('logPerformanceDigest();') < digest.indexOf('const traded'),
+     'before the trade-count branch, or a no-trade day reports nothing');
+
+  // The anchor must be FIXED at inception and persisted, or the comparison drifts.
+  ok(/_benchmarkStart = spyData\.price;/.test(src), 'the anchor is captured when starting capital is detected');
+  ok(/if \(_benchmarkStart == null &&/.test(src), 'and never re-captured once set');
+  ok(/benchmarkStart:  _benchmarkStart,/.test(src) && /dividendsTotal:  _dividendsTotal,/.test(src),
+     'both must be persisted');
+  ok(/if \(Number\.isFinite\(state\.benchmarkStart\) && state\.benchmarkStart > 0\) _benchmarkStart = state\.benchmarkStart;/.test(src),
+     'and restored');
+  ok(/if \(delta > 0\) _dividendsTotal \+= delta;/.test(src),
+     'only INCOMING cash counts as a dividend — a fee is not a dividend');
+
+  // BEHAVIOURAL: the comparison must be omitted, not faked, when there is no anchor.
+  const saveB = I.getBenchmarkStart(), saveD = I.getDividendsTotal();
+  const lines = [];
+  const realLog = console.log; console.log = (...a) => lines.push(a.join(' '));
+  I.setBenchmarkStart(null); I.logPerformanceDigest();
+  const noAnchor = lines.length;
+  I.setBenchmarkStart(100); I.spyData.price = 110; I.logPerformanceDigest();
+  console.log = realLog;
+  I.setBenchmarkStart(saveB); I.setDividendsTotal(saveD);
+
+  ok(!lines.slice(0, noAnchor).some(l => /SPY/.test(l)),
+     'with no anchor the SPY comparison must be OMITTED, never invented');
+  ok(lines.slice(noAnchor).some(l => /SPY \+10\.00%/.test(l)),
+     'with an anchor it must report the real benchmark move');
+  ok(lines.slice(noAnchor).some(l => /behind by/.test(l)),
+     'and admit when the bot is losing to it');
+});
+
 check('a restart with a funded core is not a 95% drawdown', () => {
   // peakValue is the high-water mark for TRADING equity — total MINUS the core —
   // because that is what currentDrawdown divides by. Seeding it from acct.equity
