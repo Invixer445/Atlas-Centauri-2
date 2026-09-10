@@ -2712,6 +2712,50 @@ check('nothing is priced out of reach purely by share price', () => {
   ok(capSmall >= 1000, 'and the small-account ceiling must not regress below the old flat value');
 });
 
+check('a restart with a funded core is not a 95% drawdown', () => {
+  // peakValue is the high-water mark for TRADING equity — total MINUS the core —
+  // because that is what currentDrawdown divides by. Seeding it from acct.equity
+  // conflated it with the account-wide peak. Harmless on a fresh boot (no core, so the
+  // two are equal); catastrophic on a restart. Observed live 2026-09-09: peak $998.88
+  // against tradable $48.75 = 95.1% drawdown, tripping safe mode, the risk level AND
+  // the emergency entry halt on an account down 0.11%.
+  // This is v11.45 returning through a door that fix did not close.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/riskSystem\.peakValue = Math\.max\(riskSystem\.peakValue \|\| 0, tradableValue\(\)\);/.test(src),
+     'the TRADING peak must be seeded from tradable equity, not account equity');
+  ok(!/riskSystem\.peakValue = Math\.max\(riskSystem\.peakValue \|\| 0, acct\.equity\)/.test(src),
+     'it must never be seeded from acct.equity — that is the core-inclusive figure');
+  ok(/riskSystem\.peakTotalValue = Math\.max\(riskSystem\.peakTotalValue \|\| 0, acct\.equity\);/.test(src),
+     'the ACCOUNT-wide peak is the one that takes acct.equity');
+
+  // BEHAVIOURAL: reproduce the live restart exactly.
+  if (!I.CORE_HOLD_ON) return;
+  const save = { cash: I.portfolio.cash, core: I.portfolio.coreHolding,
+                 longs: I.portfolio.longPositions, peak: I.riskSystem.peakValue, md: {} };
+  const syms = I.CORE_HOLD_SYMBOLS;
+  syms.forEach(s => { save.md[s] = I.marketData[s];
+    I.marketData[s] = { price: 100, prevClose: 100, lastUpdate: Date.now() }; });
+  I.portfolio.longPositions = {}; I.portfolio.coreHolding = {};
+  syms.forEach(s => { I.portfolio.coreHolding[s] = { qty: 0.9501, avgPrice: 100, investedCash: 95.01 }; });
+  I.portfolio.cash = 48.75;
+  const equity = I.getTotalValue(), tradable = I.tradableValue();
+  const ddFrom = (seed) => I.computeDrawdown(Math.max(50, seed), I.tradableValue()).drawdown;
+  const oldWay = ddFrom(equity);      // seeded with account equity — the bug
+  const newWay = ddFrom(tradable);    // seeded with tradable equity — the fix
+  Object.assign(I.portfolio, { cash: save.cash, coreHolding: save.core, longPositions: save.longs });
+  I.riskSystem.peakValue = save.peak;
+  syms.forEach(s => { if (save.md[s]) I.marketData[s] = save.md[s]; else delete I.marketData[s]; });
+
+  ok(oldWay > 0.9, `the old seeding must be demonstrably broken, got ${(oldWay*100).toFixed(1)}%`);
+  ok(newWay < I.capitalSystem.emergencyDrawdown,
+     `the fixed seeding must stay under the ${(I.capitalSystem.emergencyDrawdown*100).toFixed(0)}% emergency halt, got ${(newWay*100).toFixed(1)}%`);
+  ok(newWay < 0.10, `and under safe mode too, got ${(newWay*100).toFixed(1)}%`);
+  // The account-wide peak must still see the FULL equity, or the separate catastrophe
+  // backstop stops protecting anything.
+  ok(equity > tradable * 5, 'the fixture must actually have a large core, or this proves nothing');
+});
+
 check('starting capital is detected from the broker, not assumed', () => {
   // START_CAPITAL was hardcoded at 1000, and tradingFundsAvailable() is literally
   // (totalValue - START_CAPITAL). Fund at anything else and the engine reads the
@@ -2992,6 +3036,15 @@ check('a failed parse is retried with a DIFFERENT prompt, not the same one', () 
      'the retry must not re-send the identical prompt');
   ok(/YOUR PREVIOUS REPLY COULD NOT BE PARSED/.test(fn),
      'the correction must name the actual failure, not just repeat the instructions');
+  // A failure you cannot see is a failure you cannot fix. Truncation, a code fence,
+  // prose and an empty body all present identically as "unparseable-json", and this
+  // failed four times in one session with no way to tell which.
+  ok(/Response was not parseable JSON \(\$\{\(r\.text \|\| ''\)\.length\} chars\)/.test(fn),
+     'the first failure must report the response LENGTH');
+  ok(/Head: \$\{JSON\.stringify\(\(r\.text \|\| ''\)\.slice\(0, 160\)\)\}/.test(fn),
+     'and a quoted head of the actual body, so truncation is distinguishable from prose');
+  ok(/Still unparseable after the retry/.test(fn),
+     'and the give-up path must log too, or the second failure is invisible');
   ok(/the correct and complete reply is exactly/.test(fn),
      'and give the model a valid escape hatch, or it invents content to satisfy the format');
   // Still exactly ONE retry — a loop here would hammer the provider on a bad day.

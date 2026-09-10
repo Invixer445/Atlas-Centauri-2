@@ -1046,7 +1046,13 @@ async function analyze(articles) {
   // twice in one session. Repeating an input that just failed is not a retry strategy.
   // The second attempt appends an explicit, narrow correction naming the failure.
   if (!parsed) {
-    console.warn('[VENUS] Response was not parseable JSON — retrying with a stricter instruction');
+    // SHOW WHAT ACTUALLY CAME BACK. This failed four times in one session on
+    // 2026-09-09 even WITH the stricter retry, and there was no way to tell why —
+    // truncation, a code fence, prose, a refusal, an empty body all look identical from
+    // "unparseable-json". A diagnostic that names the failure is worth more than another
+    // guess at the prompt.
+    console.warn(`[VENUS] Response was not parseable JSON (${(r.text || '').length} chars) — ` +
+                 `retrying with a stricter instruction. Head: ${JSON.stringify((r.text || '').slice(0, 160))}`);
     const strict = prompt +
       `\n\nCRITICAL — YOUR PREVIOUS REPLY COULD NOT BE PARSED.` +
       `\nReturn ONE JSON array and nothing else. No markdown code fences of any kind, no prose` +
@@ -1056,7 +1062,11 @@ async function analyze(articles) {
     if (!r.ok) return { ok:false, error: r.error };
     parsed = extractJsonArray(r.text);
   }
-  if (!parsed) return { ok:false, error:'unparseable-json' };
+  if (!parsed) {
+    console.warn(`[VENUS] Still unparseable after the retry (${(r.text || '').length} chars). ` +
+                 `Head: ${JSON.stringify((r.text || '').slice(0, 200))}`);
+    return { ok:false, error:'unparseable-json' };
+  }
 
   const recommendations = recsFromParsed(parsed);
   return { ok:true, recommendations, usage: r.usage || null, model: AI_MODEL, provider: PROVIDER };
@@ -6017,7 +6027,34 @@ async function syncFromBroker() {
       // FIRST BOOT ONLY. detectStartingCapital refuses to overwrite a value restored
       // from state, so a grown account never silently redefines its own baseline.
       detectStartingCapital(Number.isFinite(acct.equity) ? acct.equity : acct.cash);
-      if (Number.isFinite(acct.equity)) riskSystem.peakValue = Math.max(riskSystem.peakValue || 0, acct.equity);
+      // TWO PEAKS, AND THEY MEASURE DIFFERENT THINGS.
+      // peakValue is the high-water mark for TRADING equity — total value MINUS the
+      // core — because that is what currentDrawdown is divided by. peakTotalValue is
+      // the account-wide mark used by the separate emergency backstop.
+      //
+      // Seeding peakValue with acct.equity conflated them. On a fresh boot it is
+      // harmless: no core exists, so equity and tradable equity are the same number.
+      // On a RESTART with a funded core it is catastrophic. Observed live 2026-09-09:
+      //
+      //   restored peakValue (correctly rebased by the core buys)   ~$50
+      //   acct.equity                                              $998.88
+      //   peakValue := max(50, 998.88)                             $998.88
+      //   tradableValue = 998.88 - 950.13 (core)                    $48.75
+      //   drawdown = (998.88 - 48.75) / 998.88                       95.1%
+      //
+      // Safe mode (10%), the risk level (20%) and the EMERGENCY ENTRY HALT (20%) all
+      // tripped on an account that was down 0.11%. The log read
+      // "[EMERGENCY] Severe drawdown — halting entries". Only the phase gate being
+      // locked kept it from mattering; the moment trading unlocks, every restart would
+      // halt entries outright.
+      //
+      // This is the v11.45 bug returning through a door that fix did not close:
+      // rebasePeakForCoreFlow correctly rebases the peak at the four core CASH-FLOW
+      // points, and then the boot sync overwrote it with a core-inclusive figure.
+      if (Number.isFinite(acct.equity)) {
+        riskSystem.peakTotalValue = Math.max(riskSystem.peakTotalValue || 0, acct.equity);
+      }
+      riskSystem.peakValue = Math.max(riskSystem.peakValue || 0, tradableValue());
       console.log(`[SYNC] Ledger cash ${prev.toFixed(2)} → broker cash $${acct.cash.toFixed(2)} (authoritative)`);
     }
     const pos = await broker.getPositions();
