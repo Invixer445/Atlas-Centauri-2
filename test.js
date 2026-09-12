@@ -2813,8 +2813,13 @@ check('starting capital is detected from the broker, not assumed', () => {
   // its floor, and the whole account is handed to an engine measured at no edge.
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
                 .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
-  ok(/const gained = getTotalValue\(\) - startingCapital\(\);/.test(src),
+  // Anchored on the expression, not the statement form: v12.59 dropped the `const
+  // gained =` temporary when it removed the tradingDrawn double-count, and the intent
+  // being tested is the BASELINE, not the shape of the line.
+  ok(/getTotalValue\(\) - startingCapital\(\)/.test(src),
      'profit must be measured from the DETECTED baseline, not the constant');
+  ok(!/getTotalValue\(\) *- *START_CAPITAL/.test(src),
+     'and never from the hardcoded constant');
   ok(/detectStartingCapital\(Number\.isFinite\(acct\.equity\) \? acct\.equity : acct\.cash\)/.test(src),
      'the boot sync must detect it from the broker');
   ok(/startingCapital: _startingCapital,/.test(src), 'and it must be persisted');
@@ -3077,8 +3082,16 @@ check('a failed parse is retried with a DIFFERENT prompt, not the same one', () 
   // not a retry strategy.
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
                 .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
-  const fn = src.slice(src.indexOf('const prompt = buildPrompt(articles.slice(0, 15));'),
+  const fn = src.slice(src.indexOf('const prompt = buildPrompt(articles.slice(0, MAX_ARTICLES_PER_CALL));'),
                        src.indexOf('const recommendations = recsFromParsed(parsed);'));
+  // A stale anchor makes indexOf return -1 and slices the WRONG region, which would
+  // quietly pass or fail for reasons unrelated to the retry. Fail loudly instead.
+  ok(fn.length > 400 && fn.length < 4000, `the analyze() slice must be located, got ${fn.length} chars`);
+  // v12.59: the internal cap used to be a hardcoded 15 while the caller enforced
+  // MAX_ARTICLES_PER_CALL = 8, so any other caller rebuilt the oversized prompt that
+  // caused the original tokens-per-minute death loop.
+  ok(!/buildPrompt\(articles\.slice\(0, *\d+\)\)/.test(fn),
+     'the internal article cap must track MAX_ARTICLES_PER_CALL, not a second hardcoded number');
   ok(/const call = \(p\) =>/.test(fn), 'the caller must accept a prompt rather than closing over one');
   ok(/r = await call\(strict\);/.test(fn), 'the retry must send the STRICTER prompt');
   ok(!/r = await call\(prompt\);[\s\S]*r = await call\(prompt\);/.test(fn),
@@ -3106,8 +3119,16 @@ check('a failed parse is retried with a DIFFERENT prompt, not the same one', () 
   ok(/^\s*r = await call\(strict\);\s*$/m.test(fn),
      'the retry must be a single unconditional statement');
   // And still no retry on transport or rate errors, where a second call makes it worse.
-  ok(/if \(!r\.ok\) return \{ ok:false, error: r\.error \};/.test(fn),
+  ok(/if \(!r\.ok\) return \{ ok:false, error: r\.error, providerCalls \};/.test(fn),
      'a transport failure must return, never retry');
+  // v12.59: the retry is a REAL second request. It was never counted, so the
+  // advertised "budget 40/h" ceiling was really up to 80/h and aiCallsThisHour() read
+  // half the true rate — with eight unparseable replies in one session, double the
+  // requests the budget exists to bound.
+  ok(/providerCalls\+\+;\s*\n\s*r = await call\(strict\);/.test(fn),
+     'the retry must increment providerCalls BEFORE it is made, so it cannot be lost on an error path');
+  ok((fn.match(/providerCalls \}/g) || []).length >= 3,
+     'every exit from analyze() must report the call count, or the caller under-charges the budget');
 });
 
 check('Venus is told what Jupiter can actually trade', () => {
@@ -3637,6 +3658,176 @@ check('a thin tape does not halt entries, but a dead feed does', () => {
   // NO DATA AT ALL also halts.
   syms.forEach(s => { delete I.marketData[s]; });
   ok(/no price data/i.test(String(I.priceFeedHalt(syms, now))), 'missing data must halt');
+});
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  v12.59 — the eight defects the 2026-09-10 log exposed
+// ════════════════════════════════════════════════════════════════════════════
+
+check('the LLM budget leaves room for a reasoning model to answer', () => {
+  // Venus's default model is openai/gpt-oss-120b, a REASONING model, and on the
+  // OpenAI-compatible endpoint reasoning tokens are billed against the SAME
+  // completion budget as the answer. max_tokens: 1200 capped thinking + answer
+  // together, so the model spent the allowance reasoning and returned
+  // message.content = ''. Eight failures in one session on 2026-09-09/10, six of
+  // them 0 chars and one cut off mid-object at 43 chars.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(I.LLM_MAX_TOKENS >= 4096, `the budget must fit reasoning + answer, got ${I.LLM_MAX_TOKENS}`);
+  // The literal 1200 must be gone from BOTH providers, not just the one that broke.
+  ok(!/max_tokens: *1200/.test(src), 'no provider may still send the 1200-token cap');
+  ok((src.match(/max_tokens: LLM_MAX_TOKENS/g) || []).length === 2,
+     'both callGroq and callAnthropic must use the shared budget');
+  // A length-truncated reply presented identically to a formatting failure, so the
+  // log blamed the model's JSON and never named the cause.
+  ok(/finish_reason/.test(src), 'finish_reason must be read, or truncation stays invisible');
+  ok(/msg\.reasoning/.test(src), 'the reasoning field must be measured, or its cost stays invisible');
+
+  // BEHAVIOURAL — the diagnostic must fire on truncation and stay silent otherwise.
+  const seen = [];
+  const realWarn = console.warn;
+  console.warn = (m) => seen.push(String(m));
+  try {
+    I.noteFinishReason('length', '', 3900);
+    I.noteFinishReason('stop', '[{"symbol":"AAPL"}]', 120);
+    I.noteFinishReason(null, '', 0);
+  } finally { console.warn = realWarn; }
+  ok(seen.length === 1, `only a length stop may warn, got ${seen.length}`);
+  ok(/TOKEN LIMIT/.test(seen[0]), 'the warning must name the token limit as the cause');
+  ok(/truncated, not malformed/.test(seen[0]),
+     'and must say the reply is truncated, or the operator debugs the parser instead');
+});
+
+check('the trading allowance moves at the real rate, not double', () => {
+  // tradingFundsAvailable() under basis 'total' returned
+  //   (getTotalValue() - startingCapital()) + tradingDrawn
+  // but getTotalValue() is the WHOLE account, so a trading loss was already inside
+  // the first term before tradingDrawn subtracted it again. Reproduced 2026-09-11:
+  // the account fell $10 and the allowance fell $20.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function tradingFundsAvailable()'),
+                       src.indexOf('function tradingPhaseLocked()'));
+  ok(fn.length > 60 && fn.length < 1200, `tradingFundsAvailable must be located, got ${fn.length}`);
+  // Anchored on the whole branch, so re-adding the term in ANY form fails here.
+  ok(/TRADING_UNLOCK_BASIS === 'total'\) \{\s*return getTotalValue\(\) - startingCapital\(\);\s*\}/.test(fn),
+     'the total basis must return the account gain ALONE — adding tradingDrawn is the double-count');
+  // And the term must survive exactly once, in the banked branch where it belongs.
+  ok((fn.match(/tradingDrawn/g) || []).length === 1,
+     `tradingDrawn must appear once (banked branch only), got ${(fn.match(/tradingDrawn/g) || []).length}`);
+  // The 'banked' basis is a sum of two DISJOINT quantities and must keep the term.
+  ok(/bankedProfit \|\| 0\) \+ \(capitalSystem\.tradingDrawn/.test(fn),
+     'the banked basis must still add tradingDrawn, where it is not a double-count');
+
+  // BEHAVIOURAL — the allowance must track the account 1:1, not 2:1.
+  const savedDrawn = I.capitalSystem.tradingDrawn;
+  const savedBasis = I.TRADING_UNLOCK_BASIS;
+  if (savedBasis !== 'total') { I.capitalSystem.tradingDrawn = savedDrawn; return; }
+  I.capitalSystem.tradingDrawn = 0;
+  const a0 = I.tradingFundsAvailable();
+  // Simulate a closed trade that lost $10: the account is down $10 AND tradingDrawn
+  // records -$10. Both happen in production; only one may reach the allowance.
+  I.capitalSystem.tradingDrawn = -10;
+  const a1 = I.tradingFundsAvailable();
+  I.capitalSystem.tradingDrawn = savedDrawn;
+  ok(Math.abs(a1 - a0) < 1e-9,
+     `tradingDrawn alone must not move the total-basis allowance, moved $${(a1 - a0).toFixed(2)}`);
+});
+
+check('the capital banner reports money that can actually be spent', () => {
+  // It printed capitalSystem.tradingCapital — an upper bound derived from cash — while
+  // the number every entry is really sized against is tradingCapitalAllowed(), which
+  // is 0 while the phase gate is shut. On 2026-09-10 it read "trading $34.13" on an
+  // account whose true trading allowance was $0.00.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('const spendable = tradingCapitalAllowed();'),
+                       src.indexOf('const spendable = tradingCapitalAllowed();') + 900);
+  ok(fn.length > 200, 'the capital banner must be located');
+  ok(/trading \$\$\{spendable\.toFixed\(2\)\}/.test(fn),
+     'the banner must print the ALLOWED figure, not the raw field');
+  ok(/capped from/.test(fn),
+     'and must say when the gate capped it, or the drop looks like lost money');
+});
+
+check('a gap warning does not claim a control that never ran', () => {
+  // gapData is consumed only by the TRADING path (isGapBlocked / getGapSizeAdjust).
+  // coreBuyStep() contains no reference to gapData at all, so for a core-basket name
+  // a gap changes nothing — yet the log printed "[GAP] XOM -2.15% — size reduced".
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const core = src.slice(src.indexOf('async function coreBuyStep'));
+  const body = core.slice(0, core.indexOf('\n}\n'));
+  ok(!/gapData/.test(body),
+     'this test encodes that coreBuyStep ignores gaps — if that changed, fix the LOG claim too');
+  const clean = src.split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/CORE_HOLD_ON && CORE_HOLD_SYMBOLS\.includes\(sym\)/.test(clean),
+     'the gap line must distinguish core names from tradeable ones');
+  ok(/no effect: core holding/.test(clean),
+     'and must say plainly that nothing happened to a core name');
+});
+
+check('the session digest fires once per trading day, not once per lucky process', () => {
+  // The trigger was a process-local `_wasOpen` booting false, so the digest only fired
+  // if THAT process observed the open->closed transition. Deploy after 16:00 ET — when
+  // deploys usually happen — and the day's [PERF] lines were never printed at all.
+  // The 2026-09-09 log spans a full close and contains no [PERF] line for this reason.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(!/let _wasOpen = false;/.test(src),
+     'the process-local open flag must be gone, or a post-close deploy still loses the day');
+  ok(/_lastDigestDate === dateStr\) return;/.test(src),
+     'the digest must be keyed on the ET date');
+  ok(/lastDigestDate:  *_lastDigestDate,/.test(src), 'and persisted');
+  ok(/_lastDigestDate = state\.lastDigestDate;/.test(src), 'and restored, or a restart reprints it');
+  // Persisted-but-never-written would still lose the day after a crash.
+  ok(/_lastDigestDate = dateStr;\s*\n\s*logDailyTradeDigest\(\);\s*\n\s*queueSaveState\(\);/.test(src),
+     'the date must be recorded AND saved at the moment the digest is emitted');
+  // Restore must reject junk rather than adopting it as a date.
+  const before = I.getLastDigestDate();
+  I.setLastDigestDate(null);
+  ok(/\^\\d\{4\}-\\d\{2\}-\\d\{2\}\$/.test(src) || /\\d\{4\}-\\d\{2\}-\\d\{2\}/.test(src),
+     'the restored value must be shape-checked, not trusted');
+  I.setLastDigestDate(before);
+});
+
+check('Venus reads the newest news, not the stalest', () => {
+  // fetchNews() asks Alpaca for sort=desc and nothing re-sorts, so `fresh` arrives
+  // NEWEST-FIRST. The code then took .slice(-MAX_ARTICLES_PER_CALL) — the TAIL, i.e.
+  // the OLDEST — while its own comment claimed it analyzed "the newest". On a busy
+  // morning Venus read the stalest stories and discarded the breaking ones.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/sort=desc/.test(src), 'this test assumes a newest-first fetch; re-derive it if that changed');
+  ok(/\.sort\(\(a, b\) => \(Date\.parse\(b\.created_at\) \|\| 0\) - \(Date\.parse\(a\.created_at\) \|\| 0\)\)/.test(src),
+     'order must be established by this code, not assumed from the provider query');
+  ok(/const toAnalyze = batch\.slice\(0, MAX_ARTICLES_PER_CALL\);/.test(src),
+     'the HEAD of a newest-first batch is what gets analyzed');
+  ok(/pendingArticles = batch\.slice\(MAX_ARTICLES_PER_CALL\);/.test(src),
+     'and the tail waits its turn');
+  ok(!/\.slice\(-MAX_ARTICLES_PER_CALL\)/.test(src), 'nothing may still take the oldest slice');
+  ok(!/\.slice\(-30\)\; *\n* *pendingArticles = \[\];/.test(src),
+     'the queue cap must keep the newest 30, not the oldest 30');
+});
+
+check('Venus is not asked for trades the account can never place', () => {
+  // Venus returned a SHORT (LMNR) on 2026-09-10 while LONG_ONLY was on and Jupiter
+  // discards shorts unread. That idea cost a slot in a reply that was already
+  // truncating against the token budget.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function buildPrompt(articles)'),
+                       src.indexOf('function buildPrompt(articles)') + 6000);
+  ok(/LONG_ONLY \?/.test(fn), 'the prompt must be conditional on the actual setting');
+  ok(/LONG-ONLY/.test(fn), 'and must state the constraint');
+  ok(/DISCARDED unread/.test(fn),
+     'and say the idea is thrown away, or the model treats it as a mild preference');
+  // BEHAVIOURAL — the instruction must actually appear in a built prompt.
+  const V = require('./server.js').venus;
+  const p = V._buildPrompt
+    ? V._buildPrompt([{ headline: 'x', summary: 'y', symbols: ['AAPL'], created_at: new Date().toISOString() }])
+    : null;
+  if (p) ok(/LONG-ONLY/.test(p), 'a built prompt must carry the constraint');
 });
 
 // ════════════════════════════════════════════════════════════════════════════

@@ -137,6 +137,10 @@ let _startingCapital = null;
 // that requires no forecast and cannot be wrong, and until now they arrived invisibly.
 let _benchmarkStart = null;      // SPY price at inception
 let _dividendsTotal = 0;         // cumulative cash adopted from the broker
+// Which trading day the end-of-session digest has already been printed for (ET
+// YYYY-MM-DD). Persisted, because the digest must fire once PER DAY and not once per
+// process that happens to witness the closing bell. See the digest timer in start().
+let _lastDigestDate = null;
 function startingCapital() {
   return (Number.isFinite(_startingCapital) && _startingCapital > 0) ? _startingCapital : START_CAPITAL;
 }
@@ -772,23 +776,61 @@ function httpsPost(host, path, headers, body) {
   });
 }
 
+// THE COMPLETION BUDGET IS SHARED WITH REASONING, AND 1200 WAS NOT ENOUGH.
+// Venus's default model (openai/gpt-oss-120b) is a REASONING model, and on the
+// OpenAI-compatible endpoint its reasoning tokens are billed against the SAME
+// completion budget as the answer. max_tokens: 1200 therefore capped thinking and
+// answer TOGETHER: the model spent the allowance reasoning over 8 articles and a
+// 5-mechanism taxonomy, then returned message.content = ''.
+//
+// Measured live 2026-09-09/10 — eight failures in a single session, six of them
+// 0 chars and one cut off mid-object at 43 chars:
+//     [{"symbol":"LMNR","direction":"short","conv
+// That body is clean, correctly-formed JSON that simply stops. It is not a code
+// fence, not prose, not a refusal. extractJsonArray's salvage stage recovers a
+// truncated array as soon as ONE object closes, and it recovered nothing — so the
+// cut landed inside the very first object.
+//
+// The ANSWER was never what needed the room: the prompt caps the reply at six
+// recommendations, and one complete recommendation object is ~267 chars, so a
+// maximal legal reply is ~400 tokens. Only the reasoning needed the headroom.
+const LLM_MAX_TOKENS = Math.max(512, parseInt(process.env.LLM_MAX_TOKENS || '4096', 10));
+
+// A length-truncated reply used to be indistinguishable from a formatting failure,
+// so the log blamed the model's JSON ("unparseable") and never named the cause
+// ("length"). Reading finish_reason is what makes the difference visible.
+function noteFinishReason(reason, text, extraChars) {
+  if (reason !== 'length') return;
+  console.warn(`[VENUS] Provider stopped on the TOKEN LIMIT (max_tokens=${LLM_MAX_TOKENS}) — ` +
+               `${text.length} chars of answer` +
+               (extraChars ? `, ${extraChars} chars of reasoning` : '') +
+               `. The reply is truncated, not malformed; raise LLM_MAX_TOKENS.`);
+}
+
 async function callGroq(prompt) {
   const r = await httpsPost('api.groq.com', '/openai/v1/chat/completions',
     { 'authorization': 'Bearer ' + GROQ_KEY },
-    { model: AI_MODEL, max_tokens: 1200, temperature: 0.2, messages: [{ role: 'user', content: prompt }] });
+    { model: AI_MODEL, max_tokens: LLM_MAX_TOKENS, temperature: 0.2, messages: [{ role: 'user', content: prompt }] });
   if (!r.ok) return r;
-  const text = r.data?.choices?.[0]?.message?.content || '';
-  const u    = r.data?.usage || {};
-  return { ok:true, text, usage: { input: u.prompt_tokens || 0, output: u.completion_tokens || 0 } };
+  const choice = r.data?.choices?.[0] || {};
+  const msg    = choice.message || {};
+  const text   = msg.content || '';
+  const u      = r.data?.usage || {};
+  noteFinishReason(choice.finish_reason, text, (msg.reasoning || '').length);
+  return { ok:true, text, usage: { input: u.prompt_tokens || 0, output: u.completion_tokens || 0 },
+           finishReason: choice.finish_reason || null };
 }
 async function callAnthropic(prompt) {
   const r = await httpsPost('api.anthropic.com', '/v1/messages',
     { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-    { model: AI_MODEL, max_tokens: 1200, messages: [{ role: 'user', content: prompt }] });
+    { model: AI_MODEL, max_tokens: LLM_MAX_TOKENS, messages: [{ role: 'user', content: prompt }] });
   if (!r.ok) return r;
   const text = (r.data.content || []).map(b => (b.type === 'text' ? b.text : '')).join('').trim();
   const u    = r.data?.usage || {};
-  return { ok:true, text, usage: { input: u.input_tokens || 0, output: u.output_tokens || 0 } };
+  // Anthropic spells the same condition 'max_tokens' rather than 'length'.
+  noteFinishReason(r.data?.stop_reason === 'max_tokens' ? 'length' : r.data?.stop_reason, text, 0);
+  return { ok:true, text, usage: { input: u.input_tokens || 0, output: u.output_tokens || 0 },
+           finishReason: r.data?.stop_reason || null };
 }
 
 // ── Build the analysis prompt — includes Venus's learned calibration ──────
@@ -861,6 +903,9 @@ RULES:
 - catalyst ∈ {earnings, guidance, analyst, ma, product, regulatory, legal, macro, insider, partnership, contract, other}
 - horizon_minutes: how long the edge likely lasts (30-390).
 - Max 6 recommendations. One per symbol.
+${LONG_ONLY ? `- THIS ACCOUNT IS LONG-ONLY. A "short" recommendation is DISCARDED unread by the
+  trading engine, so it costs you an idea slot and buys nothing. Do not return one.
+  If the only defensible view on a name is that it falls, omit the name entirely.` : ''}
 
 NEWS ITEMS:
 ${articleBlock}
@@ -1050,11 +1095,17 @@ async function analyze(articles) {
   if (!PROVIDER) return { ok:false, error:'no-api-key (set GROQ_API_KEY or ANTHROPIC_API_KEY)' };
   if (!Array.isArray(articles) || articles.length === 0) return { ok:true, recommendations: [], usage: null };
 
-  const prompt = buildPrompt(articles.slice(0, 15));
+  // MAX_ARTICLES_PER_CALL is 8 and the caller already enforces it. This internal cap
+  // was 15, so any other caller would rebuild the oversized prompt that caused the
+  // original TPM death loop. Track the same constant instead of contradicting it.
+  const prompt = buildPrompt(articles.slice(0, MAX_ARTICLES_PER_CALL));
   const call = (p) => PROVIDER === 'groq' ? callGroq(p) : callAnthropic(p);
 
+  // The caller charges the hourly budget from this count. A retry is a real second
+  // request to the provider and must be counted as one.
+  let providerCalls = 1;
   let r = await call(prompt);
-  if (!r.ok) return { ok:false, error: r.error };
+  if (!r.ok) return { ok:false, error: r.error, providerCalls };
 
   let parsed = extractJsonArray(r.text);
   // ONE retry, and only for a malformed body — never for a rate limit or a
@@ -1079,18 +1130,19 @@ async function analyze(articles) {
       `\nReturn ONE JSON array and nothing else. No markdown code fences of any kind, no prose` +
       `\nbefore or after, no trailing commas, no comments. If you have no ideas worth` +
       `\nhanding over, the correct and complete reply is exactly:\n[]`;
+    providerCalls++;
     r = await call(strict);
-    if (!r.ok) return { ok:false, error: r.error };
+    if (!r.ok) return { ok:false, error: r.error, providerCalls };
     parsed = extractJsonArray(r.text);
   }
   if (!parsed) {
     console.warn(`[VENUS] Still unparseable after the retry (${(r.text || '').length} chars). ` +
                  `Head: ${JSON.stringify((r.text || '').slice(0, 200))}`);
-    return { ok:false, error:'unparseable-json' };
+    return { ok:false, error:'unparseable-json', providerCalls };
   }
 
   const recommendations = recsFromParsed(parsed);
-  return { ok:true, recommendations, usage: r.usage || null, model: AI_MODEL, provider: PROVIDER };
+  return { ok:true, recommendations, usage: r.usage || null, model: AI_MODEL, provider: PROVIDER, providerCalls };
 }
 
 
@@ -3862,10 +3914,20 @@ async function runIntelCycle() {
     pruneIntel();   // expire old signals/dynamics every cycle regardless
 
     // Combine retry queue + fresh; drop anything that's gone stale (>2h)
+    //
+    // ORDER MATTERS AND USED TO BE WRONG. fetchNews() asks Alpaca for sort=desc
+    // (line ~3866) and nothing re-sorts, so `fresh` arrives NEWEST-FIRST. The old
+    // code then did .slice(-30) here and .slice(-MAX_ARTICLES_PER_CALL) below —
+    // both of which keep the TAIL, i.e. the OLDEST items — while the comment below
+    // claimed it analyzed "the newest". On a busy morning Venus was reading the
+    // stalest stories in the queue and discarding the breaking ones, which is the
+    // exact inverse of the intent. Sorting explicitly makes the order a property of
+    // this code rather than an assumption about the provider's query string.
     const staleCut = Date.now() - 2 * 3600000;
     const batch = [...pendingArticles, ...fresh]
       .filter(a => !a.created_at || Date.parse(a.created_at) >= staleCut)
-      .slice(-30);                                       // hard cap queue size
+      .sort((a, b) => (Date.parse(b.created_at) || 0) - (Date.parse(a.created_at) || 0))
+      .slice(0, 30);                                     // hard cap queue size, keeping the NEWEST
     pendingArticles = [];
 
     // ── STAGE 1 (optional): NEWS ANALYSIS ────────────────────────────────────
@@ -3887,11 +3949,22 @@ async function runIntelCycle() {
       // call; the remainder stays queued (still stale-filtered + capped next cycle).
       // A ~20-article batch was ~5–8K tokens in ONE request — over Groq's free-tier
       // tokens-per-minute cap by itself → guaranteed 429 → full requeue → forever.
-      const toAnalyze = batch.slice(-MAX_ARTICLES_PER_CALL);
-      pendingArticles = batch.slice(0, -MAX_ARTICLES_PER_CALL);
+      // batch is sorted NEWEST-FIRST above, so the head is what we want to read now
+      // and the tail is what waits. Taking the tail here is what made Venus read the
+      // oldest stories in the queue for as long as this code has existed.
+      const toAnalyze = batch.slice(0, MAX_ARTICLES_PER_CALL);
+      pendingArticles = batch.slice(MAX_ARTICLES_PER_CALL);
       aiCallLog.push(Date.now());
       intelStats.aiCalls++;
       r = await venus.analyze(toAnalyze);                  // VENUS analyzes (uses its own calibration)
+      // CHARGE THE RETRY TOO. venus.analyze() makes a SECOND provider call whenever
+      // the first reply will not parse, but only one call was ever logged — so the
+      // "budget 40/h" ceiling was really up to 80/h, and aiCallsThisHour() read half
+      // the true rate. With eight unparseable replies in one session that is not a
+      // rounding error, it is double the requests the budget is meant to bound.
+      if (r && r.providerCalls > 1) {
+        for (let extra = 1; extra < r.providerCalls; extra++) { aiCallLog.push(Date.now()); intelStats.aiCalls++; }
+      }
       intelStats.lastCycleAt = Date.now();
 
       if (!r.ok) {
@@ -4341,7 +4414,18 @@ function detectOvernightGaps() {
 
     if (Math.abs(gapPct) >= GAP_WARN_PCT) {
       const dir = gapPct > 0 ? '↑' : '↓';
-      console.log(`[GAP] ${sym} ${dir}${(gapPct * 100).toFixed(2)}% overnight gap${Math.abs(gapPct) >= GAP_BLOCK_PCT ? ' — BLOCKED 30min' : ' — size reduced'}`);
+      // SAY WHAT ACTUALLY HAPPENS TO THIS SYMBOL. gapData is consumed only by the
+      // TRADING path (isGapBlocked / getGapSizeAdjust, called from the entry sizer).
+      // coreBuyStep() contains no reference to gapData at all, so for a core-basket
+      // name — the only kind this account currently buys — a gap changes precisely
+      // nothing. On 2026-09-10 this line printed "[GAP] XOM ↓-2.15% — size reduced"
+      // about a name whose sole buyer ignores gaps entirely. Reporting a risk control
+      // that did not run is worse than reporting none.
+      const coreOnly = CORE_HOLD_ON && CORE_HOLD_SYMBOLS.includes(sym);
+      const effect = coreOnly
+        ? ' — no effect: core holding, and core buys do not read gaps'
+        : (Math.abs(gapPct) >= GAP_BLOCK_PCT ? ' — BLOCKED 30min' : ' — size reduced');
+      console.log(`[GAP] ${sym} ${dir}${(gapPct * 100).toFixed(2)}% overnight gap${effect}`);
     }
   });
 }
@@ -5040,10 +5124,21 @@ function rebalanceCapital() {
 
   // Log only when something actually changed — this runs on a timer, and identical
   // lines every cycle bury the signal (seen live: 5 back-to-back duplicates).
-  const snap = `${capitalSystem.reserveCash.toFixed(2)}|${capitalSystem.tradingCapital.toFixed(2)}|${capitalSystem.profitVault.toFixed(2)}`;
+  // REPORT WHAT THE SIZER WILL ACTUALLY ALLOW, NOT THE RAW FIELD. capitalSystem
+  // .tradingCapital is an upper bound derived from cash; the number every entry is
+  // really sized against is tradingCapitalAllowed(), which returns 0 while the phase
+  // gate is shut. On 2026-09-10 this line read "trading $34.13" on an account whose
+  // true trading allowance was $0.00 — it advertised spendable money that no code
+  // path could spend, which is exactly the kind of statement that makes the operator
+  // think the engine is doing something it is not.
+  const spendable = tradingCapitalAllowed();
+  const gated = spendable < capitalSystem.tradingCapital - 0.005;
+  const snap = `${capitalSystem.reserveCash.toFixed(2)}|${spendable.toFixed(2)}|${capitalSystem.profitVault.toFixed(2)}|${gated}`;
   if (rebalanceCapital._last !== snap) {
     rebalanceCapital._last = snap;
-    console.log(`[CAPITAL] reserve $${capitalSystem.reserveCash.toFixed(2)} | trading $${capitalSystem.tradingCapital.toFixed(2)} | vault $${capitalSystem.profitVault.toFixed(2)}`);
+    console.log(`[CAPITAL] reserve $${capitalSystem.reserveCash.toFixed(2)} | trading $${spendable.toFixed(2)}` +
+                (gated ? ` (capped from $${capitalSystem.tradingCapital.toFixed(2)} by the phase gate)` : '') +
+                ` | vault $${capitalSystem.profitVault.toFixed(2)}`);
   }
 }
 
@@ -5901,10 +5996,24 @@ function bankTradingPnL(pnl) {
 // trading has since lost (or plus what it has made).
 function tradingFundsAvailable() {
   if (TRADING_UNLOCK_BASIS === 'total') {
-    // Everything the account has gained over its starting capital, minus whatever
-    // trading has already given back. Unrealised gains count: they are still winnings.
-    const gained = getTotalValue() - startingCapital();
-    return gained + (capitalSystem.tradingDrawn || 0);
+    // Everything the account has gained over its starting capital. Unrealised gains
+    // count: they are still winnings.
+    //
+    // DO NOT ADD tradingDrawn HERE. It used to, and that DOUBLE-COUNTED every dollar
+    // of trading P&L: getTotalValue() is the whole account, so a trading loss has
+    // already been subtracted from `gained` before tradingDrawn subtracts it again.
+    // Reproduced 2026-09-11 — open 1 share at $100, close at $90:
+    //     REAL account change : -10.00
+    //     Allowance change    : -20.00   <- 2.00x
+    // The allowance therefore moved at twice the real rate in BOTH directions: it
+    // would re-lock on half the real loss, and unlock on half the real gain. Latent
+    // only because the gate is currently shut and tradingDrawn is still 0; it goes
+    // live the moment the first trade closes.
+    //
+    // The 'banked' basis below is correct as written and must keep the term:
+    // bankedProfit is the holding side's contribution and tradingDrawn is the
+    // trading side's, so there they are two disjoint quantities being summed.
+    return getTotalValue() - startingCapital();
   }
   return (capitalSystem.bankedProfit || 0) + (capitalSystem.tradingDrawn || 0);
 }
@@ -7050,6 +7159,7 @@ function buildStateObject() {
     startingCapital: _startingCapital,
     benchmarkStart:  _benchmarkStart,
     dividendsTotal:  _dividendsTotal,
+    lastDigestDate:  _lastDigestDate,
     closedTrades:   portfolio.closedTrades.slice(-500),
     marketTransition: marketTransitionData,
     capitalSystem,
@@ -7215,6 +7325,8 @@ function loadState() {
       _startingCapital = state.startingCapital;
       if (Number.isFinite(state.benchmarkStart) && state.benchmarkStart > 0) _benchmarkStart = state.benchmarkStart;
       if (Number.isFinite(state.dividendsTotal)) _dividendsTotal = state.dividendsTotal;
+      if (typeof state.lastDigestDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(state.lastDigestDate))
+        _lastDigestDate = state.lastDigestDate;
       console.log(`[LOAD] Starting capital $${_startingCapital.toFixed(2)} restored — ` +
                   `profit and the unlock bar stay measured from the original account size`);
     }
@@ -8615,13 +8727,30 @@ if (require.main === module) app.listen(PORT, async () => {
     evaluateAndTrade();
   }, 2000);
 
-  // 5a. End-of-session digest. Fires once, on the open->closed transition, so a
-  //     zero-trade day reports its cause the same day rather than vanishing.
-  let _wasOpen = false;
+  // 5a. End-of-session digest. Fires once per TRADING DAY, any time after that day's
+  //     close, so a zero-trade day reports its cause the same day rather than vanishing.
+  //
+  //     IT USED TO MISS WHOLE DAYS. The trigger was a process-local `_wasOpen` that
+  //     boots false, so the digest only fired if THIS process personally observed the
+  //     open->closed transition. Deploy after 16:00 ET — which is when deploys
+  //     usually happen — and that day's [PERF] and digest lines were never printed at
+  //     all. The 2026-09-09 log spans a full session close and contains no [PERF]
+  //     line for exactly this reason, which read as "the new code is broken" when the
+  //     code had simply never been reached.
+  //
+  //     Keyed on the ET date and persisted, so restarting mid-evening still reports
+  //     the day, and restarting twice does not report it twice.
   setInterval(() => {
-    const openNow = !!getCurrentMarket();
-    if (_wasOpen && !openNow) logDailyTradeDigest();
-    _wasOpen = openNow;
+    const { hours, day, dateStr } = getEasternTimeParts();
+    if (day === 0 || day === 6) return;                            // weekend
+    const session = marketCalendar.ok ? marketCalendar.byDate.get(dateStr) : null;
+    if (marketCalendar.ok && !session) return;                     // market holiday
+    const close = (session && Number.isFinite(session.close)) ? session.close : NASDAQ_NYSE_HOURS.end;
+    if (hours < close) return;                                     // session still running
+    if (_lastDigestDate === dateStr) return;                       // already reported today
+    _lastDigestDate = dateStr;
+    logDailyTradeDigest();
+    queueSaveState();
   }, 60000);
 
   // 5b. Core holding — top up toward target weight. Every 5 min is ample for a
@@ -8703,6 +8832,8 @@ module.exports = {
     CORE_PHASE1_FRACTION, effectiveCoreFraction, rebasePeakForCoreFlow, unlockStepDownIsActionable, tradingFundsAvailable,
     coreWeightMap, basketWithRecovered, coreBuyStep, logPerformanceDigest,
     getBenchmarkStart: () => _benchmarkStart, getDividendsTotal: () => _dividendsTotal,
+    getLastDigestDate: () => _lastDigestDate, setLastDigestDate: (v) => { _lastDigestDate = v; },
+    LLM_MAX_TOKENS, noteFinishReason, MAX_ARTICLES_PER_CALL,
     setBenchmarkStart: (v) => { _benchmarkStart = v; }, setDividendsTotal: (v) => { _dividendsTotal = v; }, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, CORE_BASKET_MAX_NAMES, CORE_TRIMS_PER_CYCLE, cashDriftMin, CASH_DRIFT_ABS, adoptBrokerCashDrift,
     MAX_DAY_VOLUME_SHARE, intendedPositionNotional, verifyStateDir,
     getRecoveredSymbols: () => _recoveredSymbols,
