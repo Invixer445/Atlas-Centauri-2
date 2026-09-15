@@ -5827,9 +5827,33 @@ function processProfitVault() {
 // safe mode and the emergency stop would silently never arm on a corrupt state file.
 // Pure + exported so the degenerate cases are regression-tested (see test.js).
 function computeDrawdown(peakValue, totalValue) {
-  const peak = (Number.isFinite(peakValue) && peakValue > 0) ? peakValue : START_CAPITAL;
-  const tv   = Number.isFinite(totalValue) ? totalValue : 0;
-  const dd   = Math.max(0, (peak - tv) / peak);
+  const tv = Number.isFinite(totalValue) ? totalValue : 0;
+  // A MISSING PEAK IS NOT A $1,000 PEAK. This used to substitute START_CAPITAL when the
+  // peak was absent or non-positive — and because the caller writes the returned `peak`
+  // straight back into riskSystem.peakValue, that substitution PERSISTED. It was a
+  // phantom-peak machine, and it needed no corrupt state to run:
+  //
+  //   rebasePeakForCoreFlow floors the peak at 0 by design, and normal core buying
+  //   gets there — $1,000 peak, $950 of buys leaves $50, the next $60 of dividend
+  //   reinvestment leaves 0. Then computeDrawdown(0, $48.75) returned peak $1,000,
+  //   the risk gate wrote it back, and every subsequent path only raises it.
+  //   Drawdown 95.1%, for ever, on an account that was UP $1.20.
+  //
+  // That is the mechanism behind the 2026-09-14 halt. The fresh-volume story in v12.60
+  // was a second, rarer door to the same number; this one runs every 2 seconds on
+  // perfectly healthy restored state, which is why it was the one that actually fired.
+  //
+  // The honest reading of an absent peak is "no drawdown history yet", so the peak
+  // starts from where we are and the drawdown is zero. Inventing a number the account
+  // never reached is not recovering information, it is fabricating it — and at
+  // $100,000 the same fallback silently does nothing, so the bug only ever bit small
+  // accounts, which is exactly who this build is for.
+  const peak = (Number.isFinite(peakValue) && peakValue > 0) ? peakValue : tv;
+  // peak === 0 makes the division 0/0 → NaN, and the isFinite ternary below already
+  // resolves that to 0, which is the same answer an explicit zero-guard would give.
+  // A guard here would be unreachable by any assertion — dead weight that reads like
+  // protection — so the ternary is left to do the whole job.
+  const dd = Math.max(0, (peak - tv) / peak);
   return { peak: Math.max(peak, tv), drawdown: Number.isFinite(dd) ? dd : 0 };
 }
 

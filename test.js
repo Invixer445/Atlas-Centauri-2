@@ -1032,7 +1032,12 @@ check('peak of 0 (corrupt state) does NOT yield NaN', () => {
   for (const tv of [0, 500, 1000]) {
     const r = I.computeDrawdown(0, tv);
     ok(Number.isFinite(r.drawdown), `drawdown NaN at equity ${tv}`);
-    ok(Number.isFinite(r.peak) && r.peak > 0, `peak invalid at equity ${tv}`);
+    // v12.60.1: an absent peak now resolves to the CURRENT value rather than
+    // START_CAPITAL, so at equity 0 the honest peak is 0. The requirement this test
+    // exists for is "never NaN", which still holds; `> 0` was incidental to it and was
+    // also what forced the fabricated four-figure peak.
+    ok(Number.isFinite(r.peak) && r.peak >= 0, `peak invalid at equity ${tv}`);
+    ok(r.peak === tv, `an absent peak must equal current equity, got ${r.peak} at ${tv}`);
   }
 });
 check('NaN / negative / undefined peak all degrade safely', () => {
@@ -1053,11 +1058,30 @@ check('a wiped account on corrupt state ARMS safe mode and the emergency stop', 
   // zero equity, drawdown must resolve to a real 100%, which trips both thresholds. If
   // the divisor guard regresses, drawdown becomes NaN, both comparisons silently go
   // false, and this test fails — which is exactly the failure mode worth catching.
-  const r = I.computeDrawdown(0, 0);
-  near(r.drawdown, 1, 1e-9, 'a zero-equity account is a 100% drawdown');
-  ok(r.drawdown >= I.capitalSystem.safeModeDrawdown,  'safe mode must arm');
-  ok(r.drawdown >= I.capitalSystem.emergencyDrawdown, 'emergency stop must arm');
-  ok(r.drawdown >= I.riskSystem.maxDrawdown,          'max-drawdown gate must trip');
+  // v12.60.1 CHANGED THIS TEST'S PREMISE DELIBERATELY, and here is the argument.
+  // The old version asserted computeDrawdown(0, 0) === 100%, relying on the
+  // START_CAPITAL fallback to manufacture a peak. That fallback is what produced the
+  // 2026-09-14 halt: rebasePeakForCoreFlow floors peakValue at 0 by design, ordinary
+  // core buying reaches 0, and the risk gate then wrote the fabricated $1,000 back into
+  // state — 95.1% drawdown, for ever, on an account that was UP. The premise was also
+  // wrong for this architecture: a TRADING book of $0 is the NORMAL state of a
+  // fully-invested core, not a wipeout.
+  //
+  // The requirement is unchanged — a genuine catastrophe must still arm every gate —
+  // so it is now tested through the quantity that actually carries it. peakTotalValue
+  // is account-wide and is NEVER rebased by core flow, so it retains a real peak.
+  const wiped = I.computeDrawdown(1000, 0);
+  near(wiped.drawdown, 1, 1e-9, 'a genuinely wiped account is still a 100% drawdown');
+  ok(wiped.drawdown >= I.capitalSystem.safeModeDrawdown,  'safe mode must arm');
+  ok(wiped.drawdown >= I.capitalSystem.emergencyDrawdown, 'emergency stop must arm');
+  ok(wiped.drawdown >= I.riskSystem.maxDrawdown,          'max-drawdown gate must trip');
+  // A partial but real collapse must arm them too, so this is not passing on 100% alone.
+  const bad = I.computeDrawdown(1000, 150);
+  ok(bad.drawdown >= I.capitalSystem.emergencyDrawdown, 'an 85% collapse must arm the emergency stop');
+  // AND THE FALSE POSITIVE MUST BE GONE: no peak recorded and an empty trading book is
+  // a fully-invested core, not a catastrophe.
+  ok(I.computeDrawdown(0, 0).drawdown < I.capitalSystem.safeModeDrawdown,
+     'an absent peak must NOT arm safe mode — that was the phantom');
 });
 check('peak ratchets up to current equity when equity exceeds it', () => {
   eq(I.computeDrawdown(1000, 1500).peak, 1500);
@@ -3997,6 +4021,49 @@ check('a locked phase gate means zero spendable trading capital, not a share of 
   if (I.tradingPhaseLocked()) {
     ok(before === 0, `a locked gate must allow exactly $0.00, got $${before.toFixed(2)}`);
   }
+});
+
+
+check('an absent peak is not resurrected as START_CAPITAL', () => {
+  // THE MECHANISM BEHIND THE 2026-09-14 HALT, and it needed no corrupt state at all.
+  // rebasePeakForCoreFlow floors peakValue at 0 BY DESIGN, and ordinary core buying
+  // reaches it: a $1,000 peak, $950 of buys leaves $50, the next $60 of dividend
+  // reinvestment leaves 0. computeDrawdown then substituted START_CAPITAL for the
+  // missing peak and the risk gate wrote that straight back into riskSystem.peakValue
+  // — so the account "remembered" a $1,000 peak it never had, persisted it, and read
+  // 95.1% drawdown for ever while being UP $1.20. Every later path only raises the
+  // peak, so nothing could undo it.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function computeDrawdown('),
+                       src.indexOf('function wouldExceedHeat('));
+  ok(fn.length > 100 && fn.length < 1200, `computeDrawdown must be located, got ${fn.length}`);
+  ok(!/\? peakValue : START_CAPITAL/.test(fn),
+     'a missing peak must NOT fall back to START_CAPITAL — the caller persists what this returns');
+  ok(/\? peakValue : tv/.test(fn), 'it must fall back to the CURRENT value, i.e. no drawdown history yet');
+
+  // BEHAVIOURAL — the exact live chain, end to end.
+  const saved = I.riskSystem.peakValue;
+  try {
+    I.riskSystem.peakValue = 1000;
+    I.rebasePeakForCoreFlow(950);
+    I.rebasePeakForCoreFlow(60);
+    ok(I.riskSystem.peakValue === 0, `ordinary core buying must still be able to floor the peak, got ${I.riskSystem.peakValue}`);
+    const d = I.computeDrawdown(I.riskSystem.peakValue, 48.75);
+    ok(d.peak === 48.75, `an absent peak must become the current value, got ${d.peak}`);
+    ok(d.drawdown === 0, `and the drawdown must be zero, got ${(d.drawdown*100).toFixed(1)}%`);
+    // The writeback the risk gate performs must therefore be harmless.
+    ok(d.peak < 100, 'the value written back must not be a fabricated four-figure peak');
+
+    // A REAL drawdown must be completely unaffected.
+    ok(Math.abs(I.computeDrawdown(1000, 700).drawdown - 0.30) < 1e-9, 'a real 30% drawdown must still register');
+    ok(Math.abs(I.computeDrawdown(500, 400).drawdown - 0.20) < 1e-9, 'a real 20% drawdown must still register');
+    // And the high-water mark must still ratchet UP.
+    ok(I.computeDrawdown(500, 600).peak === 600, 'the peak must still advance with a new high');
+    // Degenerate inputs must not throw or produce NaN.
+    ok(I.computeDrawdown(0, 0).drawdown === 0, 'a zero account must not read as a drawdown');
+    ok(Number.isFinite(I.computeDrawdown(NaN, 50).drawdown), 'a NaN peak must not produce NaN drawdown');
+  } finally { I.riskSystem.peakValue = saved; }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
