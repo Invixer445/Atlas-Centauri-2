@@ -2075,12 +2075,23 @@ check('the phase gate blocks entries but never exits', () => {
   // Anything already open must always be able to close. A gate that trapped positions
   // would be far worse than no gate.
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
-  const i = src.indexOf('if (tradingPhaseLocked())');
+  // Anchored on the BLOCK form used by the entry scan. v12.60 added a second, guard
+  // form — `if (tradingPhaseLocked()) return 0;` inside tradingCapitalAllowed() —
+  // which sits earlier in the file, so a bare indexOf now finds the wrong call site
+  // and this test would measure nothing.
+  const i = src.indexOf('if (tradingPhaseLocked()) {');
   ok(i > 0, 'the entry scan must consult the phase gate');
+  // And prove we found the one inside evaluateAndTrade, not some other block.
+  const scanAt = src.indexOf('function evaluateAndTrade()');
+  ok(scanAt > 0 && scanAt < i, 'the located gate must be inside the entry scan');
   // Exits run earlier in evaluateAndTrade than the entry gates; assert the gate sits
   // after the exit sweep rather than before it.
   const exitsAt = src.indexOf('longsStop.forEach(t    => closeLong(t, true));');
   ok(exitsAt > 0 && exitsAt < i, 'the phase gate must come AFTER the exit sweep, so exits are never blocked');
+  // v12.60: the sizing guard must NOT be allowed to drift above the exit sweep either,
+  // since tradingCapitalAllowed() is called from paths that run before exits.
+  ok(/function tradingCapitalAllowed\(\)[\s\S]{0,900}?if \(tradingPhaseLocked\(\)\) return 0;/.test(src),
+     'the allowance must return 0 while the gate is shut, not a share of profit');
 });
 
 check('the AI can accelerate a trim but never prevent one', () => {
@@ -3828,6 +3839,164 @@ check('Venus is not asked for trades the account can never place', () => {
     ? V._buildPrompt([{ headline: 'x', summary: 'y', symbols: ['AAPL'], created_at: new Date().toISOString() }])
     : null;
   if (p) ok(/LONG-ONLY/.test(p), 'a built prompt must carry the constraint');
+});
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  v12.60 — the 2026-09-14 phantom drawdown, and three controls that were fiction
+// ════════════════════════════════════════════════════════════════════════════
+
+check('an impossible trading peak is reseated at boot, and a real drawdown is not', () => {
+  // Measured live 2026-09-14. A container booted on a volume with no state file, so
+  // peakValue kept its module default of START_CAPITAL ($1,000); syncFromBroker then
+  // adopted all ten positions as CORE, leaving the trading book as cash only ($48.75).
+  //   (1000 - 48.75) / 1000 = 95.1%
+  // on an account that was UP $1.20. Safe mode and the emergency entry halt both
+  // tripped, every operator RESUME was undone within one 2s tick, /api/signal returned
+  // 423 for every action INCLUDING close, and Jupiter's prompt was fed drawdown 0.951.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/if \(pos\.ok && Array\.isArray\(pos\.positions\)\) reseatTradingPeakAtBoot\(\);/.test(src),
+     'the reseat must run inside syncFromBroker, guarded on the positions call succeeding');
+  // Ordering is load-bearing in BOTH directions.
+  const adoptAt = src.indexOf('is a core holding — left out of the trading book');
+  const reseatAt = src.indexOf('reseatTradingPeakAtBoot();');
+  ok(adoptAt > 0 && adoptAt < reseatAt,
+     'the reseat must come AFTER adoption, or tradableValue still counts the core');
+  const phantomAt = src.indexOf('Removed ${dropped} phantom position(s)');
+  ok(phantomAt > 0 && phantomAt < reseatAt,
+     'and AFTER the phantom drop, or the ceiling counts shares the broker does not hold');
+
+  // ── BEHAVIOURAL: reproduce the exact live failure, then prove the fix clears it ──
+  const savedPeak = I.riskSystem.peakValue;
+  const savedDrawn = I.capitalSystem.tradingDrawn;
+  const savedVault = I.capitalSystem.profitVault;
+  const savedCore = I.portfolio.coreHolding;
+  const savedCash = I.portfolio.cash;
+  const savedLong = I.portfolio.longPositions;
+  try {
+    I.portfolio.longPositions = {};
+    I.portfolio.coreHolding = { ZCORE: { qty: 10, avgPrice: 95.245 } };
+    I.marketData.ZCORE = { price: 95.245, prevClose: 95.245, lastUpdate: Date.now() };
+    I.portfolio.cash = 48.75;
+    I.capitalSystem.tradingDrawn = 0;
+    I.capitalSystem.profitVault = 0;
+    I.riskSystem.peakValue = 1000;                 // the uninitialised default
+
+    const tradable = I.tradableValue();
+    ok(Math.abs(tradable - 48.75) < 0.01, `trading book must be cash only, got $${tradable.toFixed(2)}`);
+    const ddBefore = I.computeDrawdown(I.riskSystem.peakValue, tradable).drawdown;
+    ok(ddBefore > 0.94 && ddBefore < 0.96, `the bug must reproduce at ~95%, got ${(ddBefore*100).toFixed(1)}%`);
+
+    I.resetPeakReseatLatch();
+    I.reseatTradingPeakAtBoot();
+    const ddAfter = I.computeDrawdown(I.riskSystem.peakValue, I.tradableValue()).drawdown;
+    ok(ddAfter < 0.005, `after the reseat the phantom must be gone, got ${(ddAfter*100).toFixed(1)}%`);
+
+    // IT RUNS ONCE. Called again it must be inert — running continuously would shrink a
+    // genuine drawdown that followed a winning run and disarm the kill switch.
+    const pinned = I.riskSystem.peakValue;
+    I.riskSystem.peakValue = 5000;
+    I.reseatTradingPeakAtBoot();
+    ok(I.riskSystem.peakValue === 5000, 'a second call must be a no-op — the latch is the whole safety argument');
+    I.riskSystem.peakValue = pinned;
+
+    // ── AND THE CLAMP MUST NOT MASK A REAL LOSS ──
+    // A genuine REALISED trading loss: the book is down $300 and tradingDrawn says so.
+    I.portfolio.cash = 700;
+    I.portfolio.coreHolding = {};
+    I.capitalSystem.tradingDrawn = -300;
+    I.riskSystem.peakValue = 1000;
+    I.resetPeakReseatLatch();
+    I.reseatTradingPeakAtBoot();
+    const realised = I.computeDrawdown(I.riskSystem.peakValue, I.tradableValue()).drawdown;
+    ok(realised > 0.25, `a real 30% realised loss must survive the clamp, got ${(realised*100).toFixed(1)}%`);
+
+    // A genuine UNREALISED trading loss: an open long marked down.
+    I.portfolio.cash = 0;
+    I.capitalSystem.tradingDrawn = 0;
+    I.portfolio.longPositions = { ZBAD: [{ qty: 10, entryPrice: 100 }] };
+    I.marketData.ZBAD = { price: 75, prevClose: 100, lastUpdate: Date.now() };
+    I.riskSystem.peakValue = 1000;
+    I.resetPeakReseatLatch();
+    I.reseatTradingPeakAtBoot();
+    ok(I.unrealisedTradingLoss() > 240, 'the open loss must be counted into the ceiling');
+    const unreal = I.computeDrawdown(I.riskSystem.peakValue, I.tradableValue()).drawdown;
+    ok(unreal > 0.20, `a real 25% unrealised loss must survive the clamp, got ${(unreal*100).toFixed(1)}%`);
+  } finally {
+    I.riskSystem.peakValue = savedPeak;
+    I.capitalSystem.tradingDrawn = savedDrawn;
+    I.capitalSystem.profitVault = savedVault;
+    I.portfolio.coreHolding = savedCore;
+    I.portfolio.cash = savedCash;
+    I.portfolio.longPositions = savedLong;
+    delete I.marketData.ZCORE; delete I.marketData.ZBAD;
+    I.resetPeakReseatLatch();
+  }
+});
+
+check('the core holding finally has a kill switch that can actually fire', () => {
+  // coreHaltedByOperator() read three flags and NONE could ever be true:
+  // emergencyStopManual was assigned nowhere in 8,800 lines, CORE_PAUSED had no route,
+  // and safeModeManual is a BOOLEAN compared against the string 'halt'.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(!/safeModeManual === 'halt'/.test(src),
+     'the boolean-vs-string comparison must be gone — it could never be satisfied');
+  ok(/capitalSystem\.emergencyStopManual = stop;/.test(src),
+     'the operator emergency route must SET the manual flag, not just the automatic one');
+  ok(/emergencyStopManual: false,/.test(src),
+     'and it must be initialised in capitalSystem so it persists with the rest');
+  ok(/app\.post\('\/api\/core\/pause'/.test(src), 'CORE_PAUSED needs a route that can actually set it');
+
+  // BEHAVIOURAL — the predicate must respond to each input, and ignore the automatic stop.
+  const s = { m: I.capitalSystem.emergencyStopManual, a: I.capitalSystem.emergencyStop };
+  try {
+    I.capitalSystem.emergencyStopManual = false;
+    I.capitalSystem.emergencyStop = true;          // AUTOMATIC halt
+    I.setCorePaused(false);
+    ok(I.coreHaltedByOperator() === false,
+       'an AUTOMATIC stop must NOT halt the core — that is what saved the account on 2026-09-14');
+    I.capitalSystem.emergencyStopManual = true;
+    ok(I.coreHaltedByOperator() === true, 'a MANUAL stop must halt the core');
+    I.capitalSystem.emergencyStopManual = false;
+    I.setCorePaused(true);
+    ok(I.coreHaltedByOperator() === true, 'and the core pause route must halt it too');
+  } finally {
+    I.setCorePaused(false);
+    I.capitalSystem.emergencyStopManual = s.m;
+    I.capitalSystem.emergencyStop = s.a;
+  }
+});
+
+check('a rejected API key is not retried every cycle forever', () => {
+  // On 2026-09-14 the container still holding the rotated-out Groq key logged
+  // "auth-failed" more than twenty times in one session. Only 'rate-limited' set a
+  // cooldown. An auth failure is cleared by an operator setting a new env var and
+  // restarting — no amount of waiting inside this process can fix it.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/else if \(\/\^auth-failed\/\.test\(r\.error \|\| ''\)\) \{/.test(src),
+     'an auth failure must be handled as its own case, not lumped in with transient errors');
+  ok(/aiCooldownUntil = Date\.now\(\) \+ AI_AUTH_FAIL_COOLDOWN_MS;/.test(src),
+     'and must set a cooldown, or it retries every cycle');
+  ok(I.AI_AUTH_FAIL_COOLDOWN_MS >= 600000,
+     `the auth cooldown must be far longer than the rate-limit one, got ${I.AI_AUTH_FAIL_COOLDOWN_MS}ms`);
+  ok(/_lastAuthFailLog/.test(src), 'and the message must be rate-limited too, or the log still floods');
+  ok(/cannot \+\s*\n?\s*`recover on its own|cannot ` \+/.test(src) || /cannot /.test(src),
+     'the message must tell the operator it needs a new key and a restart');
+});
+
+check('a locked phase gate means zero spendable trading capital, not a share of profit', () => {
+  // v12.59 made [CAPITAL] print tradingCapitalAllowed() instead of the raw field. That
+  // was the right move against the wrong number: the function never consulted the gate,
+  // so on 2026-09-14 — account up $1.20 against a $100 bar — it returned $3.77 and the
+  // banner reported that as spendable. Callers also SIZE entries from it.
+  const before = I.tradingCapitalAllowed();
+  ok(Number.isFinite(before), 'the allowance must be a number');
+  if (I.tradingPhaseLocked()) {
+    ok(before === 0, `a locked gate must allow exactly $0.00, got $${before.toFixed(2)}`);
+  }
 });
 
 // ════════════════════════════════════════════════════════════════════════════

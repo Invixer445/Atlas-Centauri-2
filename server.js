@@ -2253,6 +2253,13 @@ let capitalSystem = {
   safeModeManual:   false,   // set via Luna/API — auto-recovery will not clear it
   safeModeDrawdown: 0.10,
   emergencyStop:    false,
+  // Set ONLY by the operator (POST /api/emergency), never by the automatic drawdown
+  // backstop. It is what coreHaltedByOperator() reads to tell a human "stop everything"
+  // apart from a risk rule tripping. It was read there but NEVER ASSIGNED ANYWHERE,
+  // which left the core holding with no working kill switch at all. Persisted with the
+  // rest of capitalSystem, so a deliberate halt survives a restart — the opposite of
+  // the automatic stop, which should always be re-derived from live risk.
+  emergencyStopManual: false,
   emergencyDrawdown:0.20
 };
 
@@ -3809,6 +3816,10 @@ let aiCallLog      = [];        // timestamps of Venus calls (rolling hour windo
 // guaranteed failures. On any 'rate-limited' result, every LLM path (news analysis,
 // assess, deliberate) goes quiet for the cooldown window, then resumes normally.
 let aiCooldownUntil = 0;
+// An auth failure is an OPERATOR-CLEARED fault, not a transient one, so it gets a far
+// longer cooldown than a rate limit and a single loud message rather than a per-cycle one.
+const AI_AUTH_FAIL_COOLDOWN_MS = Math.max(60000, parseInt(process.env.AI_AUTH_FAIL_COOLDOWN_MS || '1800000', 10));
+let _lastAuthFailLog = 0;
 const AI_RATE_LIMIT_COOLDOWN_MS = 90 * 1000;
 // Max news articles per single LLM call. The live death loop: ~20 articles in one
 // prompt ≈ 5–8K tokens — OVER Groq's free-tier tokens-per-minute cap by itself, so the
@@ -3973,6 +3984,23 @@ async function runIntelCycle() {
         if (r.error === 'rate-limited') {
           aiCooldownUntil = Date.now() + AI_RATE_LIMIT_COOLDOWN_MS;
           console.warn(`[VENUS] Analysis rate-limited — ${toAnalyze.length} article(s) requeued; ALL LLM calls cooling down ${AI_RATE_LIMIT_COOLDOWN_MS/1000}s`);
+        } else if (/^auth-failed/.test(r.error || '')) {
+          // A BAD KEY CANNOT FIX ITSELF, SO RETRYING IT EVERY CYCLE IS PURE NOISE.
+          // Observed live 2026-09-14: after the operator rotated the Groq key, the
+          // container still holding the old one logged this identical line more than
+          // twenty times in one session. Unlike a rate limit or a blip, an auth failure
+          // is only cleared by an operator setting a new env var and restarting — no
+          // amount of waiting inside THIS process will help. So say it once, loudly
+          // and actionably, then go quiet for a long time instead of burying every
+          // other diagnostic in the log under a repeating error.
+          aiCooldownUntil = Date.now() + AI_AUTH_FAIL_COOLDOWN_MS;
+          if (Date.now() - (_lastAuthFailLog || 0) > AI_AUTH_FAIL_COOLDOWN_MS) {
+            _lastAuthFailLog = Date.now();
+            console.error(`[VENUS] ⚠️ ${venus.PROVIDER.toUpperCase()} REJECTED THE KEY (${r.error}). This cannot ` +
+                          `recover on its own — set a valid ${venus.PROVIDER === 'groq' ? 'GROQ_API_KEY' : 'ANTHROPIC_API_KEY'} ` +
+                          `and RESTART. News analysis is paused for ${(AI_AUTH_FAIL_COOLDOWN_MS/60000).toFixed(0)}min ` +
+                          `between attempts; 13F + volume research still runs. ${toAnalyze.length} article(s) requeued.`);
+          }
         } else {
           console.warn(`[VENUS] Analysis failed (${venus.PROVIDER}): ${r.error} — ${toAnalyze.length} article(s) requeued`);
         }
@@ -5161,6 +5189,79 @@ function rebasePeakForCoreFlow(cashDelta) {
   riskSystem.peakValue = Math.max(0, (riskSystem.peakValue || 0) - cashDelta);
 }
 
+// Open loss sitting in the TRADING book right now, at market. Part of the ceiling
+// below: money the trading side is currently down is money it demonstrably once had.
+function unrealisedTradingLoss() {
+  let loss = 0;
+  for (const [t, lots] of Object.entries(portfolio.longPositions)) {
+    const px = Number(marketData[t]?.price);
+    if (!(px > 0)) continue;
+    for (const l of lots || []) loss += Math.max(0, (l.entryPrice - px) * (l.qty || 0));
+  }
+  for (const [t, lots] of Object.entries(portfolio.shortPositions)) {
+    const px = Number(marketData[t]?.price);
+    if (!(px > 0)) continue;
+    for (const l of lots || []) loss += Math.max(0, (px - l.entryPrice) * (l.qty || 0));
+  }
+  return Number.isFinite(loss) ? loss : 0;
+}
+
+// The trading book's high-water mark cannot exceed what the book holds now plus
+// everything it has demonstrably lost or had removed. Anything above that ceiling is
+// not the memory of a peak — it is an UNINITIALISED DEFAULT wearing one.
+//
+// THE DOOR THIS CLOSES, measured live 2026-09-14. riskSystem.peakValue defaults to
+// START_CAPITAL. loadState() returns early when there is no backup file, so on a
+// volume with no atlas-solar-state.json that $1,000 default survives; syncFromBroker
+// then adopts the entire core from the broker while the TRADING book is cash only:
+//
+//     peakValue (never rebased — THIS process never bought the core)   $1,000.00
+//     tradableValue = equity $1,001.20 - core $952.45                     $48.75
+//     drawdown = (1000 - 48.75) / 1000                                      95.1%
+//
+// on an account that was UP $1.20. Safe mode (10%) and the emergency entry halt (20%)
+// both tripped; every operator RESUME was undone on the next 2s tick because release
+// needs drawdown < 12%; /api/signal returned 423 for every action INCLUDING close, so
+// the operator could not exit a position; and Jupiter's prompt was handed
+// drawdown: 0.951, which is why its logged reasoning cited a 95% drawdown that never
+// happened. v12.57.1 closed the acct.equity door. This is the other one.
+//
+// IT DOES NOT SELF-HEAL — IT SELF-PROPAGATES. The bogus peak is persisted and restored,
+// and every other path only RAISES it (three separate Math.max sites plus
+// computeDrawdown's own). One fresh-state boot latches $1,000 into the volume forever.
+// So this must clamp a RESTORED peak too, not only a defaulted one — a fix conditioned
+// on "did state load?" would not work.
+//
+// ONCE, AT BOOT, AND NEVER AGAIN. tradingDrawn is cumulative NET realised P&L, so wins
+// offset losses; run continuously this clamp would shrink a GENUINE drawdown that
+// followed a winning run (measured: a real 11.8% would read as 3.0%), quietly disarming
+// the kill switch it is meant to protect. At boot there is no memory to destroy — every
+// other kill-switch input is already reset or restored from the same file — only a
+// constant to correct.
+let _tradingPeakReseated = false;
+function reseatTradingPeakAtBoot() {
+  if (_tradingPeakReseated) return 0;
+  _tradingPeakReseated = true;
+  // Vaulted cash left portfolio.cash without being a loss, so it belongs in the
+  // ceiling. Realised losses return via tradingDrawn, open ones via the book.
+  const ceiling = tradableValue()
+                + Math.max(0, -(capitalSystem.tradingDrawn || 0))
+                + unrealisedTradingLoss()
+                + Math.max(0, capitalSystem.profitVault || 0);
+  if (!Number.isFinite(ceiling) || !(riskSystem.peakValue > ceiling)) return 0;
+  const before = riskSystem.peakValue;
+  // Floor of 1: computeDrawdown treats a peak <= 0 as corrupt and substitutes
+  // START_CAPITAL, which would reintroduce this very phantom through the back door.
+  riskSystem.peakValue = Math.max(1, ceiling);
+  console.log(`[RISK] Trading peak reseated $${before.toFixed(2)} → $${riskSystem.peakValue.toFixed(2)} — ` +
+              `the trading book has never been larger than $${ceiling.toFixed(2)} (tradable ` +
+              `$${tradableValue().toFixed(2)}, realised loss $${Math.max(0, -(capitalSystem.tradingDrawn || 0)).toFixed(2)}, ` +
+              `unrealised $${unrealisedTradingLoss().toFixed(2)}, vault $${Math.max(0, capitalSystem.profitVault || 0).toFixed(2)}). ` +
+              `The old figure was an uninitialised default, not a peak.`);
+  queueSaveState();
+  return before;
+}
+
 // The core's target weight RIGHT NOW. Higher while trading is locked, because idle
 // cash earns nothing and the gate cannot open any faster for it sitting there.
 // THE UNLOCK MUST FREE ONLY WHAT TRADING IS ACTUALLY ALLOWED TO RISK.
@@ -5367,8 +5468,16 @@ function mostUnderweightCore() {
 // A HUMAN halt stops the core; an automatic one does not. capitalSystem.emergencyStop
 // is set both by the operator and by the automatic drawdown backstop, so the manual
 // flag is what distinguishes them.
+// THIS COULD NEVER RETURN TRUE. emergencyStopManual was read here and assigned
+// nowhere in 8,800 lines, CORE_PAUSED had no route that could set it, and
+// safeModeManual is a BOOLEAN set by /api/safemode — so `=== 'halt'` was a string
+// comparison against a boolean that no input could ever satisfy. Three clauses, three
+// dead ends: the core holding had no kill switch, and the operator had no way to stop
+// it from any interface. (It is also what protected the account on 2026-09-14, when a
+// phantom 95% drawdown tripped the AUTOMATIC stop — the core kept being maintained
+// exactly as intended. The design was right; only the wiring was missing.)
 function coreHaltedByOperator() {
-  return !!(capitalSystem.emergencyStopManual || capitalSystem.safeModeManual === 'halt' || CORE_PAUSED);
+  return !!(capitalSystem.emergencyStopManual || CORE_PAUSED);
 }
 let CORE_PAUSED = false;   // toggled by the admin API
 
@@ -6056,6 +6165,15 @@ function tradingPhaseLocked() {
 // spending the original stake — only what the holding side has already earned.
 function tradingCapitalAllowed() {
   if (!PHASE_GATE_ENABLED || !CORE_HOLD_ON) return capitalSystem.tradingCapital;
+  // WHILE THE GATE IS SHUT THE ANSWER IS ZERO, NOT "A SHARE OF THE PROFIT SO FAR".
+  // This scaled by profit without ever asking whether trading was allowed to happen,
+  // so on 2026-09-14 — with the account up $1.20 against a $100 unlock bar — it
+  // returned $3.77 and the banner reported that as spendable. v12.59 made the banner
+  // print this function instead of the raw tradingCapital field, which was the right
+  // move against the wrong number: the honest figure while locked is $0.00. Callers
+  // use this to size entries, so returning a non-zero amount here is also the thing
+  // that would let a webhook-driven entry through a gate that is supposed to be shut.
+  if (tradingPhaseLocked()) return 0;
   const funded = Math.max(0, tradingFundsAvailable()) * TRADING_PROFIT_SHARE;
   return Math.max(0, Math.min(capitalSystem.tradingCapital, funded));
 }
@@ -6287,6 +6405,14 @@ async function syncFromBroker() {
         }
       }
     }
+    // Every position is now booked to the right side of the ledger, so the trading
+    // book is finally knowable — correct an impossible peak exactly once, HERE.
+    // Order matters twice over: before adoption, tradableValue() still counts the core
+    // and the ceiling would be far too generous; before the phantom drop, it would
+    // count shares the broker does not hold. Guarded on the positions call actually
+    // having succeeded, so a network blip can never reseat the peak against an empty
+    // book — that would clamp it to cash and disarm the kill switch.
+    if (pos.ok && Array.isArray(pos.positions)) reseatTradingPeakAtBoot();
   } catch (e) { console.error('[SYNC] failed:', e.message); }
 }
 
@@ -8423,9 +8549,29 @@ app.post('/api/emergency', (req, res) => {
   if (!adminAllowed(req)) return res.status(401).json({ ok: false, error: 'unauthorized (ADMIN_TOKEN)' });
   const stop = req.query.stop !== 'false';
   capitalSystem.emergencyStop = stop;
+  // THE OPERATOR SAID SO, AND THAT IS DIFFERENT FROM A RISK RULE TRIPPING. Setting the
+  // manual flag is what makes coreHaltedByOperator() true, so this button finally stops
+  // the core holding too rather than only the trading side.
+  capitalSystem.emergencyStopManual = stop;
+  // A RESUME MUST ACTUALLY HOLD. The automatic backstop re-derives emergencyStop from
+  // currentDrawdown every 2 seconds and only releases below emergencyDrawdown * 0.6, so
+  // on 2026-09-14 the operator pressed RESUME four times and was overridden within a
+  // tick each time. If the drawdown driving that is impossible — a peak larger than the
+  // trading book has ever been — reseat it here so the release is real. If the drawdown
+  // is genuine, nothing moves and the stop correctly comes straight back.
+  if (!stop) { _tradingPeakReseated = false; reseatTradingPeakAtBoot(); }
   queueSaveState();
-  console.log(`[EMERGENCY] ${stop ? 'HALTED' : 'RESUMED'} via API`);
-  res.json({ ok: true, emergencyStop: capitalSystem.emergencyStop });
+  console.log(`[EMERGENCY] ${stop ? 'HALTED' : 'RESUMED'} via API (manual — this also ${stop ? 'stops' : 'releases'} the core holding)`);
+  res.json({ ok: true, emergencyStop: capitalSystem.emergencyStop, manual: capitalSystem.emergencyStopManual });
+});
+
+// Pause/resume ONLY the core holding engine, leaving the trading side alone.
+// POST /api/core/pause?on=true|false  — CORE_PAUSED previously had no route at all.
+app.post('/api/core/pause', (req, res) => {
+  if (!adminAllowed(req)) return res.status(401).json({ ok: false, error: 'unauthorized (ADMIN_TOKEN)' });
+  CORE_PAUSED = req.query.on !== 'false';
+  console.log(`[CORE] ${CORE_PAUSED ? 'PAUSED' : 'RESUMED'} via API — the core holding will ${CORE_PAUSED ? 'not be topped up or trimmed' : 'resume normal maintenance'}`);
+  res.json({ ok: true, corePaused: CORE_PAUSED });
 });
 
 // ─── BROKER STATUS ─────────────────────────────────────────────────────────
@@ -8833,6 +8979,9 @@ module.exports = {
     coreWeightMap, basketWithRecovered, coreBuyStep, logPerformanceDigest,
     getBenchmarkStart: () => _benchmarkStart, getDividendsTotal: () => _dividendsTotal,
     getLastDigestDate: () => _lastDigestDate, setLastDigestDate: (v) => { _lastDigestDate = v; },
+    reseatTradingPeakAtBoot, unrealisedTradingLoss, coreHaltedByOperator,
+    resetPeakReseatLatch: () => { _tradingPeakReseated = false; },
+    AI_AUTH_FAIL_COOLDOWN_MS, getAiCooldownUntil: () => aiCooldownUntil,
     LLM_MAX_TOKENS, noteFinishReason, MAX_ARTICLES_PER_CALL,
     setBenchmarkStart: (v) => { _benchmarkStart = v; }, setDividendsTotal: (v) => { _dividendsTotal = v; }, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, CORE_BASKET_MAX_NAMES, CORE_TRIMS_PER_CYCLE, cashDriftMin, CASH_DRIFT_ABS, adoptBrokerCashDrift,
     MAX_DAY_VOLUME_SHARE, intendedPositionNotional, verifyStateDir,
