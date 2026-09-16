@@ -3199,14 +3199,28 @@ check('the core can see a price for every name in its basket', () => {
                 .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
   // Both feeds, not just one — a snapshot without a stream goes stale, a stream without
   // a snapshot has no price until the next trade prints.
-  const subIdx = src.indexOf('const subSymbols =');
+  // v12.62 split this into `wanted` (deduped, priority-ordered) and `subSymbols`
+  // (capped), so the core-inclusion assertion anchors on `wanted`.
+  const subIdx = src.indexOf('const wanted = ');
   const fetchIdx = src.indexOf("console.log(`[PRICES] Fetching");
   ok(subIdx > 0 && /CORE_HOLD_ON \? CORE_HOLD_SYMBOLS : \[\]/.test(src.slice(subIdx, subIdx + 320)),
      'the tick subscription must include the core basket');
   ok(fetchIdx > 0 && /CORE_HOLD_ON \? CORE_HOLD_SYMBOLS : \[\]/.test(src.slice(Math.max(0, fetchIdx - 320), fetchIdx)),
      'the snapshot fetch must include the core basket');
   // Deduped, or a name on both lists is subscribed twice.
-  ok(/const subSymbols = \[\.\.\.new Set\(/.test(src), 'the subscription list must be deduped');
+  ok(/const wanted = \[\.\.\.new Set\(/.test(src), 'the subscription list must be deduped');
+  // AND CAPPED. Going one symbol over the feed's limit rejects the ENTIRE subscription
+  // (observed: "[WS] Stream error 405: symbol limit exceeded" at 35 symbols), which
+  // leaves every price to go stale after MAX_PRICE_AGE_MS with only a 6-hourly snapshot
+  // behind it — so the core stops buying for exactly the reason this test guards.
+  ok(/const subSymbols = wanted\.slice\(0, WS_MAX_SYMBOLS\);/.test(src),
+     'the subscription must be capped to what the feed will accept');
+  // Priority order is what makes the cap safe: the core must never be the part dropped.
+  const w = src.slice(subIdx, subIdx + 320);
+  ok(w.indexOf('CORE_HOLD_SYMBOLS') < w.indexOf('dynamicSymbols'),
+     'the core basket must be ordered AHEAD of dynamics, so the cap sheds dynamics first');
+  ok(w.indexOf("'SPY'") < w.indexOf('CORE_HOLD_SYMBOLS'),
+     'and SPY first of all — it is the benchmark and the regime input');
 
   // A swap mid-session is the case boot-time inclusion cannot cover: the stream was
   // opened hours earlier, before those names were in the basket.
@@ -4195,6 +4209,62 @@ check('a freshly added symbol gets DECISION bars, not minute bars', () => {
                        src.indexOf('async function fetchCandles') + 2600);
   ok(/DECISION_TIMEFRAME === '1Hour'\s*\n?\s*\? Promise\.resolve\(\{\}\)\s*\n?\s*: fetchBars\(symbols, '5Min'/.test(fc),
      'the 5-minute request must be skipped when its result is never read');
+});
+
+
+check('a persisted dynamic symbol does not survive a phase-locked boot', () => {
+  // v12.61 stopped ADDING dynamics while the gate is shut but said nothing about the
+  // ones already in the state file. On 2026-09-16 a deploy restored all ten, pushed the
+  // stream list to 35, and tripped the feed's symbol cap — killing live prices for the
+  // entire process. A name that cannot be traded must not hold a stream slot the core
+  // basket needs.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/const lockedOut = PHASE_GATE_ENABLED && CORE_HOLD_ON && tradingPhaseLocked\(\);/.test(src),
+     'the restore must know whether trading is locked');
+  ok(/if \(!lockedOut && \(jupiter\.hasSignal\(sym\) \|\| hasPos\)\) dynamicSymbols\[sym\] = d;/.test(src),
+     'a locked boot must not restore a dynamic symbol');
+  // A HELD position must still be restored even while locked, or the engine forgets
+  // something the broker is actually holding.
+  ok(/hasPos/.test(src), 'a symbol the account still holds must survive regardless');
+  ok(/_dynamicsDroppedByLock/.test(src), 'and the drop must be reported, not silent');
+});
+
+check('the tick subscription is capped to what the feed will accept', () => {
+  // Alpaca's free IEX plan caps concurrent stream symbols, and the rejection is
+  // ALL-OR-NOTHING: one over and the engine receives NO trade ticks at all.
+  //     [WS] Authenticated — subscribing to 35 symbols
+  //     [WS] Stream error 405: symbol limit exceeded
+  // With MAX_PRICE_AGE_MS at 90s and the only other price source running every SIX
+  // HOURS, that silently stops the core from buying — mostUnderweightCore() skips any
+  // symbol without a fresh price.
+  ok(I.WS_MAX_SYMBOLS >= 1 && I.WS_MAX_SYMBOLS <= 30,
+     `the cap must be at or under the free-tier limit, got ${I.WS_MAX_SYMBOLS}`);
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/dropping \$\{wanted\.slice\(WS_MAX_SYMBOLS\)\.join\(','\)\}/.test(src),
+     'and must name what it dropped — a silent truncation is how this got missed');
+
+  // BEHAVIOURAL — rebuild the ordering and prove the cap sheds the right names.
+  const core = I.CORE_HOLD_SYMBOLS;
+  const fakeDynamics = ['ZZA','ZZB','ZZC','ZZD','ZZE','ZZF','ZZG','ZZH','ZZI','ZZJ'];
+  const wanted = [...new Set(['SPY', ...core,
+                  ...['PLTR','SOFI','MARA','HOOD','SOUN','IONQ','RKLB','BBAI','HIMS','CIFR'],
+                  ...['F','BAC','JPM','WFC','GE','XOM','MRK','JNJ','PFE','KO'],
+                  ...fakeDynamics])];
+  ok(wanted.length > I.WS_MAX_SYMBOLS, `the overflow scenario must be reproducible, got ${wanted.length}`);
+  const sub = wanted.slice(0, I.WS_MAX_SYMBOLS);
+  ok(sub.length === I.WS_MAX_SYMBOLS, 'the capped list must be exactly the cap');
+  ok(sub.includes('SPY'), 'SPY must survive the cap');
+  core.forEach(s => ok(sub.includes(s), `core name ${s} must survive the cap`));
+  // The cap sheds only what does not fit, so some dynamics may legitimately survive.
+  // The requirement is about WHAT IS DROPPED: everything cut must be a dynamic.
+  const dropped = wanted.slice(I.WS_MAX_SYMBOLS);
+  ok(dropped.length > 0, 'the scenario must actually overflow the cap');
+  ok(dropped.every(s => fakeDynamics.includes(s)),
+     `only dynamics may be dropped, but the cut list was ${dropped.join(',')}`);
+  ok(dropped.every(s => !core.includes(s) && s !== 'SPY'),
+     'no core name and never SPY may be in the dropped set');
 });
 
 // ════════════════════════════════════════════════════════════════════════════

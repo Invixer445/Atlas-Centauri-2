@@ -3246,6 +3246,11 @@ const WS_RECONNECT_MAX = 60000;     // cap at 60s — prevents 429 storms on fre
 // pong arrives within 10s we close the socket, triggering the close→reconnect path.
 let wsHeartbeatTimer   = null;
 let wsPingTimeout      = null;
+// Alpaca's free IEX plan caps concurrent stream symbols at 30, and going over rejects
+// the ENTIRE subscription (error 405) rather than trimming it — so this must be a hard
+// local cap, not a hope. Raise it via env only if the account is on a paid plan.
+const WS_MAX_SYMBOLS = Math.max(1, parseInt(process.env.WS_MAX_SYMBOLS || '30', 10));
+
 const WS_PING_INTERVAL = 15000;   // ping every 15s (was 30s) — more keepalive traffic helps
                                    // some networks/routers avoid idle-timing-out the socket,
                                    // and any genuinely dead link is caught twice as fast
@@ -3335,9 +3340,32 @@ function connectWebSocket() {
   // Observed on the broker that evening: 57.4%, with $430.99 sitting in cash that the
   // engine was structurally incapable of deploying. Idle cash is the single largest
   // measured drag in this system and this had been quietly capping it the whole time.
-  const subSymbols = [...new Set([...WATCHLISTS.nasdaq, ...WATCHLISTS.nyse, 'SPY',
+  // THE FEED HAS A SYMBOL CAP AND THIS LIST HAD NONE, SO THE WHOLE SUBSCRIPTION DIED.
+  // Observed live 2026-09-16 after a deploy that restored 10 dynamic symbols from state:
+  //     [WS] Authenticated — subscribing to 35 symbols
+  //     [WS] Stream error 405: symbol limit exceeded
+  // Alpaca's free IEX plan caps concurrent stream symbols (30), and the rejection is
+  // ALL-OR-NOTHING — one symbol over and the bot receives no trade ticks at all.
+  //
+  // That is far more dangerous than it looks. MAX_PRICE_AGE_MS is 90 seconds, and the
+  // only other price source, fetchInitialPrices(), runs every SIX HOURS. So a rejected
+  // subscription means every symbol goes stale 90s later and stays stale, and
+  // mostUnderweightCore() skips any symbol without a fresh price — the core silently
+  // stops buying, with nothing in the log naming the cause.
+  //
+  // Ordered by what the account cannot do without, so the cap sheds the least valuable
+  // names first: SPY (benchmark + regime), then the core basket (the actual money),
+  // then the trading watchlist, then dynamics (which are speculative by construction).
+  const wanted = [...new Set(['SPY',
                       ...(CORE_HOLD_ON ? CORE_HOLD_SYMBOLS : []),
+                      ...WATCHLISTS.nasdaq, ...WATCHLISTS.nyse,
                       ...Object.keys(dynamicSymbols)])];
+  const subSymbols = wanted.slice(0, WS_MAX_SYMBOLS);
+  if (wanted.length > subSymbols.length) {
+    console.warn(`[WS] ${wanted.length} symbols wanted but the feed caps at ${WS_MAX_SYMBOLS} — ` +
+                 `dropping ${wanted.slice(WS_MAX_SYMBOLS).join(',')}. SPY and the core basket are kept first; ` +
+                 `going over the cap rejects the ENTIRE subscription and leaves the engine with no live prices.`);
+  }
 
   dataWs.on('open', () => {
     if (gen !== wsGeneration) return;
@@ -3855,6 +3883,8 @@ let aiCooldownUntil = 0;
 // longer cooldown than a rate limit and a single loud message rather than a per-cycle one.
 const AI_AUTH_FAIL_COOLDOWN_MS = Math.max(60000, parseInt(process.env.AI_AUTH_FAIL_COOLDOWN_MS || '1800000', 10));
 let _lastAuthFailLog = 0;
+// How many persisted dynamics a boot discarded because trading is phase-locked.
+let _dynamicsDroppedByLock = 0;
 const AI_RATE_LIMIT_COOLDOWN_MS = 90 * 1000;
 // Max news articles per single LLM call. The live death loop: ~20 articles in one
 // prompt ≈ 5–8K tokens — OVER Groq's free-tier tokens-per-minute cap by itself, so the
@@ -7675,7 +7705,15 @@ function loadState() {
       if (c.dynamicSymbols && typeof c.dynamicSymbols === 'object') {
         Object.entries(c.dynamicSymbols).forEach(([sym, d]) => {
           const hasPos = (state.longPositions?.[sym]?.length > 0) || (state.shortPositions?.[sym]?.length > 0);
-          if (jupiter.hasSignal(sym) || hasPos) dynamicSymbols[sym] = d;
+          // A RESTORED DYNAMIC IS STILL A DYNAMIC. v12.61 stopped ADDING them while the
+          // phase gate is shut, but said nothing about the ones already in the state
+          // file — so a deploy restored all ten, pushed the stream list to 35 and
+          // tripped the feed's symbol cap, killing live prices for the whole process.
+          // A name that cannot be traded has no business holding a stream slot that
+          // the core basket needs.
+          const lockedOut = PHASE_GATE_ENABLED && CORE_HOLD_ON && tradingPhaseLocked();
+          if (!lockedOut && (jupiter.hasSignal(sym) || hasPos)) dynamicSymbols[sym] = d;
+          else if (lockedOut && !hasPos) _dynamicsDroppedByLock++;
         });
       }
       const js = venus.getState(), vs = jupiter.getState();
@@ -7684,6 +7722,10 @@ function loadState() {
       const nCal = Object.keys(js.calibration).length;
       if (nDyn || nSig || nCal) {
         console.log(`[LUMEN] Restored — Jupiter: ${nSig} live signals, ${nDyn} dynamic symbols | Venus: ${nCal} catalyst calibrations`);
+      if (_dynamicsDroppedByLock) {
+        console.log(`[LUMEN] Dropped ${_dynamicsDroppedByLock} persisted dynamic symbol(s) — trading is ` +
+                    `phase-locked so they cannot be traded, and each one costs a stream slot the core needs.`);
+      }
       }
     }
     // Date-anchor daily counters
@@ -9116,7 +9158,7 @@ module.exports = {
     getBenchmarkStart: () => _benchmarkStart, getDividendsTotal: () => _dividendsTotal,
     getLastDigestDate: () => _lastDigestDate, setLastDigestDate: (v) => { _lastDigestDate = v; },
     reseatTradingPeakAtBoot, unrealisedTradingLoss, coreHaltedByOperator,
-    BASKET_DAILY_SD, CALENDAR_MAX_AGE_MS,
+    BASKET_DAILY_SD, CALENDAR_MAX_AGE_MS, WS_MAX_SYMBOLS,
     resetPeakReseatLatch: () => { _tradingPeakReseated = false; },
     AI_AUTH_FAIL_COOLDOWN_MS, getAiCooldownUntil: () => aiCooldownUntil,
     LLM_MAX_TOKENS, noteFinishReason, MAX_ARTICLES_PER_CALL,
