@@ -7681,6 +7681,26 @@ function scheduleDailyReset() {
     Object.keys(portfolio.longPositions).forEach(s => activeSymbols.add(s));
     Object.keys(portfolio.shortPositions).forEach(s => activeSymbols.add(s));
     Object.keys(dynamicSymbols).forEach(s => activeSymbols.add(s));   // live dynamics keep their data (they're still WS-subscribed)
+    // THE CORE HOLDING IS MONEY THE ACCOUNT OWNS, AND IT WAS NOT ON THIS LIST.
+    // The basket is chosen by Venus, so it is NOT the static watchlist, and core lots
+    // live in portfolio.coreHolding rather than longPositions — so every core name
+    // outside WATCHLISTS had its price deleted at Eastern midnight. Measured
+    // 2026-09-16 with the live basket (AAPL MSFT JNJ MRK KO PG JPM BAC XOM CVX):
+    // AAPL, MSFT, PG and CVX were unprotected — $386.39, FORTY PERCENT of the account.
+    //
+    // coreHoldingValue() falls back to lot.investedCash when a price is missing, so
+    // after midnight those four were valued at COST instead of market and
+    // getTotalValue() understated equity by their entire gain. That flowed straight
+    // into tradingFundsAvailable(), which is what the operator reads:
+    //     [PHASE] Trading locked — holding phase has banked $-7.64
+    // while the account was really down only $2.27. The engine invented $5.37 of loss
+    // every night, added ~4 trading days to the unlock clock, and is the single
+    // reason the log read as a hemorrhage when the dashboard did not.
+    //
+    // It also silently froze those names: mostUnderweightCore() skips any symbol with
+    // no price, so the four largest winners could never be topped up.
+    Object.keys(portfolio.coreHolding || {}).forEach(s => activeSymbols.add(s));
+    CORE_HOLD_SYMBOLS.forEach(s => activeSymbols.add(s));   // and the basket we intend to hold
 
     // Remove marketData and candleData for symbols not on the watchlist
     // and not currently held (e.g. old symbols from a changed watchlist)

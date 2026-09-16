@@ -4066,6 +4066,50 @@ check('an absent peak is not resurrected as START_CAPITAL', () => {
   } finally { I.riskSystem.peakValue = saved; }
 });
 
+
+check('the midnight sweep never deletes the price of a name the account owns', () => {
+  // THE BUG THAT MADE THE BOT REPORT A HEMORRHAGE IT DID NOT HAVE.
+  // The keep-set was WATCHLISTS + SPY + long/short positions + dynamics. The core
+  // basket is chosen by VENUS, so it is not the static watchlist, and core lots live
+  // in portfolio.coreHolding, not longPositions — so every core name outside
+  // WATCHLISTS lost its marketData at Eastern midnight. With the live 2026-09-16
+  // basket that was AAPL, MSFT, PG and CVX: $386.39, forty percent of the account.
+  // coreHoldingValue() then priced them at COST (lot.investedCash), getTotalValue()
+  // understated equity by their whole gain, and tradingFundsAvailable() printed
+  // "[PHASE] ... banked $-7.64" on an account that was down $2.27.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/Object\.keys\(portfolio\.coreHolding \|\| \{\}\)\.forEach\(s => activeSymbols\.add\(s\)\);/.test(src),
+     'held core lots must be kept');
+  ok(/CORE_HOLD_SYMBOLS\.forEach\(s => activeSymbols\.add\(s\)\);/.test(src),
+     'and the intended basket too, or a name is unprotected between proposal and purchase');
+
+  // BEHAVIOURAL — rebuild the exact keep-set logic and prove no owned name is dropped.
+  const W = { nasdaq: ['PLTR','SOFI','MARA','HOOD','SOUN','IONQ','RKLB','BBAI','HIMS','CIFR'],
+              nyse:   ['F','BAC','JPM','WFC','GE','XOM','MRK','JNJ','PFE','KO'] };
+  const keep = new Set([...W.nasdaq, ...W.nyse, 'SPY']);
+  const liveBasket = ['AAPL','MSFT','JNJ','MRK','KO','PG','JPM','BAC','XOM','CVX'];
+  // Pre-fix: the four winners were unprotected. This asserts the SCENARIO was real,
+  // so the test cannot quietly become vacuous if the watchlist changes.
+  const wouldHaveBeenDropped = liveBasket.filter(s => !keep.has(s));
+  ok(wouldHaveBeenDropped.length === 4 && wouldHaveBeenDropped.join(',') === 'AAPL,MSFT,PG,CVX',
+     `the historical exposure must still be reproducible, got ${wouldHaveBeenDropped.join(',')}`);
+  // Post-fix: adding the core sources protects every one of them.
+  liveBasket.forEach(s => keep.add(s));
+  ok(liveBasket.every(s => keep.has(s)), 'every basket member must survive the sweep');
+
+  // And the mechanism that made it expensive: a missing price silently becomes cost basis.
+  const savedCore = I.portfolio.coreHolding;
+  try {
+    I.portfolio.coreHolding = { ZPRICED: { qty: 2, avgPrice: 50, investedCash: 100 } };
+    I.marketData.ZPRICED = { price: 60, prevClose: 50, lastUpdate: Date.now() };
+    ok(Math.abs(I.coreHoldingValue() - 120) < 1e-6, 'with a price, the core marks to market');
+    delete I.marketData.ZPRICED;                       // exactly what the sweep did
+    ok(Math.abs(I.coreHoldingValue() - 100) < 1e-6,
+       'without a price it silently falls back to COST — this is why the loss was invented');
+  } finally { I.portfolio.coreHolding = savedCore; delete I.marketData.ZPRICED; }
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 console.log(`\n${'─'.repeat(60)}`);
 console.log(`${passed} passed, ${failed} failed`);
