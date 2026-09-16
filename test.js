@@ -318,13 +318,13 @@ check('a holiday is closed even on a WEEKDAY once the calendar is loaded', () =>
   // Driven through resolveSession with a controlled Wednesday, because the live
   // getCurrentMarket() short-circuits on the weekend check and this suite may run on a
   // Saturday — which made an earlier version of this test pass vacuously.
-  const cal = { ok: true, byDate: new Map([['2026-11-25', { open: 9.5, close: 16 }]]) };
+  const cal = { ok: true, fetchedAt: Date.now(), byDate: new Map([['2026-11-25', { open: 9.5, close: 16 }]]) };
   eq(I.resolveSession(12, 3, '2026-11-26', cal), null, 'Thanksgiving must be closed');
   eq(I.resolveSession(12, 3, '2026-11-25', cal), 'nasdaq', 'the day before must be open');
 });
 check('early closes are honoured', () => {
   // e.g. the 1:00pm close on Christmas Eve / day after Thanksgiving.
-  const cal = { ok: true, byDate: new Map([['2026-11-27', { open: 9.5, close: 13 }]]) };
+  const cal = { ok: true, fetchedAt: Date.now(), byDate: new Map([['2026-11-27', { open: 9.5, close: 13 }]]) };
   eq(I.resolveSession(12.5, 5, '2026-11-27', cal), 'nasdaq', 'open before 13:00');
   eq(I.resolveSession(13.5, 5, '2026-11-27', cal), null, 'must be CLOSED after the 13:00 early close');
   // Without the calendar the old weekday rule would wrongly keep trading until 16:00.
@@ -3816,8 +3816,15 @@ check('the session digest fires once per trading day, not once per lucky process
   ok(/lastDigestDate:  *_lastDigestDate,/.test(src), 'and persisted');
   ok(/_lastDigestDate = state\.lastDigestDate;/.test(src), 'and restored, or a restart reprints it');
   // Persisted-but-never-written would still lose the day after a crash.
-  ok(/_lastDigestDate = dateStr;\s*\n\s*logDailyTradeDigest\(\);\s*\n\s*queueSaveState\(\);/.test(src),
-     'the date must be recorded AND saved at the moment the digest is emitted');
+  // v12.60.3 wrapped the emit in try/catch so a throwing digest cannot put itself on a
+  // once-a-minute retry loop — but the mark, the emit and the save must still be one
+  // unit, and the failure must be LOUD rather than silent.
+  ok(/_lastDigestDate = dateStr;[\s\S]{0,120}logDailyTradeDigest\(\);/.test(src),
+     'the date must be recorded at the moment the digest is emitted');
+  ok(/catch \(e\) \{[\s\S]{0,400}session digest FAILED to print/.test(src),
+     'a digest that throws must say so — a lost benchmark must never be silent');
+  ok(/session digest FAILED to print[\s\S]{0,400}queueSaveState\(\);/.test(src),
+     'and the save must still happen, or a crash re-emits the same day');
   // Restore must reject junk rather than adopting it as a date.
   const before = I.getLastDigestDate();
   I.setLastDigestDate(null);
@@ -4108,6 +4115,86 @@ check('the midnight sweep never deletes the price of a name the account owns', (
     ok(Math.abs(I.coreHoldingValue() - 100) < 1e-6,
        'without a price it silently falls back to COST — this is why the loss was invented');
   } finally { I.portfolio.coreHolding = savedCore; delete I.marketData.ZPRICED; }
+});
+
+
+check('a stale calendar falls back to normal hours instead of going dark for ever', () => {
+  // marketCalendar.ok latches true on the first successful fetch and is never cleared.
+  // If the 12-hourly refresh then fails for a week — expired key, outage, network — the
+  // loaded map simply stops reaching today's date. Every weekday read as a HOLIDAY,
+  // getCurrentMarket() returned null for ever, and the core stopped buying, trimming
+  // and refreshing prices with no error line anywhere. A silent total shutdown.
+  const fresh = { ok: true, fetchedAt: Date.now(), byDate: new Map([['2026-11-25', { open: 9.5, close: 16 }]]) };
+  const stale = { ok: true, fetchedAt: Date.now() - 30 * 24 * 3600 * 1000, byDate: new Map([['2026-11-25', { open: 9.5, close: 16 }]]) };
+  // A FRESH calendar must still call a genuine holiday closed — that protection is intact.
+  eq(I.resolveSession(12, 3, '2026-11-26', fresh), null, 'a fresh calendar must still close a holiday');
+  // A STALE one must fail OPEN to standard hours rather than declaring a permanent holiday.
+  eq(I.resolveSession(12, 3, '2026-11-26', stale), 'nasdaq', 'a stale calendar must fall back to normal hours');
+  // …and the fallback must still respect the clock, not just return open unconditionally.
+  eq(I.resolveSession(20, 3, '2026-11-26', stale), null, 'the fallback still closes outside 9.30-16.00');
+  eq(I.resolveSession(12, 0, '2026-11-26', stale), null, 'and never opens on a weekend');
+  // A date the stale calendar DOES cover is still honoured exactly.
+  eq(I.resolveSession(12, 3, '2026-11-25', stale), 'nasdaq', 'a covered date still resolves normally');
+});
+
+check('the performance line reports the basket measured swing, not a guess', () => {
+  // The "typical daily swing" was a hardcoded 0.0088 with no derivation in the repo.
+  // The equal-weight 8-name daily sd measured over 338 real sessions is 0.6797%.
+  // Overstating normal by 28% is the wrong direction for the one line whose whole job
+  // is to tell the operator whether a move is ordinary: at 0.88% a genuine -0.94-sigma
+  // day reads as a routine 0.74, which is exactly the misreading to avoid.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(!/total \* 0\.0088/.test(src), 'the undocumented 0.88% constant must be gone');
+  ok(/BASKET_DAILY_SD/.test(src), 'the swing must come from a named, derived constant');
+  ok(I.BASKET_DAILY_SD > 0.005 && I.BASKET_DAILY_SD < 0.008,
+     `the constant must match the measured 0.68%, got ${I.BASKET_DAILY_SD}`);
+});
+
+check('a watchlist add that can never be traded is not made', () => {
+  // Every dynamic add costs a snapshot request, a bar warm-up, a WS subscription and a
+  // slot in a 10-name list. With the gate 79 trading days from opening, all of it
+  // expires unused: the 2026-09-15/16 log shows eight removes draining the stream list
+  // to zero then ten adds refilling it, none of which could ever be bought.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('async function addDynamicSymbol'),
+                       src.indexOf('async function addDynamicSymbol') + 1800);
+  ok(/if \(PHASE_GATE_ENABLED && CORE_HOLD_ON && tradingPhaseLocked\(\)\) \{/.test(fn),
+     'the add must be gated on the phase lock');
+  // The gate must sit BEFORE the network call, or it saves nothing.
+  const gateAt = fn.indexOf('tradingPhaseLocked()');
+  const snapAt = fn.indexOf('alpacaDataGet');
+  ok(gateAt > 0 && snapAt > 0 && gateAt < snapAt,
+     'the gate must precede the snapshot request, or the request is still spent');
+  // DELIBERATELY NARROW: research and the basket proposal must NOT be gated, because
+  // the basket decision is real while locked and the register is scored out-of-sample.
+  const intel = src.slice(src.indexOf('async function runIntelCycle'),
+                          src.indexOf('async function runIntelCycle') + 1200);
+  ok(!/tradingPhaseLocked\(\)/.test(intel),
+     'the research cycle itself must keep running — the basket decision is real while locked');
+});
+
+check('a freshly added symbol gets DECISION bars, not minute bars', () => {
+  // fetchCandles is explicit that under DECISION_TIMEFRAME=1Hour the hourly series
+  // rides in .m1 and .m5 is deleted, because every indicator reads .m1. addDynamicSymbol
+  // was seeding .m1 with 1-MINUTE bars, understating ATR by about sqrt(60) ~ 7x until
+  // the next 5-minute refresh. The 2.2xATR stop and the risk-based share count are both
+  // computed from it, so a 7x-too-small ATR sizes the position ~7x too LARGE.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('async function addDynamicSymbol'),
+                       src.indexOf('async function addDynamicSymbol') + 4000);
+  ok(/const hourly = DECISION_TIMEFRAME === '1Hour';/.test(fn), 'the add path must know the decision timeframe');
+  ok(/if \(bh\[sym\]\?\.length\) \{ candleData\[sym\]\.m1 = bh\[sym\]\.slice\(-60\); delete candleData\[sym\]\.m5; \}/.test(fn),
+     'under 1Hour, .m1 must receive HOURLY bars and .m5 must be deleted — matching fetchCandles');
+  ok(!/if \(b1\[sym\]\?\.length\) \{ candleData\[sym\] = candleData\[sym\] \|\| \{\}; candleData\[sym\]\.m1 = b1\[sym\]/.test(fn),
+     'the unconditional minute-bar seeding must be gone');
+  // And the dead 5-minute fetch in the main refresh must be skipped under 1Hour.
+  const fc = src.slice(src.indexOf('async function fetchCandles'),
+                       src.indexOf('async function fetchCandles') + 2600);
+  ok(/DECISION_TIMEFRAME === '1Hour'\s*\n?\s*\? Promise\.resolve\(\{\}\)\s*\n?\s*: fetchBars\(symbols, '5Min'/.test(fc),
+     'the 5-minute request must be skipped when its result is never read');
 });
 
 // ════════════════════════════════════════════════════════════════════════════

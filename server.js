@@ -3114,11 +3114,40 @@ async function refreshMarketCalendar() {
 // tested on a controlled weekday: the real function short-circuits on the weekend check
 // first, so on a Saturday a holiday test would pass without ever running this code
 // (mutation testing caught exactly that).
+// How long a fetched calendar is trusted to still cover "today". The fetch loads ~35
+// trading days and refreshes every 12h, so a week of tolerance is generous; past that
+// the map is assumed not to reach the current date any more.
+const CALENDAR_MAX_AGE_MS = 7 * 24 * 3600 * 1000;
+
 function resolveSession(hours, day, dateStr, cal) {
   if (day === 0 || day === 6) return null;                       // weekend — never a trading day
   if (cal && cal.ok) {
     const session = cal.byDate.get(dateStr);
-    if (!session) return null;                                   // holiday
+    if (!session) {
+      // A MISSING DATE USED TO MEAN "HOLIDAY", UNCONDITIONALLY. That is right for a
+      // fresh calendar and catastrophic for a stale one. marketCalendar.ok latches true
+      // on the first successful fetch and is never cleared, so if the 12-hourly refresh
+      // then fails for a week — expired key, API outage, network — the map simply stops
+      // reaching today's date. Every weekday reads as a holiday, getCurrentMarket()
+      // returns null for ever, and the core stops buying, stops trimming and stops
+      // refreshing prices with NO error line anywhere. The bot goes dark and looks idle.
+      //
+      // Fail OPEN to standard hours instead, and say so. The cost of being wrong that
+      // way is one day of pointless API calls on a real holiday, when the exchange
+      // rejects or simply never fills anything. The cost of being wrong the other way
+      // is the entire account sitting unmanaged and unreported until someone notices.
+      const age = Date.now() - (cal.fetchedAt || 0);
+      if (age > CALENDAR_MAX_AGE_MS) {
+        if (Date.now() - (resolveSession._lastStaleLog || 0) > 3600000) {
+          resolveSession._lastStaleLog = Date.now();
+          console.warn(`[CALENDAR] ⚠️ The loaded calendar is ${(age / 86400000).toFixed(1)} days old and does not ` +
+                       `cover ${dateStr}. Falling back to standard 9.30–16.00 ET hours rather than treating every ` +
+                       `day as a holiday — check that the Alpaca key still works.`);
+        }
+        return (hours >= NASDAQ_NYSE_HOURS.start && hours < NASDAQ_NYSE_HOURS.end) ? 'nasdaq' : null;
+      }
+      return null;                                               // genuine holiday
+    }
     return (hours >= session.open && hours < session.close) ? 'nasdaq' : null;
   }
   if (hours >= NASDAQ_NYSE_HOURS.start && hours < NASDAQ_NYSE_HOURS.end) return 'nasdaq';
@@ -3710,9 +3739,15 @@ async function fetchCandles() {
     const start1h  = new Date(Date.now() - 21 * 24 * 60 * 60 * 1000).toISOString();
 
     // Batch calls — all symbols at once per timeframe.
+    // The 5-minute series is only ever read in the non-hourly branch below, where it
+    // fills .m5. Under DECISION_TIMEFRAME=1Hour that branch never runs and .m5 is
+    // explicitly deleted — so this request was fetched and discarded on every refresh,
+    // about 1,100 dead round trips a month in the live configuration. Skip it.
     const [bars1m, bars5m, bars1h] = await Promise.all([
-      fetchBars(symbols, '1Min', start1m, 400),   // 1m bars: tf5m trend + true ATR
-      fetchBars(symbols, '5Min', start5m, 200),    // 5m bars: tf15m bias
+      fetchBars(symbols, '1Min', start1m, 400),   // 1m bars: tf5m trend + true ATR (raw1m under 1Hour)
+      DECISION_TIMEFRAME === '1Hour'
+        ? Promise.resolve({})
+        : fetchBars(symbols, '5Min', start5m, 200),   // 5m bars: tf15m bias
       DECISION_TIMEFRAME === '1Hour'
         ? fetchBars(symbols, '1Hour', start1h, 300)
         : Promise.resolve({})
@@ -4224,6 +4259,26 @@ function affordableMaxPrice(fractional = FRACTIONAL_ENABLED) {
 
 async function addDynamicSymbol(sym, sig) {
   if (!DYNAMIC_WATCHLIST_ON) return false;
+  // A DYNAMIC SYMBOL EXISTS ONLY SO IT CAN BE TRADED, AND WHILE THE GATE IS SHUT IT
+  // CANNOT BE. Every add costs a snapshot request, a bar warm-up, a WebSocket
+  // subscription and a slot in a 10-name list, and every one of them expires unused.
+  // Measured on 2026-09-15/16 with the gate 79 trading days from opening: eight removes
+  // draining the stream list to zero, then ten adds refilling it — ARWR TCOM ALVO SMWB
+  // CRML NVDA ZTO BIDU PANW FPS — none of which could ever be bought. That churn is
+  // also what makes an idle bot read like a bot in distress.
+  //
+  // DELIBERATELY NARROW. Venus's research, its posture calls and above all the BASKET
+  // PROPOSAL path keep running, because the basket decision is real while locked and
+  // the proposal register is scored out-of-sample later. Only the trade-idea plumbing,
+  // which has no possible effect, stops.
+  if (PHASE_GATE_ENABLED && CORE_HOLD_ON && tradingPhaseLocked()) {
+    if (Date.now() - (addDynamicSymbol._lastLockLog || 0) > 3600000) {
+      addDynamicSymbol._lastLockLog = Date.now();
+      console.log(`[JUPITER] Dynamic watchlist paused — trading is phase-locked, so a watchlist add ` +
+                  `cannot become a trade. Venus research and basket proposals continue.`);
+    }
+    return false;
+  }
   if (Object.keys(dynamicSymbols).length >= DYNAMIC_MAX_SYMBOLS) {
     console.log(`[JUPITER] Dynamic watchlist full (${DYNAMIC_MAX_SYMBOLS}) — skipping ${sym}`);
     return false;
@@ -4300,12 +4355,31 @@ async function addDynamicSymbol(sym, sig) {
   try {
     const start1m = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();    // see fetchCandles
     const start5m = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
-    const [b1, b5] = await Promise.all([
+    // .m1 MUST HOLD DECISION-TIMEFRAME BARS, and this path was putting MINUTE bars in
+    // it. fetchCandles is explicit that under DECISION_TIMEFRAME=1Hour the hourly
+    // series rides in .m1 and .m5 is deliberately deleted, because every indicator —
+    // ATR, ADX, EMA, RSI, RVOL, the trend gate — reads .m1 and the backtest proves the
+    // strategy with the decision series in exactly that field. Seeding a freshly added
+    // symbol with 1-minute bars instead understates ATR by roughly sqrt(60) ≈ 7x until
+    // the next 5-minute fetchCandles overwrites it. In that window the ATR floor, the
+    // 2.2xATR stop and the risk-based share count are all computed off a volatility
+    // estimate ~7x too small — which sizes the position ~7x too LARGE. Unreachable
+    // today only because the phase gate is shut; live the moment it opens.
+    const hourly = DECISION_TIMEFRAME === '1Hour';
+    const start1h = new Date(Date.now() - 21 * 24 * 60 * 60 * 1000).toISOString();
+    const [b1, b5, bh] = await Promise.all([
       fetchBars([sym], '1Min', start1m, 100),
-      fetchBars([sym], '5Min', start5m, 100)
+      hourly ? Promise.resolve({}) : fetchBars([sym], '5Min', start5m, 100),
+      hourly ? fetchBars([sym], '1Hour', start1h, 300) : Promise.resolve({})
     ]);
-    if (b1[sym]?.length) { candleData[sym] = candleData[sym] || {}; candleData[sym].m1 = b1[sym].slice(-60); }
-    if (b5[sym]?.length) { candleData[sym] = candleData[sym] || {}; candleData[sym].m5 = b5[sym].slice(-36); }
+    candleData[sym] = candleData[sym] || {};
+    if (hourly) {
+      if (bh[sym]?.length) { candleData[sym].m1 = bh[sym].slice(-60); delete candleData[sym].m5; }
+      candleData[sym].raw1m = b1[sym]?.length ? b1[sym].slice(-60) : undefined;   // gaps/diagnostics only
+    } else {
+      if (b1[sym]?.length) candleData[sym].m1 = b1[sym].slice(-60);
+      if (b5[sym]?.length) candleData[sym].m5 = b5[sym].slice(-36);
+    }
     // Seed tick history from candle closes so EMA/RSI are meaningful immediately
     if (b1[sym]?.length >= 15) marketData[sym].history = b1[sym].slice(-40).map(c => c.c);
   } catch (e) { /* candle warmup is best-effort */ }
@@ -6574,6 +6648,14 @@ function noteDailyRejection(reason) {
 //
 // Deliberately reports the comparison whether it flatters the bot or not. A scoreboard
 // you can only lose on is the only kind worth keeping.
+// MEASURED, NOT GUESSED. This was a hardcoded 0.0088 with no derivation anywhere in
+// the repo. The equal-weight 8-name daily standard deviation, computed over 338 real
+// sessions of cached bars (AAPL MSFT JNJ MRK KO JPM BAC XOM; PG and CVX have no
+// history in the cache), is 0.6797%. Overstating "normal" by 28% is the wrong
+// direction for the one line whose entire job is to tell the operator whether a move
+// is ordinary: at 0.88% a genuinely notable -0.94-sigma day reads as a routine 0.74.
+const BASKET_DAILY_SD = Math.max(0.001, parseFloat(process.env.BASKET_DAILY_SD || '0.0068'));
+
 function logPerformanceDigest() {
   const total = getTotalValue();
   const base  = startingCapital();
@@ -6595,7 +6677,7 @@ function logPerformanceDigest() {
               `(${pctMe >= 0 ? '+' : ''}${pctMe.toFixed(2)}%) since $${base.toFixed(0)}${bench}`);
   console.log(`[PERF] ${deployed.toFixed(1)}% invested across ${Object.keys(portfolio.coreHolding || {}).length} names` +
               `  ·  dividends collected $${_dividendsTotal.toFixed(2)}` +
-              `  ·  typical daily swing on this basket is about ±$${(total * 0.0088).toFixed(2)}`);
+              `  ·  typical daily swing on this basket is about ±$${(total * BASKET_DAILY_SD).toFixed(2)}`);
 }
 
 // Called at the session close. If the bot did not trade, this says what stopped it.
@@ -8938,8 +9020,18 @@ if (require.main === module) app.listen(PORT, async () => {
     const close = (session && Number.isFinite(session.close)) ? session.close : NASDAQ_NYSE_HOURS.end;
     if (hours < close) return;                                     // session still running
     if (_lastDigestDate === dateStr) return;                       // already reported today
+    // Mark BEFORE printing so a throw inside the digest cannot put this on a
+    // once-a-minute retry loop for the rest of the session — but never let the failure
+    // be silent. Losing a day's benchmark is survivable; losing it without knowing is
+    // how "we are hemorrhaging" survived nine days against a real figure of -$2.27.
     _lastDigestDate = dateStr;
-    logDailyTradeDigest();
+    try {
+      logDailyTradeDigest();
+    } catch (e) {
+      console.error(`[PERF] ⚠️ The ${dateStr} session digest FAILED to print: ${e && e.message}. ` +
+                    `That day's benchmark is lost — this is the line that tells you whether the ` +
+                    `account is tracking its basket or actually losing.`);
+    }
     queueSaveState();
   }, 60000);
 
@@ -9024,6 +9116,7 @@ module.exports = {
     getBenchmarkStart: () => _benchmarkStart, getDividendsTotal: () => _dividendsTotal,
     getLastDigestDate: () => _lastDigestDate, setLastDigestDate: (v) => { _lastDigestDate = v; },
     reseatTradingPeakAtBoot, unrealisedTradingLoss, coreHaltedByOperator,
+    BASKET_DAILY_SD, CALENDAR_MAX_AGE_MS,
     resetPeakReseatLatch: () => { _tradingPeakReseated = false; },
     AI_AUTH_FAIL_COOLDOWN_MS, getAiCooldownUntil: () => aiCooldownUntil,
     LLM_MAX_TOKENS, noteFinishReason, MAX_ARTICLES_PER_CALL,
