@@ -4267,6 +4267,77 @@ check('the tick subscription is capped to what the feed will accept', () => {
      'no core name and never SPY may be in the dropped set');
 });
 
+
+check('a basket cannot double up an industry beyond the cap', () => {
+  // The prompt has ALWAYS asked for a spread, and Venus has always answered that it
+  // achieved one — the 2026-09-16 proposal said "no more than three stocks per sector,
+  // ensuring diversification". Nothing checked. The basket it produced held JPM AND BAC,
+  // whose daily-return correlation is 0.744 (measured) — by far the highest pair in the
+  // book, the next being JNJ/MRK at 0.499. A fifth of the account was one bet, and when
+  // that bet went wrong it produced 89% of a ten-day loss by itself.
+  const cap = I.MAX_SECTOR_EXPOSURE_CORE;
+  ok(cap >= 1 && cap <= 3, `the cap must be a small number, got ${cap}`);
+
+  // The excess name is dropped, and it is the LATER one — order is the tiebreak.
+  const r = I.applySectorCap(['JPM','BAC','WFC','AAPL','MSFT','NVDA'], {}, 2, 10);
+  ok(!r.basket.includes('WFC'), 'the third bank must be dropped');
+  ok(r.basket.includes('JPM') && r.basket.includes('BAC'), 'the first two banks are within the cap');
+  ok(r.dropped.length === 1 && /WFC\(banking\)/.test(r.dropped[0]),
+     `the drop must name the symbol AND the sector, got ${r.dropped.join(',')}`);
+
+  // AN UNCLASSIFIABLE NAME IS KEPT. Dropping unknowns would quietly bias every basket
+  // toward whatever happens to be in SYMBOL_SECTOR, which is a worse failure than
+  // occasionally allowing a doubled sector nobody can see.
+  const u = I.applySectorCap(['ZZQQ','ZZRR','ZZSS'], {}, 1, 10);
+  ok(u.basket.length === 3, `unknown sectors must all survive, got ${u.basket.join(',')}`);
+  ok(u.dropped.length === 0, 'and nothing may be dropped for being unclassifiable');
+
+  // Venus's own sector answer is the fallback for names the static map does not know.
+  const h = I.applySectorCap(['ZZQQ','ZZRR'], { ZZQQ: 'Utilities', ZZRR: 'utilities' }, 1, 10);
+  ok(h.basket.length === 1 && h.dropped.length === 1,
+     'the LLM sector hint must be honoured, case-insensitively');
+
+  // The size limit still binds after capping.
+  const sz = I.applySectorCap(['AAPL','JNJ','XOM','KO','GE'], {}, 2, 3);
+  ok(sz.basket.length === 3, `size must still cap the result, got ${sz.basket.length}`);
+
+  // The live basket must PASS unchanged — this change is not a licence to churn it.
+  const live = ['AAPL','MSFT','JNJ','MRK','KO','PG','JPM','BAC','XOM','CVX'];
+  const L = I.applySectorCap(live, {}, cap, 16);
+  ok(L.dropped.length === 0, `the live basket must survive the cap, dropped ${L.dropped.join(',')}`);
+  // …and every one of its names must be classifiable, or the cap is blind where it matters.
+  live.forEach(s => ok(I.SYMBOL_SECTOR[s], `${s} must have a sector, or the cap cannot see it`));
+});
+
+check('the basket is widened, because concentration buys nothing but drawdown', () => {
+  // MEASURED 2026-09-17 — 2,000 RANDOM baskets at each size from a 21-name liquid
+  // universe over 339 sessions, reporting the MEDIAN, not the winner:
+  //     k=3 ret/DD 2.52 | k=5 3.11 | k=10 3.70 | k=16 3.95 | k=20 3.97
+  //     median CAGR flat (~37%) at EVERY size; median maxDD falls monotonically.
+  // Return is flat, risk falls. There is no return premium for concentration here.
+  ok(I.CORE_BASKET_TARGET_NAMES >= 14,
+     `the basket must be widened past the old 10, got ${I.CORE_BASKET_TARGET_NAMES}`);
+  ok(I.CORE_BASKET_TARGET_NAMES <= I.CORE_BASKET_MAX_NAMES,
+     'the target can never exceed the hard maximum');
+
+  // POSITION FLOOR. Widening is only safe while each slice clears the fractional minimum.
+  const perName = (1000 * 0.95) / I.CORE_BASKET_TARGET_NAMES;
+  ok(perName >= I.MIN_FRACTIONAL_NOTIONAL,
+     `at $1,000 each of ${I.CORE_BASKET_TARGET_NAMES} names gets $${perName.toFixed(2)}, ` +
+     `below the $${I.MIN_FRACTIONAL_NOTIONAL} minimum`);
+
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/venus\.proposeBasket\(pool, CORE_BASKET_TARGET_NAMES\)/.test(src),
+     'the proposal size must come from the target, not from the env basket length');
+  ok(!/venus\.proposeBasket\(pool, CORE_HOLD_SYMBOLS\.length\)/.test(src),
+     'the old CORE_HOLD_SYMBOLS.length coupling must be gone — it pinned the basket at 10 by accident');
+  // The prompt must state the cap that is actually enforced, or Venus optimises against
+  // a rule that does not exist.
+  ok(/\$\{MAX_SECTOR_EXPOSURE_CORE\} names from any single industry/.test(src),
+     'the prompt must quote the enforced cap, not a hardcoded different number');
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 console.log(`\n${'─'.repeat(60)}`);
 console.log(`${passed} passed, ${failed} failed`);

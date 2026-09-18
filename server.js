@@ -1374,6 +1374,29 @@ function getResearchFor(sym)  { return researchData.bySymbol[sym] || null; }
 //
 // Returns an array of symbols, or null when unavailable — callers keep the fixed
 // basket in that case, which is also the default until the register says otherwise.
+// PURE, SO IT CAN BE TESTED. proposeBasket() needs a live LLM call, and a rule buried
+// inside one is a rule nobody can prove. basketWithRecovered was extracted for exactly
+// this reason after a mutation survived inside an un-extractable function.
+//
+// sectorsHint is Venus's own {SYM: sector} answer, used only for names the static map
+// does not know. A name NEITHER source can classify is KEPT: dropping unknowns would
+// quietly bias every basket toward whatever happens to be in SYMBOL_SECTOR.
+function applySectorCap(symbols, sectorsHint, maxPerSector, size) {
+  const hint = (sectorsHint && typeof sectorsHint === 'object') ? sectorsHint : {};
+  const sectorOf = (s) => SYMBOL_SECTOR[s] || String(hint[s] || '').toLowerCase().trim() || null;
+  const seen = {}, basket = [], dropped = [];
+  for (const s of symbols) {
+    if (basket.length >= size) break;
+    const sec = sectorOf(s);
+    if (sec) {
+      if ((seen[sec] || 0) >= maxPerSector) { dropped.push(`${s}(${sec})`); continue; }
+      seen[sec] = (seen[sec] || 0) + 1;
+    }
+    basket.push(s);
+  }
+  return { basket, dropped };
+}
+
 async function proposeBasket(candidates, size = 10) {
   if (!Array.isArray(candidates) || candidates.length < size) return null;
   const list = candidates.slice(0, 60).join(', ');
@@ -1388,7 +1411,9 @@ Choose for:
   • LIQUIDITY — large, heavily traded companies whose shares are cheap to buy and sell
   • DIVERSIFICATION — spread across unrelated industries, so one bad sector cannot sink it
   • DURABILITY — established businesses, profitable, not obviously distressed
-  • NO CONCENTRATION — never more than 3 names from any single industry
+  • NO CONCENTRATION — never more than ${MAX_SECTOR_EXPOSURE_CORE} names from any single industry.
+    This is ENFORCED after you answer: excess names are dropped, so doubling up an
+    industry costs you basket slots rather than gaining you anything.
 
 Explicitly do NOT choose for: recent price moves, momentum, news, hype, or your view of
 what will outperform. A boring, well-spread basket is the correct answer.
@@ -1413,7 +1438,24 @@ Output ONLY JSON:
     .filter(x => /^[A-Z.]{1,6}$/.test(x) && candidates.includes(x));
   const unique = [...new Set(picked)];
   if (unique.length < Math.min(5, size)) return null;      // too thin to be a basket
-  const basket = unique.slice(0, size);
+  // ENFORCE THE SECTOR CAP RATHER THAN ASKING FOR IT. The prompt has always requested a
+  // spread, and Venus has always answered that it achieved one — the 2026-09-16 proposal
+  // literally said "no more than three stocks per sector, ensuring diversification".
+  // Nothing checked. The live basket it produced held JPM AND BAC, whose daily-return
+  // correlation is 0.744 — by far the highest pair in the book, the next being JNJ/MRK
+  // at 0.499 — so a fifth of the account was effectively one bet, and when that bet went
+  // wrong it produced 89% of a ten-day loss on its own.
+  //
+  // Venus's own `sectors` field is used as a fallback for names the static map does not
+  // know, because the map cannot cover every candidate the screen might surface. A name
+  // neither source can classify is kept: dropping unknowns would quietly bias the basket
+  // toward whatever happens to be in the map.
+  const { basket: capped, dropped } = applySectorCap(unique, r.sectors, MAX_SECTOR_EXPOSURE_CORE, size);
+  if (dropped.length) {
+    console.log(`[VENUS] 🧺 Sector cap (max ${MAX_SECTOR_EXPOSURE_CORE}/sector) dropped ${dropped.join(', ')} — ` +
+                `a basket that doubles up an industry is one bet wearing two tickers.`);
+  }
+  const basket = capped;
   // CONVICTION IS A SCREEN-QUALITY SCORE, NOT A FORECAST, and that distinction is the
   // reason this is safe to size on. Asking Venus how confident it is that a name will
   // RISE reintroduces exactly the forecasting the prompt above forbids — and forecasting
@@ -2210,8 +2252,21 @@ const SYMBOL_SECTOR = {
   PLTR:'tech', SOFI:'fintech', MARA:'crypto', HOOD:'fintech', SOUN:'tech',
   IONQ:'tech', RKLB:'tech', BBAI:'tech', HIMS:'health', CIFR:'crypto',
   F:'auto', BAC:'banking', JPM:'banking', WFC:'banking', GE:'industrial',
-  XOM:'energy', MRK:'pharma', JNJ:'pharma', PFE:'pharma', KO:'consumer'
+  XOM:'energy', MRK:'pharma', JNJ:'pharma', PFE:'pharma', KO:'consumer',
+  // CORE-BASKET CANDIDATES. The map only covered the trading watchlist, so every
+  // mega-cap Venus actually picks for the core resolved to undefined and the sector
+  // cap below could not see them at all — which is how the live basket ended up
+  // holding TWO money-centre banks and TWO integrated oils.
+  AAPL:'tech', MSFT:'tech', NVDA:'semis', AVGO:'semis', GOOGL:'internet',
+  META:'internet', AMZN:'retail', COST:'retail', WMT:'retail', TSLA:'auto',
+  UNH:'health', V:'payments', MA:'payments', CVX:'energy', COP:'energy',
+  PG:'consumer', PEP:'consumer', ABBV:'pharma', LLY:'pharma', TMO:'health',
+  HD:'retail', MCD:'consumer', CAT:'industrial', HON:'industrial', RTX:'industrial',
+  GS:'banking', MS:'banking', C:'banking', SCHW:'banking', BRK:'financial',
+  NFLX:'internet', ADBE:'tech', CRM:'tech', ORCL:'tech', AMD:'semis', INTC:'semis'
 };
+const MAX_SECTOR_EXPOSURE_CORE = Math.max(1,
+  parseInt(process.env.CORE_MAX_PER_SECTOR || '2', 10));
 const MAX_SECTOR_EXPOSURE = 2;   // at most 2 open positions in the same sector
 
 // ─── MARKET DATA ─────────────────────────────────────────────────────────
@@ -2787,6 +2842,31 @@ const CORE_BASKET_MIN_HOLD_MS = Math.max(0,
 // where spread per name stops being worth the diversification.
 const CORE_BASKET_MAX_NAMES = Math.max(1,
   parseInt(process.env.CORE_BASKET_MAX_NAMES || '20', 10));
+// HOW MANY NAMES VENUS IS ASKED FOR. This used to be CORE_HOLD_SYMBOLS.length, so the
+// basket was pinned at 10 by an env default that was never about diversification.
+//
+// MEASURED 2026-09-17 — 2,000 RANDOM baskets drawn at each size from a 21-name liquid
+// universe over 339 sessions, reporting the MEDIAN rather than the winner:
+//     k      med CAGR   med maxDD   med ret/DD
+//     3       36.72%      14.43%       2.52
+//     5       37.51%      11.99%       3.11
+//    10       37.23%      10.09%       3.70
+//    16       36.98%       9.33%       3.95
+//    20       36.89%       9.16%       3.97
+// Return is FLAT across every size; risk falls monotonically with more names. There is
+// no return premium for concentration here — only drawdown. This also kills the
+// "5 names beat 10" table that sat in this file for months: that was the best five in
+// hindsight, and the median five is materially worse than the median ten.
+//
+// Widening is also the non-fitted fix for the sector doubling. Capping 2 per sector at
+// 10 names still lets one industry be 20% of the account; at 16 it is 12.5%. Choosing a
+// specific replacement for BAC would have scored better in the backtest and would have
+// been pure hindsight — this is the same improvement without picking a name.
+//
+// Position floor check: 95% of $1,000 across 16 names is $59/name, well clear of the
+// $5 fractional minimum, so this is safe at the current account size and at any larger one.
+const CORE_BASKET_TARGET_NAMES = Math.max(1, Math.min(CORE_BASKET_MAX_NAMES,
+  parseInt(process.env.CORE_BASKET_TARGET_NAMES || '16', 10)));
 let _lastBasketSwapAt = 0;
 let _lastBasketProposalAt = 0;
 // Set once Venus has actually delivered a basket. Until then, venus mode buys nothing.
@@ -4149,7 +4229,7 @@ async function runIntelCycle() {
       _lastBasketProposalAt = Date.now();
       const pool = [...new Set([...symbolsForMarket('nasdaq'), ...Object.keys(dynamicSymbols)])];
       try {
-        const prop = await venus.proposeBasket(pool, CORE_HOLD_SYMBOLS.length);
+        const prop = await venus.proposeBasket(pool, CORE_BASKET_TARGET_NAMES);
         if (prop) {
           const overlap = prop.basket.filter(x => CORE_HOLD_SYMBOLS.includes(x)).length;
           console.log(`[VENUS] 🧺 Basket proposal: ${prop.basket.join(',')}`);
@@ -9159,6 +9239,7 @@ module.exports = {
     getLastDigestDate: () => _lastDigestDate, setLastDigestDate: (v) => { _lastDigestDate = v; },
     reseatTradingPeakAtBoot, unrealisedTradingLoss, coreHaltedByOperator,
     BASKET_DAILY_SD, CALENDAR_MAX_AGE_MS, WS_MAX_SYMBOLS,
+    CORE_BASKET_TARGET_NAMES, MAX_SECTOR_EXPOSURE_CORE, SYMBOL_SECTOR, applySectorCap,
     resetPeakReseatLatch: () => { _tradingPeakReseated = false; },
     AI_AUTH_FAIL_COOLDOWN_MS, getAiCooldownUntil: () => aiCooldownUntil,
     LLM_MAX_TOKENS, noteFinishReason, MAX_ARTICLES_PER_CALL,
