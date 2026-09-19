@@ -2867,6 +2867,29 @@ const CORE_BASKET_MAX_NAMES = Math.max(1,
 // $5 fractional minimum, so this is safe at the current account size and at any larger one.
 const CORE_BASKET_TARGET_NAMES = Math.max(1, Math.min(CORE_BASKET_MAX_NAMES,
   parseInt(process.env.CORE_BASKET_TARGET_NAMES || '16', 10)));
+
+// THE BASKET MUST BE CHOSEN FROM A QUALITY POOL, NOT THE TRADING WATCHLIST.
+// v12.63 widened the basket to 16 on a measurement run over 21 LIQUID LARGE-CAPS. The
+// live pool was symbolsForMarket('nasdaq') — the TRADING watchlist — which is
+// PLTR SOFI MARA HOOD SOUN IONQ RKLB BBAI HIMS CIFR plus ten NYSE names. Ten of its
+// twenty-six entries are speculative small and mid caps, so asking for 16 names FORCED
+// Venus down into them. Observed immediately, 2026-09-17:
+//     [VENUS] 🧺 Basket proposal: AAPL,MSFT,JPM,BAC,XOM,CVX,JNJ,MRK,KO,WMT,F,GE,MARA
+// A crypto miner in a basket meant to be held for months, because the pool ran out of
+// large caps. The measurement did not transfer, and that is on the widening, not on Venus.
+//
+// The two universes have genuinely different jobs and conflating them was the defect:
+// the watchlist exists to surface speculative SHORT-HORIZON ideas for the trading side;
+// the basket is the durable holding. Bessembinder (2018, CRSP 1926-2016) is the reason
+// this matters more than it looks — four of every seven US stocks have LIFETIME returns
+// below one-month T-bills, and that skew is worst in small caps. Reaching further down
+// the quality ladder to fill basket slots is reaching into the half of the distribution
+// that loses to cash.
+const CORE_BASKET_POOL = (process.env.CORE_BASKET_POOL ||
+  'AAPL,MSFT,ADBE,ORCL,CRM,NVDA,AVGO,AMD,GOOGL,META,AMZN,NFLX,' +
+  'WMT,COST,HD,PG,KO,PEP,MCD,JNJ,MRK,LLY,ABBV,PFE,UNH,TMO,' +
+  'JPM,BAC,WFC,GS,MS,V,MA,XOM,CVX,COP,GE,CAT,HON,RTX')
+  .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
 let _lastBasketSwapAt = 0;
 let _lastBasketProposalAt = 0;
 // Set once Venus has actually delivered a basket. Until then, venus mode buys nothing.
@@ -4227,7 +4250,9 @@ async function runIntelCycle() {
     // afterwards is how six false edges got believed in this project.
     if (CORE_HOLD_ON && Date.now() - _lastBasketProposalAt > BASKET_PROPOSAL_INTERVAL_MS) {
       _lastBasketProposalAt = Date.now();
-      const pool = [...new Set([...symbolsForMarket('nasdaq'), ...Object.keys(dynamicSymbols)])];
+      // Quality pool only. Dynamics are deliberately EXCLUDED: they are short-horizon
+      // speculative ideas by construction, and the basket is a months-long holding.
+      const pool = [...new Set([...CORE_BASKET_POOL, ...CORE_HOLD_SYMBOLS])];
       try {
         const prop = await venus.proposeBasket(pool, CORE_BASKET_TARGET_NAMES);
         if (prop) {
@@ -9239,7 +9264,7 @@ module.exports = {
     getLastDigestDate: () => _lastDigestDate, setLastDigestDate: (v) => { _lastDigestDate = v; },
     reseatTradingPeakAtBoot, unrealisedTradingLoss, coreHaltedByOperator,
     BASKET_DAILY_SD, CALENDAR_MAX_AGE_MS, WS_MAX_SYMBOLS,
-    CORE_BASKET_TARGET_NAMES, MAX_SECTOR_EXPOSURE_CORE, SYMBOL_SECTOR, applySectorCap,
+    CORE_BASKET_TARGET_NAMES, MAX_SECTOR_EXPOSURE_CORE, SYMBOL_SECTOR, applySectorCap, CORE_BASKET_POOL,
     resetPeakReseatLatch: () => { _tradingPeakReseated = false; },
     AI_AUTH_FAIL_COOLDOWN_MS, getAiCooldownUntil: () => aiCooldownUntil,
     LLM_MAX_TOKENS, noteFinishReason, MAX_ARTICLES_PER_CALL,

@@ -4338,6 +4338,61 @@ check('the basket is widened, because concentration buys nothing but drawdown', 
      'the prompt must quote the enforced cap, not a hardcoded different number');
 });
 
+
+check('the basket is chosen from a quality pool, not the trading watchlist', () => {
+  // v12.63 widened the basket to 16 on a measurement run over 21 LIQUID LARGE-CAPS, but
+  // the live pool was the TRADING watchlist — ten of whose twenty-six entries are
+  // speculative small and mid caps. Asking for 16 FORCED Venus down into them, and the
+  // very first proposal after the change came back as:
+  //   AAPL,MSFT,JPM,BAC,XOM,CVX,JNJ,MRK,KO,WMT,F,GE,MARA
+  // A crypto miner in a basket meant to be held for months. The two universes have
+  // different jobs: the watchlist surfaces short-horizon speculative ideas; the basket
+  // is the durable holding. Bessembinder's CRSP work is why the direction matters —
+  // four of every seven US stocks have LIFETIME returns below one-month T-bills, and
+  // that skew is worst in small caps, so reaching down the quality ladder to fill slots
+  // reaches into the half of the distribution that loses to cash.
+  const pool = I.CORE_BASKET_POOL;
+  ok(Array.isArray(pool) && pool.length >= 24, `the pool must be deep enough to fill the basket, got ${pool.length}`);
+
+  // The speculative watchlist must not be reachable from the basket at all.
+  const speculative = ['MARA','SOUN','IONQ','BBAI','CIFR','HIMS','PLTR','SOFI','HOOD','RKLB'];
+  const leaked = pool.filter(s => speculative.includes(s));
+  ok(leaked.length === 0, `speculative names must not be basket candidates, found ${leaked.join(',')}`);
+
+  // Every candidate must be classifiable, or the sector cap is blind exactly where it
+  // is being asked to work.
+  const blind = pool.filter(s => !I.SYMBOL_SECTOR[s]);
+  ok(blind.length === 0, `every pool name needs a sector, missing ${blind.join(',')}`);
+
+  // The pool must be able to FILL the target within the cap, or the basket silently
+  // comes up short every cycle: sectors x cap must cover the target.
+  const sectors = new Set(pool.map(s => I.SYMBOL_SECTOR[s]));
+  ok(sectors.size * I.MAX_SECTOR_EXPOSURE_CORE >= I.CORE_BASKET_TARGET_NAMES,
+     `${sectors.size} sectors x cap ${I.MAX_SECTOR_EXPOSURE_CORE} cannot fill ${I.CORE_BASKET_TARGET_NAMES} slots`);
+
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/const pool = \[\.\.\.new Set\(\[\.\.\.CORE_BASKET_POOL, \.\.\.CORE_HOLD_SYMBOLS\]\)\];/.test(src),
+     'the proposal must draw from the quality pool plus what is already held');
+  ok(!/const pool = \[\.\.\.new Set\(\[\.\.\.symbolsForMarket\('nasdaq'\)/.test(src),
+     'the trading-watchlist pool must be gone');
+  // Dynamics are short-horizon by construction and must not reach a months-long holding.
+  const call = src.slice(src.indexOf('const pool = [...new Set([...CORE_BASKET_POOL'), 0) &&
+               src.slice(src.indexOf('const pool = [...new Set([...CORE_BASKET_POOL'),
+                         src.indexOf('const pool = [...new Set([...CORE_BASKET_POOL') + 200);
+  ok(!/dynamicSymbols/.test(call), 'dynamic symbols must not be basket candidates');
+
+  // BEHAVIOURAL — a quality pool plus the cap yields a spread basket with no junk.
+  const r = I.applySectorCap(pool, {}, I.MAX_SECTOR_EXPOSURE_CORE, I.CORE_BASKET_TARGET_NAMES);
+  ok(r.basket.length === I.CORE_BASKET_TARGET_NAMES,
+     `the pool must actually fill the basket, got ${r.basket.length}`);
+  const secCount = {};
+  r.basket.forEach(s => { const k = I.SYMBOL_SECTOR[s]; secCount[k] = (secCount[k]||0)+1; });
+  Object.entries(secCount).forEach(([k,n]) =>
+    ok(n <= I.MAX_SECTOR_EXPOSURE_CORE, `sector ${k} has ${n} names, over the cap`));
+  ok(Object.keys(secCount).length >= 8, `a 16-name basket must span many sectors, got ${Object.keys(secCount).length}`);
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 console.log(`\n${'─'.repeat(60)}`);
 console.log(`${passed} passed, ${failed} failed`);
