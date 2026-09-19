@@ -2669,8 +2669,23 @@ const CORE_HOLD_ON       = CORE_HOLD_FRACTION > 0;
 // 50% core the whole $1000 earns 8.8%/yr instead of the basket's 17.6%, and the wait
 // for the gate to open doubles as a direct result. Phase 1 therefore holds nearly
 // everything and steps back down to CORE_HOLD_FRACTION the moment trading unlocks.
-const CORE_PHASE1_FRACTION = Math.max(0, Math.min(0.95,
-  parseFloat(process.env.CORE_PHASE1_FRACTION || '0.95')));
+// THE 0.95 CEILING WAS NEVER DERIVED — it was a round number, and it costs real money.
+// Measured over 339 sessions (coreguard run, control = 100% invested equal-weight hold):
+//     9pp idle cash  -> -6.10% terminal value
+//    19pp idle cash  -> -12.20%
+//    40pp idle cash  -> -24.40%
+// That is -0.643% of terminal value per percentage point of idle cash over the 1.34-year
+// window, or about -0.48%/yr per point. Idle cash is the largest measured drag in this
+// system and the ONLY one that can be removed without taking on any extra risk.
+//
+// At 0.97 a $10,000 account holds $300 rather than $500 in cash — worth roughly
+// $8/month — while still leaving SIXTY times the $5 minimum order as working buffer.
+// The ceiling goes to 0.98 so the operator can push further; the default stops at 0.97
+// because the engine genuinely needs cash to function: coreBuyStep() cannot act on a
+// drifted weight without it, and a buffer that thin turns every dividend and every
+// rounding remainder into the difference between topping up and sitting still.
+const CORE_PHASE1_FRACTION = Math.max(0, Math.min(0.98,
+  parseFloat(process.env.CORE_PHASE1_FRACTION || '0.97')));
 // Only top up when meaningfully below target, so a drifting price does not generate
 // a stream of tiny orders that pay spread for nothing.
 const CORE_REBALANCE_BAND = 0.10;

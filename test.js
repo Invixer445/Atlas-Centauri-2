@@ -4393,6 +4393,39 @@ check('the basket is chosen from a quality pool, not the trading watchlist', () 
   ok(Object.keys(secCount).length >= 8, `a 16-name basket must span many sectors, got ${Object.keys(secCount).length}`);
 });
 
+
+check('idle cash is minimised, because it is the only drag removable at zero risk', () => {
+  // MEASURED over 339 sessions (coreguard run, control = 100% invested EW hold):
+  //    9pp idle cash -> -6.10% terminal value | 19pp -> -12.20% | 40pp -> -24.40%
+  // = -0.643% of terminal value per percentage point of idle cash over the 1.34yr
+  // window, ~-0.48%/yr per point. The old 0.95 ceiling was a round number with no
+  // derivation anywhere in the repo; at $10,000 it left $500 earning nothing.
+  ok(I.CORE_PHASE1_FRACTION >= 0.96,
+     `phase-1 must hold nearly everything, got ${I.CORE_PHASE1_FRACTION}`);
+  ok(I.CORE_PHASE1_FRACTION <= 0.98,
+     'but never so much that the engine has no working cash');
+
+  // THE BUFFER MUST STAY USABLE AT THE SMALL END. coreBuyStep() cannot act on a drifted
+  // weight without cash, so the remainder has to clear the minimum order by a real
+  // margin even on a $1,000 account — not just on a comfortable one.
+  const smallAcct = 1000 * (1 - I.CORE_PHASE1_FRACTION);
+  ok(smallAcct >= I.MIN_FRACTIONAL_NOTIONAL * 3,
+     `at $1,000 the cash buffer is $${smallAcct.toFixed(2)}, under 3x the $${I.MIN_FRACTIONAL_NOTIONAL} minimum order`);
+
+  // EVERY NAME MUST STILL BE BUYABLE at the widened basket size on a small account,
+  // or widening quietly starves the tail of the basket.
+  const perName = (1000 * I.CORE_PHASE1_FRACTION) / I.CORE_BASKET_TARGET_NAMES;
+  ok(perName >= I.MIN_FRACTIONAL_NOTIONAL * 2,
+     `$${perName.toFixed(2)} per name at $1,000 is too close to the $${I.MIN_FRACTIONAL_NOTIONAL} floor`);
+
+  // The unlock step-down must remain executable: the core falls from phase-1 to the
+  // floor through the ORDINARY trim, which only acts once a name is CORE_TRIM_BAND above
+  // target. Raising phase-1 widens that gap, so this should still hold — but it is
+  // exactly the kind of coupling that breaks silently.
+  ok(I.unlockStepDownIsActionable(),
+     'the unlock step-down must still be large enough for the trim to execute it');
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 console.log(`\n${'─'.repeat(60)}`);
 console.log(`${passed} passed, ${failed} failed`);
