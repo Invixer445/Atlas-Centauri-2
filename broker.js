@@ -171,8 +171,13 @@ function makeAlpacaBroker() {
       const r = await httpsJson('GET', `${base}/v2/account`, headers, null);
       if (!r.ok) return { ok: false, error: r.error, status: r.status };
       const a = r.data;
+      // IDENTITY, NOT JUST NUMBERS. Saved state is keyed to an account; point the same
+      // volume at a DIFFERENT Alpaca account and every baseline in it (starting capital,
+      // the benchmark anchor, the peaks, the core lots) describes somebody else's money.
+      // The id is what lets the engine notice, so it is returned with the balances.
       return { ok: true, cash: parseFloat(a.cash), equity: parseFloat(a.equity),
                buying_power: parseFloat(a.buying_power), status: a.status,
+               id: a.id || null, account_number: a.account_number || null,
                pattern_day_trader: a.pattern_day_trader };
     },
     // Official NYSE/NASDAQ trading calendar — real holidays and early closes.

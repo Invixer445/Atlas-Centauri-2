@@ -2315,8 +2315,19 @@ check('the tilt reaches sizing, and buying and trimming use the SAME weights', (
      'the top-up must measure each name against its OWN share, not the flat average');
   ok(/coreTarget \* \(Number\.isFinite\(w\[sym\]\) \? w\[sym\] : 1 \/ nEq\)/.test(over),
      'the trim target must be the tilted share, not a flat slice');
-  ok(/const frac = \(Number\.isFinite\(share\) && share > 0\) \? share : 1 \/ n;/.test(size),
+  ok(/\(Number\.isFinite\(share\) && share > 0\) \? share : 1 \/ n/.test(size),
      'coreTopUpQty must honour the share it is given');
+  // BEHAVIOURAL, NOT JUST TEXTUAL. v12.65 put an affordability branch in front of the
+  // share, and a regex alone cannot tell "the tilt is honoured" from "the tilt is
+  // reachable but always skipped". At a size that funds the whole basket the tilted name
+  // must get a visibly bigger slice than the flat one, or the tilt is decoration.
+  if (I.CORE_HOLD_ON) {
+    const tv = 100000, names = I.CORE_HOLD_SYMBOLS.length;
+    const flat = I.coreTopUpQty(100, tv, 0, tv, names, null) * 100;
+    const big  = I.coreTopUpQty(100, tv, 0, tv, names, (1 / names) * 1.5) * 100;
+    ok(big > flat * 1.4,
+       `a 1.5x share must buy ~1.5x the notional: flat $${flat.toFixed(2)} vs tilted $${big.toFixed(2)}`);
+  }
   ok(/mostUnderweightCore\(\)/.test(src) && /pick\.share\)/.test(src),
      'the buy path must pass the pick\'s share through to sizing');
 
@@ -3253,8 +3264,12 @@ check('a recovered holding is not force-sold by a proposal that never knew it ex
   ok(/_recoveredSymbols\.add\(bp\.symbol\);/.test(src),
      'a holding ATLAS FOUND rather than chose must be marked as recovered');
   const branch = blockAfter(src, "if (CORE_BASKET_SOURCE === 'venus' && maySwap) {");
-  ok(/basketWithRecovered\(prop\.basket, _recoveredSymbols, portfolio\.coreHolding\)/.test(branch),
+  ok(/basketWithRecovered\(prop\.basket, _recoveredSymbols, portfolio\.coreHolding, unionCap\)/.test(branch),
      'the swap must merge recovered holdings before replacing the basket');
+  // The union's ceiling must be what the ACCOUNT can fund, not the static maximum —
+  // otherwise a broker full of strays widens the basket straight back past the balance.
+  ok(/const unionCap = affordableBasketNames\(getTotalValue\(\), CORE_BASKET_MAX_NAMES\);/.test(branch),
+     'the carried-holdings cap must be account-relative, not the raw CORE_BASKET_MAX_NAMES');
   ok(/CORE_HOLD_SYMBOLS\.push\(\.\.\.merged\.basket\)/.test(branch),
      'the MERGED basket, not the raw proposal, must become the live basket');
   // ONE CYCLE OF GRACE. Without the clear, a recovered name could never be dropped —
@@ -4321,15 +4336,15 @@ check('the basket is widened, because concentration buys nothing but drawdown', 
      'the target can never exceed the hard maximum');
 
   // POSITION FLOOR. Widening is only safe while each slice clears the fractional minimum.
-  const perName = (1000 * 0.95) / I.CORE_BASKET_TARGET_NAMES;
+  const perName = (1000 * I.CORE_PHASE1_FRACTION) / I.CORE_BASKET_TARGET_NAMES;
   ok(perName >= I.MIN_FRACTIONAL_NOTIONAL,
      `at $1,000 each of ${I.CORE_BASKET_TARGET_NAMES} names gets $${perName.toFixed(2)}, ` +
      `below the $${I.MIN_FRACTIONAL_NOTIONAL} minimum`);
 
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
                 .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
-  ok(/venus\.proposeBasket\(pool, CORE_BASKET_TARGET_NAMES\)/.test(src),
-     'the proposal size must come from the target, not from the env basket length');
+  ok(/const askFor = affordableBasketNames\(\);/.test(src) && /venus\.proposeBasket\(pool, askFor\)/.test(src),
+     'the proposal size must come from what the account can fund, not from the env basket length');
   ok(!/venus\.proposeBasket\(pool, CORE_HOLD_SYMBOLS\.length\)/.test(src),
      'the old CORE_HOLD_SYMBOLS.length coupling must be gone — it pinned the basket at 10 by accident');
   // The prompt must state the cap that is actually enforced, or Venus optimises against
@@ -4424,6 +4439,393 @@ check('idle cash is minimised, because it is the only drag removable at zero ris
   // exactly the kind of coupling that breaks silently.
   ok(I.unlockStepDownIsActionable(),
      'the unlock step-down must still be large enough for the trim to execute it');
+});
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  v12.65 — THE ACCOUNT SIZE IS AN INPUT, NOT AN ASSUMPTION
+// ════════════════════════════════════════════════════════════════════════════
+group('v12.65 — any account size');
+
+// Run a probe with the core holding switched ON. Almost every core path is gated on
+// CORE_HOLD_ON, which is FALSE in the default config, so an in-process assertion about
+// core sizing tests nothing at all — it returns 0 at the first line and passes.
+function coreProbe(body, extraEnv = {}) {
+  const probe = `
+    const I = require('${require('path').join(__dirname, 'server.js').replace(/\\/g, '/')}')._internals;
+    ${body}
+  `;
+  const out = require('child_process').execFileSync(process.execPath, ['-e', probe], {
+    env: { ...process.env, CORE_HOLD_FRACTION: '0.5', ...extraEnv },
+    encoding: 'utf8', timeout: 60000,
+  });
+  return JSON.parse(out.trim().split('\n').filter(l => l.startsWith('{')).pop());
+}
+
+check('a small account buys SOMETHING instead of silently buying nothing', () => {
+  // THE BUG, REPRODUCED. 16 names at a 97% core weight is totalValue/16.49 per slice.
+  // Below $82.47 that is under MIN_FRACTIONAL_NOTIONAL, so coreTopUpQty returned 0 for
+  // EVERY name and the account sat in 100% cash forever — no error, no warning, no
+  // order. Measured against v12.64: $80 bought nothing, $83 bought $5.03. The ten-name
+  // env default has the same wall at $51.55.
+  const r = coreProbe(`
+    const out = {};
+    for (const tv of [40, 50, 100, 250, 1000, 10000]) {
+      out['s' + tv] = I.coreTopUpQty(100, tv, 0, tv, 16, null) * 100;
+    }
+    out.floor = I.MIN_FRACTIONAL_NOTIONAL;
+    console.log(JSON.stringify(out));
+  `);
+  for (const tv of [50, 100, 250, 1000, 10000]) {
+    ok(r['s' + tv] >= r.floor,
+       `a $${tv} account must open a position worth at least $${r.floor}, got $${r['s' + tv].toFixed(2)}`);
+  }
+  // And it must still refuse when the account genuinely cannot fund ONE position.
+  // Shrinking to one name is the floor; inventing an order below the broker's minimum
+  // is not, and "buy something" must never become "buy dust".
+  ok(r.s40 === 0 || r.s40 >= r.floor,
+     `a $40 account must either fund a real position or buy nothing, got $${r.s40.toFixed(2)}`);
+});
+
+check('the basket narrows to what the balance can fund, and widens back as it grows', () => {
+  const r = coreProbe(`
+    const out = { minSlice: I.coreMinSlice(), floor: I.MIN_FRACTIONAL_NOTIONAL,
+                  target: I.CORE_BASKET_TARGET_NAMES, rows: [] };
+    out.dust = [1, 5, 9].map(tv => [tv, I.affordableBasketNames(tv, I.CORE_BASKET_TARGET_NAMES),
+                                        I.coreTopUpQty(100, tv, 0, tv, I.CORE_BASKET_TARGET_NAMES, null) * 100]);
+    for (const tv of [20, 50, 100, 250, 500, 1000, 10000, 1000000]) {
+      out.rows.push([tv, I.affordableBasketNames(tv, I.CORE_BASKET_TARGET_NAMES), I.effectiveCoreFraction()]);
+    }
+    out.zero = I.affordableBasketNames(0, I.CORE_BASKET_TARGET_NAMES);
+    out.nan  = I.affordableBasketNames(NaN, I.CORE_BASKET_TARGET_NAMES);
+    console.log(JSON.stringify(out));
+  `);
+  let prev = 0;
+  for (const [tv, n, frac] of r.rows) {
+    ok(n >= 1, `$${tv} must still propose at least one name, got ${n}`);
+    ok(n <= r.target, `$${tv} proposed ${n} names, above the ${r.target} target`);
+    ok(n >= prev, `the basket must never NARROW as the account grows: $${tv} gave ${n} after ${prev}`);
+    prev = n;
+    // Every name it proposes must be fundable, or the narrowing did not do its job.
+    if (n > 1) {
+      const slice = (tv * frac) / n;
+      ok(slice >= r.minSlice,
+         `$${tv} across ${n} names is $${slice.toFixed(2)} a slice, under the $${r.minSlice} minimum`);
+    }
+  }
+  // A missing equity reading is IGNORANCE, not a tiny account. Shrinking on it would
+  // mean every boot before the first quote proposed a one-name portfolio.
+  ok(r.zero === r.target && r.nan === r.target,
+     `no equity reading must leave the target alone, got ${r.zero} / ${r.nan}`);
+
+  // AN ACCOUNT TOO SMALL FOR EVEN ONE FULL SLICE MUST STILL SAY "ONE", NOT "NONE".
+  // Measured with the floor removed: zero names makes the per-name fraction 1/0, so the
+  // target is Infinity, so `gap <= target * band` is Infinity <= Infinity — true — and
+  // coreTopUpQty returns 0. A $9 account that buys an $8 position with the floor in
+  // place buys NOTHING without it. Rounding the name count down to zero reintroduces
+  // exactly the silent stall this whole function exists to remove, one size lower.
+  for (const [tv, n, qty] of r.dust) {
+    eq(n, 1, `a $${tv} account must narrow to one name, not zero`);
+    ok(qty === 0 || qty >= r.floor,
+       `a $${tv} account must buy nothing rather than dust, got $${qty.toFixed(2)}`);
+  }
+
+  // HEADROOM, NOT JUST CLEARANCE. A slice sitting EXACTLY on the broker minimum is
+  // buyable once and then permanently stuck: it cannot be topped up, and one tick down
+  // in account value makes every name in the basket unbuyable at the same instant.
+  ok(r.minSlice >= r.floor * 1.5,
+     `the minimum slice $${r.minSlice} must leave real room above the $${r.floor} broker floor`);
+});
+
+check('narrowing the basket does not quietly become a concentration policy', () => {
+  // The affordability branch overrides the conviction tilt, so it MUST NOT engage at
+  // sizes that can fund the whole basket — otherwise it silently flattens the weighting
+  // on every normal account. $250 already funds 16 names at $15 each.
+  const r = coreProbe(`
+    console.log(JSON.stringify({
+      at250:   I.affordableBasketNames(250,   I.CORE_BASKET_TARGET_NAMES),
+      at1k:    I.affordableBasketNames(1000,  I.CORE_BASKET_TARGET_NAMES),
+      at10k:   I.affordableBasketNames(10000, I.CORE_BASKET_TARGET_NAMES),
+      target:  I.CORE_BASKET_TARGET_NAMES,
+      tilted:  I.coreTopUpQty(100, 10000, 0, 10000, 16, (1 / 16) * 1.5) * 100,
+      flat:    I.coreTopUpQty(100, 10000, 0, 10000, 16, null) * 100,
+    }));
+  `);
+  ok(r.at250 === r.target && r.at1k === r.target && r.at10k === r.target,
+     `the full basket must be funded from $250 up, got ${r.at250}/${r.at1k}/${r.at10k}`);
+  ok(r.tilted > r.flat * 1.4,
+     `the tilt must survive at a fundable size: flat $${r.flat.toFixed(2)} vs tilted $${r.tilted.toFixed(2)}`);
+});
+
+check('the trading floor scales with the account instead of pretending every account is $1,000', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(!/capitalSystem\.tradingCapital < 50\b/.test(src),
+     'the bare `tradingCapital < 50` literal must be gone');
+  ok(/if \(capitalSystem\.tradingCapital < minimumTradingCapital\(\)\) return;/.test(src),
+     'the entry gate must ask minimumTradingCapital()');
+
+  const prev = I.startingCapital();
+  try {
+    // AT THE SIZE IT WAS WRITTEN FOR, THE NUMBER IS UNCHANGED. A floor that quietly
+    // moved on the account it already ran on would be a behaviour change dressed as a
+    // portability fix.
+    I.detectStartingCapital(1000, { force: true });
+    near(I.minimumTradingCapital(), 50, 1e-9, 'at $1,000 the floor must still be exactly $50');
+    // And it must stay strictly below the unlock bar at EVERY size, or trading could
+    // unlock into a book the floor immediately forbids it from using.
+    for (const s of [100, 1000, 10000, 100000, 1000000]) {
+      I.detectStartingCapital(s, { force: true });
+      const floor = I.minimumTradingCapital(), bar = I.tradingUnlockThreshold();
+      ok(floor > 0 && Number.isFinite(floor), `$${s}: floor must be a real number, got ${floor}`);
+      ok(floor < bar, `$${s}: floor $${floor.toFixed(2)} must sit below the $${bar.toFixed(2)} unlock bar`);
+      // It must also be able to fund one minimum position after the reserve.
+      ok(floor * (1 - I.capitalSystem.reserveRatio) >= I.MIN_FRACTIONAL_NOTIONAL - 1e-9,
+         `$${s}: floor $${floor.toFixed(2)} cannot fund a $${I.MIN_FRACTIONAL_NOTIONAL} position`);
+    }
+  } finally { I.detectStartingCapital(prev, { force: true }); }
+});
+
+check('the share-price ceiling asks how big the account is', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  // A flat $1,000 cut off every high-priced large cap on an account that could buy them
+  // outright, and under fractional sizing the share price does not constrain size at all.
+  ok(!/entryPrice > DYNAMIC_MAX_PRICE/.test(src),
+     'the execution gate must not reject on the static price ceiling');
+  ok(/const priceCeiling = affordableMaxPrice\(\);/.test(src),
+     'the execution gate must size the ceiling to the account');
+  ok(!/q\.price > DYNAMIC_MAX_PRICE/.test(src),
+     'the watchlist screen must not reject on the static price ceiling either');
+  // The floor is still absolute, and must stay that way: a $1 stock is a bad stock on
+  // any balance, for reasons that have nothing to do with how much money is available.
+  ok(/q\.price < DYNAMIC_MIN_PRICE/.test(src), 'the price FLOOR must remain absolute');
+
+  const prevCash = I.portfolio.cash;
+  try {
+    I.portfolio.cash = 2000000;
+    const big = I.affordableMaxPrice(true);
+    ok(big > 1000, `a large account must price above the old $1,000 ceiling, got $${big}`);
+    I.portfolio.cash = 700;
+    const small = I.affordableMaxPrice(false);
+    ok(small <= I.DYNAMIC_MAX_PRICE,
+       `without fractional the ceiling must never LOOSEN past $${I.DYNAMIC_MAX_PRICE}, got $${small}`);
+  } finally { I.portfolio.cash = prevCash; }
+});
+
+check('state that belongs to a different account is not trusted', () => {
+  // Pointing the same Railway volume at a new Alpaca account restored a $1,000 baseline
+  // onto a $10,000 balance, which reads as $9,000 of profit already banked: the phase
+  // gate opens in the first second and the entire account goes to the trading side.
+  ok(I.accountIdentityChanged('acct-A', 'acct-B'), 'two different ids must count as a change');
+  ok(!I.accountIdentityChanged('acct-A', 'acct-A'), 'the same id must not');
+  // CONSERVATIVE ON MISSING EVIDENCE. The reset is not reversible, so a missing field is
+  // silence, never proof. The paper test double returns no id at all.
+  ok(!I.accountIdentityChanged(null, 'acct-B'), 'no saved id is a first boot, not a change');
+  ok(!I.accountIdentityChanged('acct-A', null), 'no live id is missing evidence, not a change');
+  ok(!I.accountIdentityChanged(null, null) && !I.accountIdentityChanged('', ''), 'nothing known, nothing claimed');
+
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const sync = blockAfter(src, 'async function syncFromBroker()');
+  const iChange = sync.indexOf('accountIdentityChanged');
+  const iDetect = sync.indexOf('detectStartingCapital');
+  ok(iChange >= 0 && iDetect >= 0 && iChange < iDetect,
+     'the boot sync must ask WHOSE account this is before adopting any baseline from state');
+  ok(/brokerAccountId: _brokerAccountId,/.test(src), 'the account id must be persisted');
+  ok(/_brokerAccountId = state\.brokerAccountId;/.test(src), 'and restored');
+  ok(/id: a\.id \|\| null/.test(require('fs').readFileSync(require('path').join(__dirname, 'broker.js'), 'utf8')),
+     'the broker adapter must return the account id for this to be possible at all');
+});
+
+check('adopting a new account discards its predecessor\'s money, not its lessons', () => {
+  const p = I.portfolio, c = I.capitalSystem, r = I.riskSystem;
+  const saved = {
+    sc: I.startingCapital(), bs: I.getBenchmarkStart(), dv: I.getDividendsTotal(),
+    ld: I.getLastDigestDate(), id: I.getBrokerAccountId(),
+    lp: p.longPositions, sp: p.shortPositions, ch: p.coreHolding, ct: p.closedTrades,
+    pv: c.profitVault, td: c.tradingDrawn, lv: c.lastVaultValue,
+    pk: r.peakValue, pt: r.peakTotalValue, po: I.getPendingOrders(),
+  };
+  try {
+    I.setBrokerAccountId('old-account');
+    I.detectStartingCapital(1000, { force: true });
+    I.setBenchmarkStart(400); I.setDividendsTotal(12.5); I.setLastDigestDate('2026-01-02');
+    p.longPositions = { FOO: [{ qty: 1, entryPrice: 10 }] };
+    p.coreHolding   = { BAR: { qty: 3, avgPrice: 5 } };
+    p.closedTrades  = [{ ticker: 'BAZ', pnl: 1.25 }];
+    I.setPendingOrders({ 'order-1': { ticker: 'FOO' } });
+    c.profitVault = 40; c.tradingDrawn = -15; c.lastVaultValue = 900;
+    r.peakValue = 1200; r.peakTotalValue = 1300;
+
+    I.adoptNewAccount({ id: 'new-account' });
+
+    // Balances describe money that is not there any more.
+    eq(I.getBenchmarkStart(), null, 'the benchmark anchor');
+    eq(I.getDividendsTotal(), 0, 'the dividend tally');
+    eq(I.getLastDigestDate(), null, 'the digest date');
+    eq(Object.keys(p.longPositions).length, 0, 'long positions');
+    eq(Object.keys(p.coreHolding).length, 0, 'core holdings');
+    eq(Object.keys(I.getPendingOrders()).length, 0, 'in-flight orders');
+    eq(c.profitVault, 0, 'the vault'); eq(c.tradingDrawn, 0, 'the cumulative draw');
+    eq(r.peakValue, 0, 'the trading peak'); eq(r.peakTotalValue, 0, 'the account peak');
+    // A stale peak left in place would read as an instant catastrophic drawdown and arm
+    // safe mode on an account that has not lost a cent.
+    ok(I.computeDrawdown(r.peakValue, 500).drawdown === 0,
+       'a re-seated peak must not present a fresh account as being in drawdown');
+    // Starting capital must be re-derivable, not merely blanked.
+    I.detectStartingCapital(10000);
+    near(I.startingCapital(), 10000, 1e-9, 'the new account must set its own baseline');
+
+    // WHAT SURVIVES. Closed trades are market outcomes, not balances — a stock behaved
+    // the way it behaved regardless of which account was watching, and they are the only
+    // thing Jupiter's win model and Venus's calibration have ever learned from.
+    eq(p.closedTrades.length, 1, 'closed-trade history must survive the account change');
+  } finally {
+    I.setBrokerAccountId(saved.id); I.setStartingCapital(saved.sc);
+    I.setBenchmarkStart(saved.bs); I.setDividendsTotal(saved.dv); I.setLastDigestDate(saved.ld);
+    p.longPositions = saved.lp; p.shortPositions = saved.sp; p.coreHolding = saved.ch;
+    p.closedTrades = saved.ct; I.setPendingOrders(saved.po);
+    c.profitVault = saved.pv; c.tradingDrawn = saved.td; c.lastVaultValue = saved.lv;
+    r.peakValue = saved.pk; r.peakTotalValue = saved.pt;
+  }
+});
+
+check('the first log an operator reads is about THEIR account, not the default one', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  // The banner used to print before loadState() and before syncFromBroker(), so a
+  // $10,000 account was told its unlock bar was $100.00. Nothing downstream was wrong;
+  // the report was, which is worse — it is where the operator goes to find out what the
+  // bot thinks it is doing.
+  ok(/function logCapitalDependentConfig\(\)/.test(src),
+     'the capital-dependent banner must be a named thing that can be ordered');
+  const iDefine = src.indexOf('function logCapitalDependentConfig()');
+  const iSync   = src.indexOf('await syncFromBroker()');
+  const iCall   = src.indexOf('logCapitalDependentConfig();');
+  ok(iSync > 0 && iCall > iSync,
+     'the banner must be printed AFTER the broker sync, where starting capital is known');
+  ok(iCall !== iDefine, 'the definition is not the call site');
+  // And nothing capital-dependent may be left behind in the early banner.
+  // Anchor on the BANNER ITSELF (the emoji line printed at boot), not on the phrase —
+  // which also appears in the file header 9,000 lines earlier and would silently widen
+  // this slice to most of the program.
+  const iBanner = src.indexOf('🌌  ATLAS LUMEN');
+  ok(iBanner > 0 && iBanner < iSync, 'the boot banner must precede the broker sync');
+  const early = src.slice(iBanner, iSync);
+  ok(!/tradingUnlockThreshold\(\)/.test(early),
+     'the unlock bar must not be printed before the account size is known');
+  ok(!/effectiveCoreFraction\(\)/.test(early),
+     'the core weight must not be printed before the account size is known');
+});
+
+check('a "good day" is judged in percent, not in dollars', () => {
+  // `avgPnL > 5` is a strong average on a $1,000 account and unmeasurable on a
+  // $1,000,000 one, where the branch reads "neutral" for ever however the trading side
+  // actually did. Both thresholds are the same numbers they always were at $1,000.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(!/avgPnL > 5\b/.test(src) && !/avgPnL < -5\b/.test(src),
+     'the sentiment shift must not compare an average against a bare $5');
+  ok(!/avgPnL > 2\b/.test(src) && !/avgPnL < -2\b/.test(src),
+     'the trend label must not compare an average against a bare $2');
+  ok(/const pnlStrong = startingCapital\(\) \* 0\.005;/.test(src)
+     && /const pnlWeak   = startingCapital\(\) \* 0\.002;/.test(src),
+     'both thresholds must be fractions of starting capital');
+  ok(/avgPnL > pnlStrong \? 0\.03 : \(avgPnL < -pnlStrong \? -0\.03 : 0\)/.test(src),
+     'the sentiment shift must use the scaled threshold');
+  ok(/avgPnL > pnlWeak \? 'bullish' : avgPnL < -pnlWeak \? 'bearish' : 'neutral'/.test(src),
+     'the trend label must use the scaled threshold');
+
+  const prev = I.startingCapital();
+  try {
+    I.detectStartingCapital(1000, { force: true });
+    near(I.startingCapital() * 0.005, 5, 1e-9, 'at $1,000 the strong threshold must still be $5');
+    near(I.startingCapital() * 0.002, 2, 1e-9, 'at $1,000 the weak threshold must still be $2');
+  } finally { I.detectStartingCapital(prev, { force: true }); }
+});
+
+check('the documentation points at files that exist', () => {
+  // THE DEPLOY INSTRUCTION POINTED AT A FILE THAT WAS NEVER COMMITTED. README's Deploy
+  // section said "See RAILWAY_DEPLOY_GUIDE.md for the full walkthrough" and its Files
+  // section listed twenty documents — ATLAS_OVERVIEW, GUIDE_0 through GUIDE_5, nine
+  // CHANGES_* files — none of which are in the repository, while eleven files that ARE
+  // in it went unmentioned. Anyone following the README to deploy this hit a wall on the
+  // first instruction. A broken pointer in the one file a new operator reads first is a
+  // deployment defect, so it is tested like one.
+  const fs = require('fs'), pathx = require('path');
+  const docs = ['README.md', 'RAILWAY_DEPLOY_GUIDE.md'];
+  const missing = [];
+  for (const doc of docs) {
+    const full = pathx.join(__dirname, doc);
+    ok(fs.existsSync(full), `${doc} must exist — it is referenced as the deploy path`);
+    const text = fs.readFileSync(full, 'utf8');
+    // Any repo-local filename the doc names, in backticks or at the start of a line in
+    // a file listing. Deliberately ignores URLs and bare prose.
+    // The line-start branch must accept UPPERCASE names too: every doc in the Files
+    // block is uppercase, so a lowercase-only pattern silently skipped exactly the
+    // entries that were wrong — a mutation putting GUIDE_0_COMPLETE_SETUP.md back into
+    // the listing sailed through a green suite.
+    const re = /`([A-Za-z0-9_.\-]+\.(?:md|js|html|json))`|^([A-Za-z0-9_.\-]+\.(?:js|md|html|json))\b/gm;
+    let m;
+    while ((m = re.exec(text))) {
+      const name = m[1] || m[2];
+      if (name === 'package-lock.json') continue;
+      if (!fs.existsSync(pathx.join(__dirname, name))) missing.push(`${doc} → ${name}`);
+    }
+  }
+  ok(missing.length === 0,
+     `documentation names files that do not exist:\n      ${missing.join('\n      ')}`);
+});
+
+check('the deploy guide describes the endpoints this build actually serves', () => {
+  // The same failure one level down: a guide is only useful if the routes it names are
+  // real. These are read straight out of server.js rather than trusted.
+  const fs = require('fs'), pathx = require('path');
+  const src   = fs.readFileSync(pathx.join(__dirname, 'server.js'), 'utf8');
+  const guide = fs.readFileSync(pathx.join(__dirname, 'RAILWAY_DEPLOY_GUIDE.md'), 'utf8');
+  const real = new Set();
+  const re = /app\.(?:get|post)\('([^']+)'/g;
+  let m; while ((m = re.exec(src))) real.add(m[1]);
+  ok(real.size > 5, `expected a real route table, found ${real.size}`);
+  const named = [...guide.matchAll(/`(\/api\/[A-Za-z0-9\/_\-]+)`/g)].map(x => x[1]);
+  ok(named.length > 0, 'the guide must name at least one endpoint');
+  const bogus = [...new Set(named)].filter(r => !real.has(r));
+  ok(bogus.length === 0, `the guide names routes that do not exist: ${bogus.join(', ')}`);
+});
+
+check('every account size produces a coherent plan end to end', () => {
+  // THE SWEEP. Each fix above is local; this asks whether the pieces still agree with
+  // each other at sizes nobody has ever run the bot at.
+  const r = coreProbe(`
+    const rows = [];
+    for (const s of [100, 500, 1000, 10000, 100000, 1000000, 10000000]) {
+      I.detectStartingCapital(s, { force: true });
+      I.portfolio.cash = s;
+      rows.push({
+        s,
+        bar:   I.tradingUnlockThreshold(),
+        floor: I.minimumTradingCapital(),
+        names: I.affordableBasketNames(s, I.CORE_BASKET_TARGET_NAMES),
+        slice: (s * I.effectiveCoreFraction()) / I.affordableBasketNames(s, I.CORE_BASKET_TARGET_NAMES),
+        drift: I.cashDriftMin(),
+        qty:   I.coreTopUpQty(100, s, 0, s, I.CORE_BASKET_TARGET_NAMES, null) * 100,
+      });
+    }
+    console.log(JSON.stringify({ rows, min: I.MIN_FRACTIONAL_NOTIONAL }));
+  `);
+  for (const row of r.rows) {
+    const at = `$${row.s}`;
+    near(row.bar, row.s * 0.10, 1e-6, `${at}: the unlock bar must be 10% of starting capital`);
+    ok(row.floor < row.bar, `${at}: the trading floor must sit below the unlock bar`);
+    ok(row.names >= 1 && row.slice >= r.min,
+       `${at}: ${row.names} names at $${row.slice.toFixed(2)} a slice is under the $${r.min} minimum`);
+    ok(row.qty >= r.min, `${at}: the first core buy must be a real order, got $${row.qty.toFixed(2)}`);
+    // Cash-drift adoption must stay meaningful rather than becoming either noise-chasing
+    // on a large account or a permanent no-op on a small one.
+    ok(row.drift >= 0.01 && row.drift <= row.s * 0.01,
+       `${at}: the drift floor $${row.drift.toFixed(2)} is out of proportion`);
+  }
 });
 
 // ════════════════════════════════════════════════════════════════════════════

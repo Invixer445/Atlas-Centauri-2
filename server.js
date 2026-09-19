@@ -141,6 +141,22 @@ let _dividendsTotal = 0;         // cumulative cash adopted from the broker
 // YYYY-MM-DD). Persisted, because the digest must fire once PER DAY and not once per
 // process that happens to witness the closing bell. See the digest timer in start().
 let _lastDigestDate = null;
+// WHOSE ACCOUNT THIS STATE BELONGS TO.
+//
+// Everything persisted here is measured FROM an account: starting capital, the SPY
+// benchmark anchor, both peaks, the core lots, the closed-trade history. Point the same
+// Railway volume at a different Alpaca account — which is exactly what happens when the
+// operator opens a fresh paper account and redeploys — and every one of those baselines
+// is now describing somebody else's money. The specific failure is not subtle: a $1,000
+// baseline restored onto a $10,000 account reads as $9,000 of PROFIT already earned, the
+// phase gate unlocks in the first second, the core steps down to its floor and the whole
+// balance is handed to the trading side. That is the same catastrophe detectStartingCapital
+// was written to prevent, arriving through the one door it does not watch — because it
+// deliberately refuses to overwrite a value restored from state.
+//
+// So the account's own id is persisted alongside the numbers. If it changes, the state is
+// not about this account and its baselines are discarded rather than trusted.
+let _brokerAccountId = null;
 function startingCapital() {
   return (Number.isFinite(_startingCapital) && _startingCapital > 0) ? _startingCapital : START_CAPITAL;
 }
@@ -4269,7 +4285,16 @@ async function runIntelCycle() {
       // speculative ideas by construction, and the basket is a months-long holding.
       const pool = [...new Set([...CORE_BASKET_POOL, ...CORE_HOLD_SYMBOLS])];
       try {
-        const prop = await venus.proposeBasket(pool, CORE_BASKET_TARGET_NAMES);
+        // Ask for a basket this account can pay for. Requesting 16 names on a balance
+        // that funds 9 spends an LLM call producing seven slices too small to buy.
+        const askFor = affordableBasketNames();
+        if (askFor < CORE_BASKET_TARGET_NAMES) {
+          console.log(`[VENUS] 🧺 Asking for ${askFor} names, not ${CORE_BASKET_TARGET_NAMES} — ` +
+            `a $${getTotalValue().toFixed(0)} account funds ${askFor} slice(s) of at least ` +
+            `$${coreMinSlice().toFixed(2)}; wider than that and every slice falls under the ` +
+            `$${MIN_FRACTIONAL_NOTIONAL} minimum order and nothing can be bought at all`);
+        }
+        const prop = await venus.proposeBasket(pool, askFor);
         if (prop) {
           const overlap = prop.basket.filter(x => CORE_HOLD_SYMBOLS.includes(x)).length;
           console.log(`[VENUS] 🧺 Basket proposal: ${prop.basket.join(',')}`);
@@ -4304,7 +4329,10 @@ async function runIntelCycle() {
           }
           if (CORE_BASKET_SOURCE === 'venus' && maySwap) {
             console.log(`[VENUS]    CORE_BASKET_SOURCE=venus — this proposal is now the live basket`);
-            const merged = basketWithRecovered(prop.basket, _recoveredSymbols, portfolio.coreHolding);
+            // The union is capped by the SAME affordability rule, or a broker full of
+            // strays could widen the basket straight back past what the cash can fund.
+            const unionCap = affordableBasketNames(getTotalValue(), CORE_BASKET_MAX_NAMES);
+            const merged = basketWithRecovered(prop.basket, _recoveredSymbols, portfolio.coreHolding, unionCap);
             if (merged.carried.length) {
               console.log(`[VENUS]    carrying ${merged.carried.join(',')} into the new basket — ` +
                 `held but not proposed, and a recovered holding is not force-sold by a ` +
@@ -4312,7 +4340,9 @@ async function runIntelCycle() {
             }
             if (merged.dropped.length) {
               console.warn(`[VENUS]    ${merged.dropped.join(',')} will be exited — ` +
-                `basket is capped at ${CORE_BASKET_MAX_NAMES} names`);
+                `basket is capped at ${unionCap} names` +
+                (unionCap < CORE_BASKET_MAX_NAMES
+                  ? ` (the ceiling is ${CORE_BASKET_MAX_NAMES}; this account funds ${unionCap})` : ''));
             }
             _recoveredSymbols.clear();       // one cycle of grace, not permanent tenure
             const previous = new Set(CORE_HOLD_SYMBOLS);
@@ -4382,6 +4412,28 @@ const MAX_DAY_VOLUME_SHARE = Math.max(0.0005, Math.min(0.25,
 // What this account would actually put into one position at `price`, using the same
 // risk budget and stop geometry the sizer uses. Kept in one place so the liquidity
 // screen and the sizer can never drift apart.
+// THE SMALLEST TRADING BOOK WORTH RUNNING.
+//
+// This was a bare `< 50`, and a bare 50 is only correct on the one account size it was
+// written for. On a $100 account it is half the balance, so the trading side can never
+// open a position no matter how well the holding side does; on a $1,000,000 account it
+// is rounding error that never binds at all. Either way the number stops describing the
+// thing it is checking.
+//
+// Two floors, whichever is larger:
+//   • enough to fund one minimum-notional position after the reserve is set aside —
+//     below this the sizer cannot produce a tradeable order, so trying is pure spread;
+//   • 5% of starting capital, which is exactly HALF the 10% the phase gate demands
+//     before it unlocks. Keeping that relationship fixed is what makes the check mean
+//     the same thing at every size: trading stops when its book has been halved.
+// At $1,000 the pair returns 50 — the value this replaced, unchanged, at the size it
+// was written for.
+function minimumTradingCapital() {
+  const reserve = Math.min(0.95, Math.max(0, capitalSystem.reserveRatio || 0));
+  const onePosition = Math.max(1, MIN_FRACTIONAL_NOTIONAL) / (1 - reserve);
+  return Math.max(onePosition, startingCapital() * 0.05);
+}
+
 function intendedPositionNotional(price) {
   const trading = Math.max(0, tradableValue() * (1 - capitalSystem.reserveRatio));
   const riskFrac = STRATEGY.RISK_PER_TRADE_BASE ?? 0.015;
@@ -4438,8 +4490,17 @@ async function addDynamicSymbol(sym, sig) {
   const snap = await alpacaDataGet(`/v2/stocks/${encodeURIComponent(sym)}/snapshot?feed=${ALPACA_DATA_FEED}`);
   const q = snapshotToQuote(snap);
   if (!q) { console.log(`[JUPITER] ${sym} rejected — no snapshot (bad/foreign/delisted symbol?)`); return false; }
-  if (q.price < DYNAMIC_MIN_PRICE || q.price > DYNAMIC_MAX_PRICE) {
-    console.log(`[JUPITER] ${sym} rejected — price $${q.price.toFixed(2)} outside [$${DYNAMIC_MIN_PRICE}, $${DYNAMIC_MAX_PRICE}]`);
+  // Only the FLOOR is a fixed price. The ceiling is the affordability test immediately
+  // below, which knows how big this account is; DYNAMIC_MAX_PRICE was doing the job
+  // twice and doing it wrong at the top end — a flat $1,000 cut off BKNG, NVDA after a
+  // run, and every other high-priced large cap on a $1,000,000 account that could buy
+  // them outright, while under fractional sizing the share price does not constrain the
+  // position at all. The static half was also strictly tighter than the affordability
+  // half, so it decided every rejection above $1,000 and the affordability log line
+  // announcing the real reason could never print.
+  if (q.price < DYNAMIC_MIN_PRICE) {
+    console.log(`[JUPITER] ${sym} rejected — price $${q.price.toFixed(2)} below the $${DYNAMIC_MIN_PRICE} floor ` +
+                `(sub-$${DYNAMIC_MIN_PRICE} names carry wide spreads and manipulation risk)`);
     return false;
   }
   // AFFORDABILITY. The $1000 static ceiling is meaningless on a small book: with
@@ -5646,11 +5707,55 @@ function coreWeightMap(symbols = CORE_HOLD_SYMBOLS, conv = CORE_CONVICTION) {
 // returns a sell, because the measured advantage of holding comes from not reacting.
 // `share` is this name's fraction of the core (see coreWeightMap). Omitting it means
 // equal weight, which is what every caller predating the conviction tilt expects.
+// THE SMALLEST SLICE WORTH OPENING.
+//
+// MIN_FRACTIONAL_NOTIONAL is the floor below which coreTopUpQty returns zero, so a slice
+// sitting exactly ON it can be bought once and then never topped up again. Requiring two
+// floors of room means a name that is funded stays fundable as it drifts.
+function coreMinSlice() { return Math.max(1, MIN_FRACTIONAL_NOTIONAL) * 2; }
+
+// HOW MANY NAMES THIS ACCOUNT CAN ACTUALLY FUND.
+//
+// THE BASKET SIZE WAS A CONSTANT AND THE ACCOUNT WAS NOT. At 16 names and a 97% core
+// weight, each slice is totalValue/16.49 — which clears the $5 dust floor at $1,000 and
+// at $10,000, and does NOT clear it below about $83. Every name's gap then comes back
+// under MIN_FRACTIONAL_NOTIONAL, coreTopUpQty returns 0 for all sixteen, and the account
+// sits in 100% cash FOREVER with no error, no warning and no order. Measured against
+// v12.64: $80 buys nothing, $83 buys $5.03. The ten-name env default has the same wall
+// at $51.55 ($5 x 10 / 0.97). Nothing in the engine said so: the sizing
+// comment asserted 16 names was "safe at the current account size and at any larger one",
+// which is true and quietly says nothing at all about a smaller one.
+//
+// The fix is not a bigger floor, it is fewer names. Diversification is worth having but
+// it is not worth having INSTEAD of a position: the measured table runs k=3 at 2.52
+// return-per-drawdown against k=16 at 3.95, so a four-name basket on a $50 account is
+// materially worse than sixteen and infinitely better than cash. Returns the target
+// unchanged when there is no equity reading yet — shrinking the basket on ignorance
+// would mean every boot before the first quote proposed a one-name portfolio.
+function affordableBasketNames(totalValue = getTotalValue(), nameCount = CORE_BASKET_TARGET_NAMES) {
+  const target = Math.max(1, nameCount);
+  const tv = Number(totalValue);
+  if (!Number.isFinite(tv) || tv <= 0) return target;
+  const investable = tv * effectiveCoreFraction();
+  if (!(investable > 0)) return target;
+  return Math.max(1, Math.min(target, Math.floor(investable / coreMinSlice())));
+}
+
 function coreTopUpQty(price, totalValue, currentNameValue, cash, nameCount = CORE_HOLD_SYMBOLS.length, share = null) {
   if (!CORE_HOLD_ON) return 0;
   if (!Number.isFinite(price) || price <= 0) return 0;
   const n = Math.max(1, nameCount);
-  const frac = (Number.isFinite(share) && share > 0) ? share : 1 / n;
+  // SIZE AGAINST WHAT THE ACCOUNT CAN FUND, NOT AGAINST WHAT THE BASKET LISTS.
+  // When the two differ the basket is too wide for the balance, and spreading the core
+  // across all of it produces slices under the dust floor — which buys NOTHING at all
+  // (see affordableBasketNames). Concentrating into the fundable count instead fills
+  // names one at a time until the cash runs out, and widens again by itself as the
+  // account grows. The conviction tilt is dropped in that state on purpose: a weighting
+  // preference measured in tenths of a percent is meaningless on a slice of $12, and
+  // applying it here would reintroduce the sub-floor target it exists to avoid.
+  const nEff = affordableBasketNames(totalValue, n);
+  const frac = (nEff < n) ? (1 / nEff)
+             : ((Number.isFinite(share) && share > 0) ? share : 1 / n);
   const perNameTarget = totalValue * effectiveCoreFraction() * frac;
   const gap = perNameTarget - currentNameValue;
   // Band keeps ordinary drift from generating a stream of tiny spread-paying buys.
@@ -6511,6 +6616,57 @@ function dispatchFill(p, o) {
   else if (p.kind === 'partial')   partialClose(p.ticker, p.direction, p.fraction, p.rung, { brokerFill: true, fillPrice, sells: p.sells });
 }
 
+// HAS THE STATE FILE OUTLIVED THE ACCOUNT IT DESCRIBES?
+//
+// Pure, and deliberately conservative: only a saved id AND a live id that BOTH exist and
+// genuinely differ counts as a change. Every other combination is silence, not evidence.
+//   • no saved id      → first boot after this check shipped, or a fresh volume
+//   • no live id       → the paper test double, or an Alpaca response without one
+// Guessing "changed" in either case would throw away a perfectly good baseline on
+// nothing more than a missing field, and the reset it triggers is not reversible.
+function accountIdentityChanged(savedId, liveId) {
+  if (!savedId || !liveId) return false;
+  return String(savedId) !== String(liveId);
+}
+
+// The volume has been pointed at a different account. Discard every figure that was
+// measured FROM the old one and let the ordinary boot path re-derive them.
+//
+// WHAT SURVIVES, AND WHY. Closed trades are kept. They are real market outcomes that
+// Jupiter's win model and Venus's calibration learned from, and a stock behaved the way
+// it behaved regardless of which account was watching. What does NOT survive is anything
+// denominated in this account's money — the starting capital, the benchmark anchor, the
+// peaks, the vault, the cumulative trading draw, the position book and any in-flight
+// orders. Those describe balances that no longer exist, and the boot sync and reconcile
+// that run immediately after this rebuild them from the broker, which is authoritative.
+function adoptNewAccount(acct) {
+  const shown = (id) => (id ? `…${String(id).slice(-6)}` : 'none');
+  console.warn(`[CAPITAL] 🔁 DIFFERENT BROKER ACCOUNT — saved state belongs to ${shown(_brokerAccountId)}, ` +
+               `this is ${shown(acct && acct.id)}. Every baseline in that state (starting capital ` +
+               `$${startingCapital().toFixed(2)}, the benchmark anchor, both peaks, the vault and the ` +
+               `position book) was measured from an account that is not this one. Discarding them and ` +
+               `re-deriving from the broker. Closed-trade history is KEPT — those are market outcomes, ` +
+               `not balances, and the AIs learned from them.`);
+  _startingCapital = null;      // detectStartingCapital re-runs against this account's equity
+  _benchmarkStart  = null;      // re-anchored to SPY at the same instant
+  _dividendsTotal  = 0;
+  _lastDigestDate  = null;
+  portfolio.longPositions  = {};
+  portfolio.shortPositions = {};
+  portfolio.coreHolding    = {};
+  pendingOrders = {};
+  capitalSystem.profitVault    = 0;
+  capitalSystem.tradingDrawn   = 0;
+  capitalSystem.lastVaultValue = 0;
+  capitalSystem.emergencyStop  = false;
+  capitalSystem.safeMode       = false;
+  // A peak of 0 is re-seated from live equity by the sync immediately below; leaving the
+  // old account's high-water mark in place would read as an instant catastrophic drawdown.
+  riskSystem.peakValue      = 0;
+  riskSystem.peakTotalValue = 0;
+  _tradingPeakReseated      = false;
+}
+
 // Boot sync: adopt the broker's cash as the ledger's cash, and adopt any broker
 // positions the internal book doesn't know (e.g., after a state wipe). The broker is
 // authoritative — the ledger conforms to IT, never the other way around.
@@ -6518,6 +6674,9 @@ async function syncFromBroker() {
   try {
     const acct = await broker.getAccount();
     if (acct.ok && Number.isFinite(acct.cash)) {
+      // IS THIS EVEN THE SAME ACCOUNT? Ask before adopting a single number from state.
+      if (accountIdentityChanged(_brokerAccountId, acct.id)) adoptNewAccount(acct);
+      if (acct.id) _brokerAccountId = acct.id;
       const prev = portfolio.cash;
       portfolio.cash = acct.cash;
       // FIRST BOOT ONLY. detectStartingCapital refuses to overwrite a value restored
@@ -6914,7 +7073,12 @@ function terraValidateTrade(plan) {
 
   // RULE 2 — the stock must be within tradeable limits
   if (entryPrice < DYNAMIC_MIN_PRICE)                             return reject(`price $${entryPrice.toFixed(2)} below $${DYNAMIC_MIN_PRICE} min`);
-  if (entryPrice > DYNAMIC_MAX_PRICE)                             return reject(`price $${entryPrice.toFixed(2)} above $${DYNAMIC_MAX_PRICE} max`);
+  // ACCOUNT-RELATIVE, NOT ABSOLUTE. A $1,000 share is unbuyable on a $700 book and
+  // entirely ordinary on a $1,000,000 one, and with fractional sizing on it is neither —
+  // the sizer buys 0.18 of it. affordableMaxPrice() answers that question with the
+  // balance in hand and is never looser than the old constant when fractional is off.
+  const priceCeiling = affordableMaxPrice();
+  if (entryPrice > priceCeiling)                                  return reject(`price $${entryPrice.toFixed(2)} above the $${priceCeiling.toFixed(2)} this account can size`);
 
   // RULE 3 — Jupiter must have produced a real size
   // Size must be a real, tradeable quantity. With fractional sizing on, anything at or
@@ -7461,8 +7625,16 @@ function updateLearning() {
 
   const avgPnL = recent.reduce((s, t) => s + t.realizedPnL, 0) / recent.length;
 
-  // Sentiment shift gated on a new trade — uses P&L not random drift
-  const sentimentShift = avgPnL > 5 ? 0.03 : (avgPnL < -5 ? -0.03 : 0);
+  // Sentiment shift gated on a new trade — uses P&L not random drift.
+  //
+  // THE THRESHOLD IS A FRACTION, NOT A DOLLAR AMOUNT. A flat $5 average is a strong
+  // result on a $1,000 account and literally unmeasurable on a $1,000,000 one, where
+  // this branch would read "neutral" for ever no matter how the trading side did. Both
+  // thresholds below are the same numbers they always were AT $1,000 — 0.5% and 0.2% of
+  // starting capital — and now mean the same thing at every other size.
+  const pnlStrong = startingCapital() * 0.005;     // $5 on $1,000
+  const pnlWeak   = startingCapital() * 0.002;     // $2 on $1,000
+  const sentimentShift = avgPnL > pnlStrong ? 0.03 : (avgPnL < -pnlStrong ? -0.03 : 0);
   if (sentimentShift !== 0 && last.closedAt !== aiSystem._lastSentimentUpdateTime) {
     aiSystem._lastSentimentUpdateTime = last.closedAt;
     // Only shift by ±0.03 on top of breadth — trade P&L is a signal quality indicator
@@ -7481,7 +7653,7 @@ function updateLearning() {
 
   aiSystem.currentReasoning.winRate      = winRate;
   aiSystem.currentReasoning.confidence   = Math.round(Math.min(100, closed.length * 2));
-  aiSystem.currentReasoning.trend        = avgPnL > 2 ? 'bullish' : avgPnL < -2 ? 'bearish' : 'neutral';
+  aiSystem.currentReasoning.trend        = avgPnL > pnlWeak ? 'bullish' : avgPnL < -pnlWeak ? 'bearish' : 'neutral';
   aiSystem.currentReasoning.breadth      = sentimentData.breadthScore;
   aiSystem.currentReasoning.regime       = detectMarketRegime();
   aiSystem.currentReasoning.nextAction   =
@@ -7542,6 +7714,10 @@ function buildStateObject() {
     benchmarkStart:  _benchmarkStart,
     dividendsTotal:  _dividendsTotal,
     lastDigestDate:  _lastDigestDate,
+    // WHICH ACCOUNT the figures above are about. Without it, a volume reattached to a
+    // new account restores a baseline describing money that is not there — see
+    // accountIdentityChanged().
+    brokerAccountId: _brokerAccountId,
     closedTrades:   portfolio.closedTrades.slice(-500),
     marketTransition: marketTransitionData,
     capitalSystem,
@@ -7702,6 +7878,11 @@ function loadState() {
               && Number.isFinite(lot.avgPrice) && lot.avgPrice > 0) portfolio.coreHolding[sym] = lot;
         }
       }
+    }
+    // Restored BEFORE the capital baseline, because it is what decides whether that
+    // baseline may be trusted at all. syncFromBroker compares it against the live account.
+    if (typeof state.brokerAccountId === 'string' && state.brokerAccountId) {
+      _brokerAccountId = state.brokerAccountId;
     }
     if (Number.isFinite(state.startingCapital) && state.startingCapital > 0) {
       _startingCapital = state.startingCapital;
@@ -8349,7 +8530,7 @@ function evaluateAndTrade() {
   const openCount = Object.keys(portfolio.longPositions).length
                   + Object.keys(portfolio.shortPositions).length;
   if (openCount >= MAX_OPEN_POSITIONS) return;
-  if (capitalSystem.tradingCapital < 50) return;
+  if (capitalSystem.tradingCapital < minimumTradingCapital()) return;
 
   // ── 5. TIME-OF-DAY FILTER ─────────────────────────────────────────────────
   if (isInsideSessionBuffer()) {
@@ -9009,22 +9190,18 @@ app.post('/api/tradingview-webhook', (req, res) => {
 
 // Boot the execution engine only when run directly (`node server.js`). When
 // imported as a module, the engine stays dormant and only its brain is exposed.
-if (require.main === module) app.listen(PORT, async () => {
-  // Version comes from package.json so it can never drift from what is deployed. The
-  // banner was hardcoded "v11.20" for six releases, which made a live log genuinely
-  // ambiguous about which code was running — exactly the question you cannot afford to
-  // guess at when diagnosing why nothing traded.
-  let VERSION = 'unknown';
-  try { VERSION = require('./package.json').version; } catch (_) {}
-  console.log(`\n🌌  ATLAS LUMEN — Unified Engine v${VERSION} on port ${PORT}`);
-  console.log(`   ♀ Venus (research AI: web + 13F + news) + 🔭 Jupiter (trading AI: sizes/decides/learns) + 🌍 Terra (execution gate)`);
-  console.log(`[STARTUP] Alpaca data feed (${ALPACA_DATA_FEED}) — US markets (NASDAQ/NYSE) only`);
-  // Print the settings that actually decide whether a trade happens. Every one of
-  // these has silently blocked trading at some point in this project's history.
-  console.log(`[CONFIG] decisions on ${DECISION_TIMEFRAME} bars | trail ${STRATEGY.ATR_TRAIL_ARM_R >= 99 ? 'OFF' : 'arms at ' + STRATEGY.ATR_TRAIL_ARM_R + 'R'} | ` +
-              `${LONG_ONLY ? 'LONG-ONLY' : 'long+short'} | stop ${STRATEGY.ATR_STOP_MULT}xATR target ${STRATEGY.ATR_TARGET_MULT}xATR`);
-  console.log(`[CONFIG] risk ${(STRATEGY.RISK_PER_TRADE_BASE*100).toFixed(1)}%/trade | ATR floor ${(STRATEGY.MIN_ATR_ENTRY*100).toFixed(2)}% | ` +
-              `net R:R >= ${STRATEGY.MIN_RR_NET} | cost ceiling ${(STRATEGY.MAX_ROUND_TRIP_COST*100).toFixed(2)}%`);
+// THE CONFIG LINES THAT NEED TO KNOW HOW BIG THE ACCOUNT IS.
+//
+// These used to print with the rest of the banner, which runs BEFORE loadState() and
+// before syncFromBroker() — so every figure in them came from the $1,000 default. On a
+// $10,000 account the very first line the operator read announced an unlock bar of
+// $100.00 when the real bar was $1,000.00, and on a restart the basket was reported as
+// the env default while the restored Venus basket was what the money was actually in.
+// Nothing downstream was wrong; the report was, which is worse, because it is the one
+// place the operator goes to find out what the bot thinks it is doing. Printed after the
+// broker sync instead, where starting capital, the live basket and the core weight are
+// all known.
+function logCapitalDependentConfig() {
   if (PHASE_GATE_ENABLED && CORE_HOLD_ON)
     console.log(`[CONFIG] PHASE GATE ON — trading stays locked until the holding side banks ` +
                 `$${tradingUnlockThreshold().toFixed(2)} (${(TRADING_UNLOCK_PCT*100).toFixed(0)}% of starting capital); after that it risks only banked profit`);
@@ -9048,6 +9225,24 @@ if (require.main === module) app.listen(PORT, async () => {
                   // misleading-first-log problem the phase-1 weight above already fixed.
                   ` across ${CORE_HOLD_SYMBOLS.length} names${(CORE_BASKET_SOURCE === 'venus' && !_venusBasketReceived) ? ' — awaiting Venus\'s picks' : ` (${CORE_HOLD_SYMBOLS.slice(0,4).join(',')}${CORE_HOLD_SYMBOLS.length>4?'…':''}${CORE_BASKET_SOURCE === 'venus' ? ', restored' : ''})`}`
                 : `core holding OFF (set CORE_HOLD_FRACTION=0.5 to hold half across ${CORE_HOLD_SYMBOLS.length} names)`));
+}
+
+if (require.main === module) app.listen(PORT, async () => {
+  // Version comes from package.json so it can never drift from what is deployed. The
+  // banner was hardcoded "v11.20" for six releases, which made a live log genuinely
+  // ambiguous about which code was running — exactly the question you cannot afford to
+  // guess at when diagnosing why nothing traded.
+  let VERSION = 'unknown';
+  try { VERSION = require('./package.json').version; } catch (_) {}
+  console.log(`\n🌌  ATLAS LUMEN — Unified Engine v${VERSION} on port ${PORT}`);
+  console.log(`   ♀ Venus (research AI: web + 13F + news) + 🔭 Jupiter (trading AI: sizes/decides/learns) + 🌍 Terra (execution gate)`);
+  console.log(`[STARTUP] Alpaca data feed (${ALPACA_DATA_FEED}) — US markets (NASDAQ/NYSE) only`);
+  // Print the settings that actually decide whether a trade happens. Every one of
+  // these has silently blocked trading at some point in this project's history.
+  console.log(`[CONFIG] decisions on ${DECISION_TIMEFRAME} bars | trail ${STRATEGY.ATR_TRAIL_ARM_R >= 99 ? 'OFF' : 'arms at ' + STRATEGY.ATR_TRAIL_ARM_R + 'R'} | ` +
+              `${LONG_ONLY ? 'LONG-ONLY' : 'long+short'} | stop ${STRATEGY.ATR_STOP_MULT}xATR target ${STRATEGY.ATR_TARGET_MULT}xATR`);
+  console.log(`[CONFIG] risk ${(STRATEGY.RISK_PER_TRADE_BASE*100).toFixed(1)}%/trade | ATR floor ${(STRATEGY.MIN_ATR_ENTRY*100).toFixed(2)}% | ` +
+              `net R:R >= ${STRATEGY.MIN_RR_NET} | cost ceiling ${(STRATEGY.MAX_ROUND_TRIP_COST*100).toFixed(2)}%`);
   if (CORE_HOLD_ON && PHASE_GATE_ENABLED && !unlockStepDownIsActionable()) {
     // The warning's premise changed with v11.53. The unlock no longer steps to a flat
     // CORE_HOLD_FRACTION; it frees exactly the trading allowance. So the gap between the
@@ -9143,6 +9338,10 @@ if (require.main === module) app.listen(PORT, async () => {
     const pend = Object.keys(pendingOrders).length;
     if (pend) console.log(`[EXEC] Resuming ${pend} pending order(s) from saved state`);
   }
+
+  // NOW the capital-dependent banner: state is loaded, the broker has been asked, and
+  // startingCapital() is this account's real number rather than the $1,000 default.
+  logCapitalDependentConfig();
 
   // 5. Main loop — v11.19: sped up from 10s to 2s (matches Luna's own 2s poll cadence).
   // This is a pure reaction-speed change, not a risk change: it doesn't touch position
@@ -9285,6 +9484,13 @@ module.exports = {
     LLM_MAX_TOKENS, noteFinishReason, MAX_ARTICLES_PER_CALL,
     setBenchmarkStart: (v) => { _benchmarkStart = v; }, setDividendsTotal: (v) => { _dividendsTotal = v; }, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, CORE_BASKET_MAX_NAMES, CORE_TRIMS_PER_CYCLE, cashDriftMin, CASH_DRIFT_ABS, adoptBrokerCashDrift,
     MAX_DAY_VOLUME_SHARE, intendedPositionNotional, verifyStateDir,
+    // v12.65 — account-size portability
+    affordableBasketNames, coreMinSlice, minimumTradingCapital,
+    accountIdentityChanged, adoptNewAccount, logCapitalDependentConfig,
+    DYNAMIC_MIN_PRICE, DYNAMIC_MAX_PRICE,
+    getBrokerAccountId: () => _brokerAccountId,
+    setBrokerAccountId: (v) => { _brokerAccountId = v; },
+    setStartingCapital: (v) => { _startingCapital = v; },
     getRecoveredSymbols: () => _recoveredSymbols,
     CORE_TILT_ON, CORE_TILT_STRENGTH, CORE_TILT_MAX, CORE_TILT_MIN, CORE_TILT_MAX_SHARE,
     getCoreConviction: () => CORE_CONVICTION,
