@@ -3376,7 +3376,15 @@ function isInsideSessionBuffer() {
   if (day === 0 || day === 6) return false;
   const bufMin  = SESSION_BUFFER_MIN / 60;
   const usOpen  = NASDAQ_NYSE_HOURS.start;
-  const usClose = NASDAQ_NYSE_HOURS.end;
+  // THE CALENDAR'S CLOSE, NOT THE CONSTANT. resolveSession already honours Alpaca's
+  // early closes (13:00 the day after Thanksgiving, Christmas Eve, July 3rd), and
+  // test.js asserts it does — but this function read the hardcoded 16.0, so on every
+  // early-close day the last-five-minutes filter guarded a moment three hours after the
+  // bell and the engine happily opened a position into the closing auction it was
+  // written to avoid.
+  const { dateStr } = getEasternTimeParts();
+  const sess = (marketCalendar.ok && marketCalendar.byDate.get(dateStr)) || null;
+  const usClose = (sess && Number.isFinite(sess.close)) ? sess.close : NASDAQ_NYSE_HOURS.end;
   // Only apply during the actual US session
   if (hours < usOpen || hours >= usClose) return false;
   if (hours < usOpen + bufMin) return true;   // first 5 min
@@ -4784,7 +4792,17 @@ function marketIntradayVolMedian(symbols) {
 }
 
 function detectOvernightGaps() {
-  const symbols  = [...WATCHLISTS.nasdaq, ...WATCHLISTS.nyse];
+  // DYNAMICS WERE INVISIBLE TO THIS, AND DYNAMICS ARE THE ONES THAT GAP.
+  // The static watchlists are large caps that rarely move 3% overnight. Venus's dynamic
+  // adds are speculative names picked precisely BECAUSE something happened to them, and
+  // they were the only symbols the gap system could not see — so the block that exists
+  // to stop the engine buying a 30% overnight move never covered the 30% overnight moves.
+  // Anything currently HELD is included too: a gap matters most in a name already owned.
+  const symbols  = [...new Set([
+    ...WATCHLISTS.nasdaq, ...WATCHLISTS.nyse,
+    ...Object.keys(dynamicSymbols),
+    ...Object.keys(portfolio.longPositions), ...Object.keys(portfolio.shortPositions),
+  ])];
   const now      = Date.now();
   const todayStr = getEasternTimeParts().dateStr;
 
@@ -4890,10 +4908,16 @@ function computeMarketBreadth() {
   sentimentData.breadthScore = breadth;
 
   // SPY momentum as a market-wide directional filter
-  const spyMom = (spyData.price && spyData.prevClose && spyData.prevClose > 0)
+  // Truthiness is not finiteness. This value is persisted AND it feeds
+  // detectMarketRegime, which feeds Jupiter's 10-feature vector and Mercury's 12 — so a
+  // single non-finite reading propagates into two learners and the saved state. The WS
+  // writer already rejects a bad price and the restore now validates one, but the cost of
+  // checking here is a comparison and the cost of not checking is two poisoned models.
+  const spyMom = (Number.isFinite(spyData.price) && spyData.price > 0
+                  && Number.isFinite(spyData.prevClose) && spyData.prevClose > 0)
     ? (spyData.price - spyData.prevClose) / spyData.prevClose
     : 0;
-  sentimentData.spyMomentum = spyMom;
+  sentimentData.spyMomentum = Number.isFinite(spyMom) ? spyMom : 0;
 
   // Combine: breadth drives 70% of sentiment, SPY momentum adds 30%.
   // Map SPY momentum to a 0-1 scale (±2% move maps to 0.2–0.8).
@@ -5489,13 +5513,39 @@ function getNotionalExposure() {
 }
 
 // Sector exposure check — prevents correlated clusters
+// Tickers that will be positions shortly: an entry order sitting at the broker, not yet
+// filled and therefore not yet in the book. The heat cap was fixed for exactly this race
+// (pendingEntryNotional); the COUNTING caps were not, and they run on the same clock.
+// In broker-authoritative mode a position is booked only when pollPendingOrders (every
+// 3s) sees the fill, while evaluateAndTrade re-scans every 2s and a limit entry can rest
+// for up to ORDER_TIMEOUT_MS before it is cancelled. Every tick in that window sees a
+// book that does not yet contain the order just sent, so the same sector — or the same
+// position slot — can be approved repeatedly.
+function pendingEntryTickers() {
+  const out = new Set();
+  for (const o of Object.values(pendingOrders)) {
+    if (o && o.kind === 'entry' && typeof o.ticker === 'string') out.add(o.ticker);
+  }
+  return out;
+}
+
+// How many position SLOTS are committed: booked plus in flight. Deduped, because an add
+// to a name already held is not a new slot.
+function committedPositionCount() {
+  const held = new Set([...Object.keys(portfolio.longPositions),
+                        ...Object.keys(portfolio.shortPositions)]);
+  for (const t of pendingEntryTickers()) held.add(t);
+  return held.size;
+}
+
 function sectorExposureFor(sector) {
   if (!sector) return 0;
   const sectorOf = t => SYMBOL_SECTOR[t] || (dynamicSymbols[t] ? 'dynamic' : undefined);
-  let count = 0;
-  Object.keys(portfolio.longPositions).forEach(t  => { if (sectorOf(t) === sector) count++; });
-  Object.keys(portfolio.shortPositions).forEach(t => { if (sectorOf(t) === sector) count++; });
-  return count;
+  const seen = new Set();
+  Object.keys(portfolio.longPositions).forEach(t  => { if (sectorOf(t) === sector) seen.add(t); });
+  Object.keys(portfolio.shortPositions).forEach(t => { if (sectorOf(t) === sector) seen.add(t); });
+  for (const t of pendingEntryTickers()) if (sectorOf(t) === sector) seen.add(t);
+  return seen.size;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -6731,7 +6781,20 @@ async function pollPendingOrders() {
 function dispatchFill(p, o) {
   const fillPrice = Number(o.filled_avg_price);
   const fillQty   = Number(o.filled_qty);
-  if (!(fillPrice > 0) || !(fillQty >= 1)) {
+  // `fillQty >= 1` DISCARDED EVERY FRACTIONAL FILL. Fractional sizing is ON by default
+  // and is the whole reason a small account can trade a $340 share at all — v11.28 added
+  // it precisely so the sizer stops flooring to zero. Every one of those fills came back
+  // as 0.4 or 1.81 shares, failed this test, and was dropped on the floor.
+  //
+  // On an ENTRY that means the position exists at Alpaca and nowhere in ATLAS: no stop,
+  // no heat accounting, no exit path, invisible to every risk gate. On an EXIT it is
+  // worse — the shares are genuinely gone at the broker, unmarkLots clears the in-flight
+  // marks, and the ledger goes on showing a position that no longer exists, complete with
+  // a stop loss guarding nothing. Either way reconcileWithBroker fights it for ever.
+  //
+  // The real requirement is a positive, finite quantity. A broker cannot fill less than
+  // nothing, and 0.000001 shares is still a fill that has to be booked.
+  if (!(fillPrice > 0) || !Number.isFinite(fillQty) || !(fillQty > 0)) {
     console.error(`[BROKER] ${p.kind} ${p.ticker} filled with bad numbers (px=${o.filled_avg_price}, qty=${o.filled_qty}) — skipping book`);
     if (p.kind !== 'entry') unmarkLots(p.ticker, p.direction, p.kind, p.rung);
     return;
@@ -7906,7 +7969,12 @@ function buildStateObject() {
       spyMomentum:  sentimentData.spyMomentum,
       uptickRatio:  sentimentData.uptickRatio
     },
-    spyData,
+    // SANITISED ON THE WAY OUT. The state file is the thing that survives a restart, so
+    // the invariant worth holding is that it never contains a non-finite number at all —
+    // whatever happened in memory. JSON.stringify turns Infinity into null, which reloads
+    // as a DIFFERENT kind of corruption, so writing it and hoping is not a strategy.
+    spyData: { price: Number.isFinite(spyData.price) && spyData.price > 0 ? spyData.price : null,
+               prevClose: Number.isFinite(spyData.prevClose) && spyData.prevClose > 0 ? spyData.prevClose : null },
     // BUG 3 FIX: persist gapData so gap blocks survive a restart.
     // (candleData itself is too large to persist and is rebuilt by fetchCandles.)
     gapData,
@@ -8072,7 +8140,13 @@ function loadState() {
     
     if (state.capitalSystem)  Object.assign(capitalSystem, state.capitalSystem);
     if (state.pendingOrders)  pendingOrders = state.pendingOrders;
-    if (state.spyData)        Object.assign(spyData, state.spyData);
+    // Object.assign copied whatever was in the file, unvalidated — including a non-finite
+    // price, which then flows into spyMomentum and the market regime.
+    if (state.spyData && typeof state.spyData === 'object') {
+      const sp = Number(state.spyData.price), pc = Number(state.spyData.prevClose);
+      spyData.price     = (Number.isFinite(sp) && sp > 0) ? sp : null;
+      spyData.prevClose = (Number.isFinite(pc) && pc > 0) ? pc : null;
+    }
 
     clearOrphanedInFlightMarks();   // see the function — prevents permanently-dead stop-losses
     if (state.aiSystem) {
@@ -8110,12 +8184,20 @@ function loadState() {
       riskSystem.lossHaltUntil      = state.riskSystem.lossHaltUntil      ?? 0;
     }
     if (state.sentimentData) {
-      sentimentData.general      = state.sentimentData.general      ?? 0.5;
-      sentimentData.byMarket.nasdaq = state.sentimentData.byMarket?.nasdaq ?? 0.5;
-      sentimentData.byMarket.nyse   = state.sentimentData.byMarket?.nyse   ?? 0.5;
-      sentimentData.breadthScore = state.sentimentData.breadthScore ?? 0.5;
-      sentimentData.spyMomentum  = state.sentimentData.spyMomentum  ?? 0;
-      sentimentData.uptickRatio  = state.sentimentData.uptickRatio  ?? 0.5;
+      // `??` CATCHES null AND undefined. IT DOES NOT CATCH NaN OR Infinity.
+      // (NaN ?? 0) is NaN. And JSON.parse('1e999') is Infinity, so a corrupt or truncated
+      // state file can hand these straight back — after which spyMomentum feeds
+      // detectMarketRegime, which feeds Jupiter's feature vector and Mercury's. The rest
+      // of this file already restores defensively (jupiter.loadState filters every
+      // training vector, mercury.loadState filters every open prediction); these lines
+      // were the exception.
+      const num = (v, d) => (typeof v === 'number' && Number.isFinite(v)) ? v : d;
+      sentimentData.general      = num(state.sentimentData.general, 0.5);
+      sentimentData.byMarket.nasdaq = num(state.sentimentData.byMarket?.nasdaq, 0.5);
+      sentimentData.byMarket.nyse   = num(state.sentimentData.byMarket?.nyse, 0.5);
+      sentimentData.breadthScore = num(state.sentimentData.breadthScore, 0.5);
+      sentimentData.spyMomentum  = num(state.sentimentData.spyMomentum, 0);
+      sentimentData.uptickRatio  = num(state.sentimentData.uptickRatio, 0.5);
     }
     // BUG 3 FIX: restore gapData but only blocks that haven't expired yet,
     // so a symbol blocked for 25 more minutes stays blocked across a restart.
@@ -8592,6 +8674,18 @@ function createMercury() {
 
   const clip01 = (x) => Math.max(0, Math.min(1, x));
   const fin = (x, d = 0) => (typeof x === 'number' && Number.isFinite(x)) ? x : d;
+  // `px > 0` IS TRUE FOR INFINITY. Found by the adversarial soak, 2026-09-22: a single
+  // non-finite price in marketData set a prediction's high-water mark to Infinity
+  // PERMANENTLY, wrote a non-finite number into the state file (which JSON.stringify
+  // turns into null, so the corruption survives the round trip as a different kind of
+  // corruption), and — worst of all — resolveOne computed r = (Infinity - price)/price,
+  // labelled the sample UP, and trained the model on it. One bad tick would have
+  // poisoned the training data the skill gate is computed from, which is the one number
+  // in this whole subsystem that has to be trustworthy.
+  const livePrice = (sym) => {
+    const v = marketData[sym]?.price;
+    return (typeof v === 'number' && Number.isFinite(v) && v > 0) ? v : null;
+  };
 
   // ── VOLATILITY ───────────────────────────────────────────────────────────
   // EWMA(lambda=0.94) on 1-minute log returns — the RiskMetrics parameter, used here
@@ -8675,7 +8769,7 @@ function createMercury() {
   // non-finites, because OnlineLogistic will happily train on a NaN-shaped hole.
   function featuresFor(sym) {
     const md = marketData[sym];
-    if (!md || !(md.price > 0)) return null;
+    if (!md || livePrice(sym) === null) return null;
     const hist = Array.isArray(md.history) ? md.history : [];
     const px = md.price;
     const sig1d = sigmaFor(sym, 390);
@@ -8738,7 +8832,7 @@ function createMercury() {
   function forecast(sym, { record = false } = {}) {
     if (!MERCURY_ON) return null;
     const md = marketData[sym];
-    if (!md || !(md.price > 0)) return null;
+    if (!md || livePrice(sym) === null) return null;
     const now = _now();
     const age = now - fin(md.lastUpdate, 0);
     // STALE DATA IS NOT EVIDENCE ABOUT NOW. Freshness multiplies confidence rather than
@@ -8868,10 +8962,10 @@ function createMercury() {
     let resolved = 0;
     for (const id of Object.keys(open)) {
       const p = open[id];
-      const px = marketData[p.sym]?.price;
-      if (px > 0) { p.hi = Math.max(p.hi, px); p.lo = Math.min(p.lo, px); }
+      const px = livePrice(p.sym);
+      if (px !== null) { p.hi = Math.max(p.hi, px); p.lo = Math.min(p.lo, px); }
       if (now < p.resolveAt) continue;
-      if (!(px > 0)) { delete open[id]; continue; }   // no price to score against
+      if (px === null) { delete open[id]; continue; }   // no usable price to score against
       resolveOne(p, px);
       delete open[id];
       resolved++;
@@ -8881,6 +8975,10 @@ function createMercury() {
 
   function resolveOne(p, px) {
     const r = (px - p.price) / p.price;
+    // Belt and braces: the caller already filtered, but a sample that reaches the model
+    // with a non-finite return would shift both the Brier score and the weights, and the
+    // skill gate reads both. Refuse rather than guess.
+    if (!Number.isFinite(r) || !Number.isFinite(p.sigma) || p.sigma <= 0) return;
     const band = MERCURY_BAND * p.sigma;
     const wasUp = r > band ? 1 : 0;
     const wasDown = r < -band ? 1 : 0;
@@ -8993,7 +9091,9 @@ function createMercury() {
       open = {};
       for (const p of s.open.slice(-MERCURY_OPEN_MAX)) {
         if (p && typeof p.sym === 'string' && Array.isArray(p.f) && p.f.length === MERCURY_DIM
-            && Number.isFinite(p.resolveAt) && p.price > 0) open[p.id] = p;
+            && Number.isFinite(p.resolveAt) && Number.isFinite(p.price) && p.price > 0
+            && Number.isFinite(p.hi) && Number.isFinite(p.lo)
+            && p.f.every(x => Number.isFinite(x))) open[p.id] = p;
       }
     }
     if (s.lastRecorded && typeof s.lastRecorded === 'object') {
@@ -9559,7 +9659,10 @@ function evaluateAndTrade() {
   const _ddTotal = computeDrawdown(riskSystem.peakTotalValue || totalValue, totalValue);
   riskSystem.peakTotalValue    = Math.max(riskSystem.peakTotalValue || 0, _ddTotal.peak, totalValue);
   riskSystem.totalDrawdown     = _ddTotal.drawdown;
-  if (CORE_HOLD_ON && riskSystem.totalDrawdown >= Math.min(0.5, capitalSystem.emergencyDrawdown * 2)) {
+  // Named, because the release branch below has to test the SAME threshold. Computing it
+  // twice is how the two drifted apart in the first place.
+  const ACCOUNT_EMERGENCY_DD = Math.min(0.5, capitalSystem.emergencyDrawdown * 2);
+  if (CORE_HOLD_ON && riskSystem.totalDrawdown >= ACCOUNT_EMERGENCY_DD) {
     if (!capitalSystem.emergencyStop)
       console.log(`[EMERGENCY] Account-wide drawdown ${(riskSystem.totalDrawdown*100).toFixed(1)}% — halting entries`);
     capitalSystem.emergencyStop = true;
@@ -9573,7 +9676,23 @@ function evaluateAndTrade() {
   if (riskSystem.currentDrawdown >= capitalSystem.emergencyDrawdown) {
     if (!capitalSystem.emergencyStop) console.log('[EMERGENCY] Severe drawdown — halting entries');
     capitalSystem.emergencyStop = true;
-  } else if (riskSystem.currentDrawdown < capitalSystem.emergencyDrawdown * 0.6) {
+  } else if (riskSystem.currentDrawdown < capitalSystem.emergencyDrawdown * 0.6
+             && !capitalSystem.emergencyStopManual
+             && !(CORE_HOLD_ON && riskSystem.totalDrawdown >= ACCOUNT_EMERGENCY_DD)) {
+    // TWO THINGS THIS MUST NOT UNDO, AND IT UNDID BOTH.
+    //
+    // 1. A HUMAN'S EMERGENCY STOP. /api/emergency sets emergencyStopManual, and this
+    //    branch cleared emergencyStop without ever looking at it — so the operator hit
+    //    the big red button and, on the very next two-second tick, trading resumed. The
+    //    safeMode line directly above has always checked !safeModeManual; the emergency
+    //    stop, which is the more serious of the two, did not.
+    //
+    // 2. THE ACCOUNT-WIDE BACKSTOP SET ELEVEN LINES EARLIER. That check measures
+    //    totalDrawdown (equity INCLUDING the core); this one measures currentDrawdown
+    //    (the trading book alone). With the core at 97% the trading book is a rounding
+    //    error, so its drawdown sits near zero while the account is down 40% — and this
+    //    branch cleared the halt in the same function call that raised it. The
+    //    account-wide backstop had therefore never halted anything in its life.
     capitalSystem.emergencyStop = false;
   }
 
@@ -9670,8 +9789,10 @@ function evaluateAndTrade() {
   }
 
   // ── 4. POSITION COUNT + CAPITAL CHECK ─────────────────────────────────────
-  const openCount = Object.keys(portfolio.longPositions).length
-                  + Object.keys(portfolio.shortPositions).length;
+  // Booked AND in flight — see committedPositionCount. Counting only the book let the
+  // 2-second scan approve a ninth, tenth and eleventh entry while the eighth was still
+  // resting at the broker unfilled.
+  const openCount = committedPositionCount();
   if (openCount >= MAX_OPEN_POSITIONS) return;
   if (capitalSystem.tradingCapital < minimumTradingCapital()) return;
 
@@ -10374,8 +10495,27 @@ app.post('/api/tradingview-webhook', (req, res) => {
   const price = marketData[symbol]?.price;
   if (!Number.isFinite(price) || price <= 0) return res.status(409).json({ ok: false, error: 'no-price-for-symbol' });
 
-  // Global guards still apply even to external signals
+  // Global guards still apply even to external signals.
+  //
+  // THIS USED TO BE ONE LINE, AND THE COMMENT ABOVE CLAIMED "ATLAS's full risk pipeline".
+  // Half of that was true: executeLong still runs buildTradePlan and terraValidateTrade,
+  // so the stop, the R:R, the price band, the size floor, the broker-fundability check,
+  // the cooldown, the heat cap and the sector cap all applied. What did NOT apply was
+  // every gate that lives in evaluateAndTrade rather than in Terra — and those are the
+  // KILL SWITCHES. A webhook could open a position while the consecutive-loss halt was
+  // active, while the price feed was stale, while the account was over its daily loss
+  // limit, and past MAX_OPEN_POSITIONS, because none of those are Terra's job.
+  // An external signal is not a reason to override a halt; it is the reason to have one.
   if (capitalSystem.emergencyStop) return res.status(423).json({ ok: false, error: 'emergency-stop-active' });
+  if (action !== 'close') {
+    const kill = getKillSwitchReason();
+    if (kill) return res.status(423).json({ ok: false, error: 'halted', reason: kill });
+    const openCount = committedPositionCount();
+    if (openCount >= MAX_OPEN_POSITIONS)
+      return res.status(429).json({ ok: false, error: 'max-positions', open: openCount, max: MAX_OPEN_POSITIONS });
+    if (riskSystem.riskLevel === 'elevated')
+      return res.status(423).json({ ok: false, error: 'risk-elevated', failing: riskSystem.checksPassing });
+  }
 
   let result;
   if (action === 'close') {
@@ -10729,6 +10869,11 @@ module.exports = {
     setBenchmarkStart: (v) => { _benchmarkStart = v; }, setDividendsTotal: (v) => { _dividendsTotal = v; }, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, CORE_BASKET_MAX_NAMES, CORE_TRIMS_PER_CYCLE, cashDriftMin, CASH_DRIFT_ABS, adoptBrokerCashDrift,
     MAX_DAY_VOLUME_SHARE, intendedPositionNotional, verifyStateDir,
     desiredWsSymbols, syncWsSubscription, wsSymbolPriority, WATCHLISTS,
+    pendingEntryTickers, committedPositionCount, dispatchFill, isInsideSessionBuffer,
+    detectOvernightGaps, MAX_OPEN_POSITIONS, MAX_SECTOR_EXPOSURE, sectorExposureFor,
+    // Test-only handles for the main loop and the state writer, so a soak harness can
+    // drive the REAL tick with hostile data instead of a reimplementation of it.
+    evaluateAndTrade, updateSymbolMetrics, buildIntelSummary, buildStateObject,
     // ☿ v13.66 — the forecaster and the decision layer
     mercury, MERCURY_ON, MERCURY_HORIZONS, MERCURY_FEATURES, MERCURY_DIM, MERCURY_BAND,
     MERCURY_MIN_SAMPLES, MERCURY_SKILL_FLOOR, MERCURY_PRIOR_K, MERCURY_COND_MEAN,

@@ -5704,6 +5704,346 @@ check('holding is not billed for an entry it already made', () => {
   } finally { restoreMercury(snap); }
 });
 
+check('a non-finite price is refused, not absorbed', () => {
+  // FOUND BY THE ADVERSARIAL SOAK, 2026-09-22. `px > 0` is TRUE for Infinity. A single
+  // non-finite price set a prediction's high-water mark to Infinity permanently, wrote a
+  // non-finite number into the state file, and — the expensive part — resolveOne computed
+  // r = (Infinity - price)/price, labelled the sample UP, and TRAINED THE MODEL ON IT.
+  // One bad tick would have poisoned the data the skill gate is computed from, which is
+  // the one number in this subsystem that has to be trustworthy.
+  const snap = snapMercury();
+  const savedMd = I.marketData.ZINF;
+  try {
+    seedPath('ZINF', mkPath([[80, 0.001]]));
+    I.mercury.resetRecordClock();
+    I.mercury.forecast('ZINF', { record: true });
+    const ids = Object.keys(I.mercury.getOpen()).filter(k => I.mercury.getOpen()[k].sym === 'ZINF');
+    ok(ids.length > 0, 'premise: a prediction was recorded');
+    const before = { ...I.mercury.getOpen()[ids[0]] };
+
+    for (const poison of [Infinity, -Infinity, NaN, 0, -5, null, undefined]) {
+      I.marketData.ZINF.price = poison;
+      I.mercury.sweep();                       // water-mark pass
+      for (const id of ids) {
+        const p = I.mercury.getOpen()[id];
+        if (!p) continue;
+        ok(Number.isFinite(p.hi) && Number.isFinite(p.lo),
+           `a price of ${poison} corrupted the excursion marks: hi=${p.hi} lo=${p.lo}`);
+        eq(p.hi, before.hi, `hi must be untouched by a price of ${poison}`);
+        eq(p.lo, before.lo, `lo must be untouched by a price of ${poison}`);
+      }
+    }
+    // And a poisoned price must not produce a forecast at all.
+    for (const poison of [Infinity, NaN, 0, -1]) {
+      I.marketData.ZINF.price = poison;
+      I.mercury.clearCache();
+      eq(I.mercury.forecast('ZINF'), null,
+         `a price of ${poison} must yield no forecast, not a forecast built on it`);
+    }
+    // The guard must be finiteness, not just positivity — that was the actual bug.
+    const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                  .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+    ok(/const livePrice = \(sym\) => \{/.test(src), 'there must be one guarded price reader');
+    ok(/Number\.isFinite\(v\) && v > 0\) \? v : null;/.test(src),
+       'and it must check finiteness, not only sign');
+    const sw = src.slice(src.indexOf('function sweep(now = _now())'), src.indexOf('function resolveOne'));
+    ok(!/px > 0/.test(sw), 'the sweep must not test a raw price with > 0 any more');
+    ok(/livePrice\(p\.sym\)/.test(sw), 'it must go through the guarded reader');
+    const ro = src.slice(src.indexOf('function resolveOne'), src.indexOf('const ledger = []'));
+    ok(/if \(!Number\.isFinite\(r\) \|\| !Number\.isFinite\(p\.sigma\) \|\| p\.sigma <= 0\) return;/.test(ro),
+       'and resolveOne must refuse to train on a sample it cannot trust');
+  } finally {
+    if (savedMd) I.marketData.ZINF = savedMd; else delete I.marketData.ZINF;
+    for (const id of Object.keys(I.mercury.getOpen()))
+      if (I.mercury.getOpen()[id].sym === 'ZINF') delete I.mercury.getOpen()[id];
+    restoreMercury(snap);
+  }
+});
+
+check('the state file can never contain a non-finite number', () => {
+  // JSON.stringify turns Infinity into null, so writing one and hoping means it reloads
+  // as a DIFFERENT kind of corruption. And `??` on the way back in catches null and
+  // undefined but NOT NaN — (NaN ?? 0) is NaN — while JSON.parse('1e999') is Infinity,
+  // so a corrupt or truncated file can hand one straight back.
+  const sd = I.spyData;
+  const saved = { p: sd.price, pc: sd.prevClose };
+  try {
+    for (const poison of [Infinity, -Infinity, NaN, -1, 0]) {
+      sd.price = poison; sd.prevClose = poison;
+      const blob = I.buildStateObject();
+      const bad = [];
+      (function scan(o, path, seen) {
+        if (!o || typeof o !== 'object' || seen.has(o)) return; seen.add(o);
+        for (const [k, v] of Object.entries(o)) {
+          const pth = path ? `${path}.${k}` : k;
+          if (typeof v === 'number' && !Number.isFinite(v)) bad.push(`${pth}=${v}`);
+          else if (v && typeof v === 'object') scan(v, pth, seen);
+        }
+      })(blob, '', new Set());
+      eq(bad.length, 0, `a spyData price of ${poison} leaked into the state: ${bad.join(', ')}`);
+      // And the computed momentum that feeds the market regime must stay finite.
+      I.computeMarketBreadth();
+      ok(Number.isFinite(I.sentimentData.spyMomentum),
+         `spyMomentum went non-finite on a price of ${poison} — it feeds detectMarketRegime, ` +
+         "which feeds Jupiter's feature vector and Mercury's");
+      eq(I.sentimentData.spyMomentum, 0,
+         `a price of ${poison} must produce a momentum of exactly 0, not a number derived ` +
+         'from it — the outer isFinite guard catching a NaN is the backstop, not the rule');
+    }
+  } finally { sd.price = saved.p; sd.prevClose = saved.pc; }
+});
+
+check('a corrupt state file is not trusted on the way back in', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/const num = \(v, d\) => \(typeof v === 'number' && Number\.isFinite\(v\)\) \? v : d;/.test(src),
+     'restored sentiment numbers must be validated, not ?? -defaulted');
+  // POSITIVE, NOT NEGATIVE. The first version of this asserted the ABSENCE of one exact
+  // string, double spaces and all, and a mutation that reintroduced `?? 0` with single
+  // spacing walked straight past it. Assert what must be TRUE instead.
+  for (const f of ['general', 'breadthScore', 'spyMomentum', 'uptickRatio']) {
+    ok(new RegExp(`sentimentData\\.${f}\\s*= num\\(state\\.sentimentData\\.${f}`).test(src),
+       `${f} must be restored through the finite-check helper, not ??`);
+  }
+  ok(!/= state\.sentimentData\.\w+\s*\?\? /.test(src),
+     'no sentiment field may be restored with ?? — it catches null but not NaN');
+  ok(!/if \(state\.spyData\)        Object\.assign\(spyData, state\.spyData\);/.test(src),
+     'spyData must not be Object.assign-ed straight out of the file');
+  ok(/spyData\.price     = \(Number\.isFinite\(sp\) && sp > 0\) \? sp : null;/.test(src),
+     'it must be validated field by field');
+  // Mercury's own restore filter must reject a corrupt open prediction rather than load it.
+  const snap = snapMercury();
+  try {
+    const blob = I.mercury.serialize();
+    blob.open = [
+      { id: 'bad1', sym: 'X', h: 'short', at: 1, price: Infinity, sigma: 0.01, pUp: 0.3, pDown: 0.3,
+        resolveAt: 2, hi: 1, lo: 1, f: new Array(I.MERCURY_DIM).fill(0) },
+      { id: 'bad2', sym: 'X', h: 'short', at: 1, price: 10, sigma: 0.01, pUp: 0.3, pDown: 0.3,
+        resolveAt: 2, hi: Infinity, lo: 1, f: new Array(I.MERCURY_DIM).fill(0) },
+      { id: 'bad3', sym: 'X', h: 'short', at: 1, price: 10, sigma: 0.01, pUp: 0.3, pDown: 0.3,
+        resolveAt: 2, hi: 1, lo: 1, f: new Array(I.MERCURY_DIM).fill(NaN) },
+    ];
+    I.mercury.loadState(blob);
+    const open = I.mercury.getOpen();
+    for (const id of ['bad1', 'bad2', 'bad3'])
+      ok(!open[id], `a corrupt open prediction (${id}) must be dropped, not restored`);
+  } finally { restoreMercury(snap); }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  v13.67 — SEVEN RISK-GATE DEFECTS
+// ════════════════════════════════════════════════════════════════════════════
+group('v13.67 — gates that did not gate');
+
+check('a fractional fill is booked, not thrown away', () => {
+  // THE WORST BUG IN THIS FILE'S HISTORY, AND IT WAS ONE COMPARISON.
+  // dispatchFill required `fillQty >= 1`. Fractional sizing is ON by default and is the
+  // entire reason a small account can trade a $340 share — v11.28 added it so the sizer
+  // stops flooring to zero. Every fractional fill therefore failed this test and was
+  // dropped. On an ENTRY the position exists at Alpaca and nowhere in ATLAS: no stop, no
+  // heat, no exit, invisible to every gate. On an EXIT the shares are genuinely gone and
+  // the ledger keeps showing a position that is not there, guarded by a stop on nothing.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function dispatchFill'), src.indexOf('function accountIdentityChanged'));
+  ok(!/fillQty >= 1/.test(fn),
+     'a fractional fill must not be rejected for being under one share');
+  ok(/!Number\.isFinite\(fillQty\) \|\| !\(fillQty > 0\)/.test(fn),
+     'the requirement is a positive FINITE quantity — a broker cannot fill less than nothing');
+
+  // BEHAVIOURAL. Drive the real dispatcher with a real fractional fill.
+  const saved = { cash: I.portfolio.cash };
+  try {
+    resetBook();
+    seedSymbol('ZFRAC', 340);
+    const plan = I.buildTradePlan('ZFRAC', 'LONG', 340, 5, 'test');
+    plan.shares = 0.4;
+    I.dispatchFill({ kind: 'entry', ticker: 'ZFRAC', direction: 'LONG', plan },
+                   { filled_avg_price: 340, filled_qty: 0.4 });
+    const lots = I.portfolio.longPositions.ZFRAC;
+    ok(lots && lots.length === 1,
+       'a 0.4-share fill must produce a position in the book, not a console error');
+    near(lots[0].qty, 0.4, 1e-9, 'with the quantity the broker actually filled');
+    ok(lots[0].stopPrice > 0 || plan.stop.price > 0, 'and it must carry its stop');
+    // A genuinely bad fill must still be refused.
+    for (const bad of [0, -1, NaN, Infinity]) {
+      resetBook(); seedSymbol('ZBAD', 100);
+      const p2 = I.buildTradePlan('ZBAD', 'LONG', 100, 5, 'test');
+      I.dispatchFill({ kind: 'entry', ticker: 'ZBAD', direction: 'LONG', plan: p2 },
+                     { filled_avg_price: 100, filled_qty: bad });
+      ok(!I.portfolio.longPositions.ZBAD,
+         `a filled_qty of ${bad} must still be refused`);
+    }
+  } finally { resetBook(); I.portfolio.cash = saved.cash; }
+});
+
+check('the operator\'s emergency stop is not undone two seconds later', () => {
+  // /api/emergency sets emergencyStopManual, and the automatic release cleared
+  // emergencyStop without ever consulting it — so the big red button held for exactly one
+  // tick. The safeMode line directly above has always checked !safeModeManual; the
+  // emergency stop, which is the more serious of the two, did not.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/capitalSystem\.emergencyStopManual = stop;/.test(src),
+     'premise: the API records that the halt was a human decision');
+  const rel = src.slice(src.indexOf('} else if (riskSystem.currentDrawdown < capitalSystem.emergencyDrawdown * 0.6'));
+  ok(/!capitalSystem\.emergencyStopManual/.test(rel.slice(0, 400)),
+     'the automatic release must refuse to clear a manually-set emergency stop');
+  ok(/!\(CORE_HOLD_ON && riskSystem\.totalDrawdown >= ACCOUNT_EMERGENCY_DD\)/.test(rel.slice(0, 400)),
+     'and must refuse to clear the account-wide backstop set eleven lines earlier');
+});
+
+check('the account-wide backstop is not cleared by the same function that sets it', () => {
+  // With the core at 97% the trading book is a rounding error, so ITS drawdown sits near
+  // zero while the whole account is down 40%. The account-wide check set emergencyStop
+  // and the trading-drawdown release cleared it in the same call — every tick, for ever.
+  // The backstop had never halted anything in its life.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/const ACCOUNT_EMERGENCY_DD = Math\.min\(0\.5, capitalSystem\.emergencyDrawdown \* 2\);/.test(src),
+     'the account-wide threshold must be named once, not recomputed at each site');
+  const iSet = src.indexOf('riskSystem.totalDrawdown >= ACCOUNT_EMERGENCY_DD');
+  const iRel = src.indexOf('} else if (riskSystem.currentDrawdown < capitalSystem.emergencyDrawdown * 0.6');
+  ok(iSet > 0 && iRel > iSet, 'the release must come after the set, as it does');
+  ok(src.slice(iRel, iRel + 400).includes('ACCOUNT_EMERGENCY_DD'),
+     'and must test the SAME threshold rather than a different drawdown measure');
+  // The two measure different books, and that is the point.
+  ok(/riskSystem\.totalDrawdown     = _ddTotal\.drawdown;/.test(src),
+     'totalDrawdown is account-wide (includes the core)');
+  ok(/riskSystem\.currentDrawdown = _dd\.drawdown;/.test(src),
+     'currentDrawdown is the trading book alone');
+});
+
+check('a TradingView signal cannot trade through a kill switch', () => {
+  // The comment claimed "ATLAS's full risk pipeline". Half true: executeLong still runs
+  // buildTradePlan and terraValidateTrade, so the stop, R:R, price band, size floor,
+  // broker fundability, cooldown, heat and sector caps all applied. What did not apply
+  // was every gate living in evaluateAndTrade — which is where the KILL SWITCHES are.
+  // An external signal is not a reason to override a halt; it is the reason to have one.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const hook = src.slice(src.indexOf("app.post('/api/tradingview-webhook'"));
+  const body = hook.slice(0, hook.indexOf('\napp.'));
+  ok(/if \(capitalSystem\.emergencyStop\) return res\.status\(423\)/.test(body),
+     'the emergency stop must still apply');
+  ok(/const kill = getKillSwitchReason\(\);/.test(body),
+     'the consecutive-loss halt, stale-price halt and feed halt must apply');
+  ok(/openCount >= MAX_OPEN_POSITIONS/.test(body), 'the position cap must apply');
+  ok(/riskSystem\.riskLevel === 'elevated'/.test(body),
+     'the daily-loss / drawdown / heat risk level must apply');
+  // A CLOSE must never be blocked by any of them — refusing to let a position out is the
+  // one thing worse than letting one in.
+  const iClose = body.indexOf("if (action !== 'close')");
+  ok(iClose > 0, 'the new gates must be scoped to opening actions only');
+  ok(body.indexOf("action === 'close'") > iClose,
+     'and the close branch must sit outside them');
+});
+
+check('the gap block covers the names that actually gap', () => {
+  // The static watchlists are large caps that rarely move 3% overnight. Venus's dynamic
+  // adds are speculative names chosen precisely BECAUSE something happened to them — and
+  // they were the only symbols detectOvernightGaps could not see. The block that exists
+  // to stop the engine buying a 30% overnight move never covered 30% overnight moves.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function detectOvernightGaps'), src.indexOf('function getGapSizeAdjust'));
+  ok(/Object\.keys\(dynamicSymbols\)/.test(fn),
+     'dynamic symbols must be scanned for gaps');
+  ok(/Object\.keys\(portfolio\.longPositions\), \.\.\.Object\.keys\(portfolio\.shortPositions\)/.test(fn),
+     'and anything currently held — a gap matters most in a name already owned');
+  ok(/new Set\(\[/.test(fn), 'the union must be deduped');
+
+  const savedDyn = { ...I.dynamicSymbols };
+  try {
+    I.dynamicSymbols.ZGAP = { addedAt: Date.now(), source: 'test', catalyst: 'other' };
+    I.marketData.ZGAP = { price: 52, prevClose: 40, dayOpen: 52, high: 53, low: 51,
+                          dailyVolume: 5e6, lastUpdate: Date.now(), history: [52] };
+    I.candleData.ZGAP = { m1: Array.from({ length: 40 }, (_, i) => ({ t: i, o: 52, h: 52.1, l: 51.9, c: 52, v: 1000 })) };
+    I.detectOvernightGaps();
+    const g = I.gapData.ZGAP;
+    ok(g, 'a +30% gap on a dynamic symbol must be detected at all');
+    ok(g.gapPct > 0.03, `and recorded as a real gap, got ${g && g.gapPct}`);
+    ok(I.isGapBlocked('ZGAP'), 'and must block entries');
+  } finally {
+    delete I.dynamicSymbols.ZGAP; Object.assign(I.dynamicSymbols, savedDyn);
+    delete I.marketData.ZGAP; delete I.candleData.ZGAP; delete I.gapData.ZGAP;
+  }
+});
+
+check('an order in flight counts against the position and sector caps', () => {
+  // The heat cap was fixed for this exact race (pendingEntryNotional). The COUNTING caps
+  // were not, and they run on the same clock: a position is booked only when
+  // pollPendingOrders (3s) sees the fill, while the scan re-runs every 2s and a limit
+  // entry can rest at the broker until it times out. Every tick in that window saw a book
+  // that did not contain the order just sent.
+  const savedPending = I.getPendingOrders();
+  try {
+    resetBook();
+    I.setPendingOrders({});
+    eq(I.committedPositionCount(), 0, 'an empty book with nothing in flight is zero');
+    seedSymbol('ZAAA', 50); seedSymbol('ZBBB', 50);
+    I.portfolio.longPositions.ZAAA = [{ qty: 1, entryPrice: 50, highestPnL: 0, openedAt: Date.now(), atrFrac: 0.02, partialsTaken: {} }];
+    eq(I.committedPositionCount(), 1, 'one booked position is one');
+    I.setPendingOrders({ o1: { kind: 'entry', ticker: 'ZBBB', direction: 'LONG', qty: 1, refPrice: 50 } });
+    eq(I.committedPositionCount(), 2,
+       'an entry resting at the broker must occupy a slot before it is booked');
+    // An ADD to a name already held is not a new slot.
+    I.setPendingOrders({ o1: { kind: 'entry', ticker: 'ZAAA', direction: 'LONG', qty: 1, refPrice: 50 } });
+    eq(I.committedPositionCount(), 1, 'an add to a held name must not double-count');
+    // Exits must never occupy an entry slot.
+    I.setPendingOrders({ o1: { kind: 'exitLong', ticker: 'ZBBB', direction: 'LONG' } });
+    eq(I.committedPositionCount(), 1, 'an exit order is not a pending entry');
+
+    // Same for the sector cap.
+    const sect = I.SYMBOL_SECTOR.AAPL;
+    ok(sect, 'premise: AAPL has a known sector');
+    resetBook(); I.setPendingOrders({});
+    const base = I.sectorExposureFor(sect);
+    I.setPendingOrders({ o1: { kind: 'entry', ticker: 'AAPL', direction: 'LONG', qty: 1, refPrice: 200 } });
+    eq(I.sectorExposureFor(sect), base + 1,
+       'a pending entry must count against its sector, or two can be approved in the window');
+
+    // AND THE CALL SITES MUST ACTUALLY USE IT. Testing the helper alone left the entry
+    // scan free to go back to counting the book — a mutation doing exactly that passed a
+    // green suite.
+    const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                  .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+    const raw = /Object\.keys\(portfolio\.longPositions\)\.length\s*\n?\s*\+ Object\.keys\(portfolio\.shortPositions\)\.length;/g;
+    const rawCounts = (src.match(raw) || []).length;
+    eq(rawCounts, 0,
+       `${rawCounts} place(s) still count open positions straight off the book — every ` +
+       'position-cap check must go through committedPositionCount()');
+    // Slice from AFTER the header: evalFn starts at 'function evaluateAndTrade()', so
+    // indexOf('function ') finds position 0 and the window came back empty — which made
+    // the assertion fail on correct code, the worst kind of test.
+    const iEval = src.indexOf('function evaluateAndTrade()');
+    const evalFn = src.slice(iEval, src.indexOf('\nfunction ', iEval + 10));
+    ok(evalFn.length > 1000, 'the entry scan body must be findable');
+    ok(/const openCount = committedPositionCount\(\);/.test(evalFn),
+       'the entry scan must use the committed count');
+    const hookFn = src.slice(src.indexOf("app.post('/api/tradingview-webhook'"));
+    ok(/const openCount = committedPositionCount\(\);/.test(hookFn.slice(0, 4000)),
+       'and so must the webhook');
+  } finally { resetBook(); I.setPendingOrders(savedPending); }
+});
+
+check('the last-minutes filter uses the real close, not a constant', () => {
+  // resolveSession already honours Alpaca's early closes (13:00 the day after
+  // Thanksgiving, Christmas Eve, July 3rd) and test.js asserts it does — but
+  // isInsideSessionBuffer read the hardcoded 16.0, so on every early-close day the
+  // last-five-minutes guard protected a moment three hours after the bell and the engine
+  // opened positions straight into the closing auction it was written to avoid.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function isInsideSessionBuffer'), src.indexOf('function clearWsStabilityTimer'));
+  ok(/marketCalendar\.ok && marketCalendar\.byDate\.get\(dateStr\)/.test(fn),
+     'the buffer must read the calendar session');
+  ok(/const usClose = \(sess && Number\.isFinite\(sess\.close\)\) \? sess\.close : NASDAQ_NYSE_HOURS\.end;/.test(fn),
+     'using the real close, and falling back to the constant only when there is no calendar');
+  ok(/const usOpen  = NASDAQ_NYSE_HOURS\.start;/.test(fn),
+     'the open stays constant — Alpaca does not publish late opens');
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 console.log(`\n${'─'.repeat(60)}`);
 console.log(`${passed} passed, ${failed} failed`);
