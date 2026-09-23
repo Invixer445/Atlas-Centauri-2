@@ -5435,7 +5435,16 @@ function detectMarketRegime() {
 // ════════════════════════════════════════════════════════════════════════════
 
 function getTotalValue() {
-  let value = portfolio.cash;
+  // THE VAULT IS STILL YOUR MONEY. processProfitVault debits portfolio.cash and credits
+  // capitalSystem.profitVault, but no order is placed and nothing leaves the broker — it
+  // is an earmark, not a withdrawal. Omitting it here understated total equity by exactly
+  // the vaulted amount, and that propagated: tradableValue() fell by $300 on a $300
+  // deposit, and the next risk tick read it as a 3% drawdown on an account that had not
+  // lost a cent — tightening Jupiter's sizing, arming safe mode at 10% and halting
+  // entries at 20%. Every other trading-book cash flow calls rebasePeakForCoreFlow for
+  // exactly this reason; the vault was the one that did not, and counting the money is a
+  // better fix than rebasing around its absence.
+  let value = portfolio.cash + Math.max(0, capitalSystem.profitVault || 0);
   // The core holding is real equity and must count, or every percentage the engine
   // computes off total value (risk sizing, drawdown, exposure) is wrong the moment
   // a core position exists.
@@ -6873,7 +6882,11 @@ async function syncFromBroker() {
       if (accountIdentityChanged(_brokerAccountId, acct.id)) adoptNewAccount(acct);
       if (acct.id) _brokerAccountId = acct.id;
       const prev = portfolio.cash;
-      portfolio.cash = acct.cash;
+      // Same reasoning as adoptBrokerCashDrift: the broker's cash balance CONTAINS the
+      // vaulted money, because vaulting never moved anything. Assigning it raw silently
+      // reversed every vault deposit on each boot while profitVault kept the credit —
+      // which is how a restart could show `vault $2700.00` and undiminished cash at once.
+      portfolio.cash = acct.cash - Math.max(0, capitalSystem.profitVault || 0);
       // FIRST BOOT ONLY. detectStartingCapital refuses to overwrite a value restored
       // from state, so a grown account never silently redefines its own baseline.
       detectStartingCapital(Number.isFinite(acct.equity) ? acct.equity : acct.cash);
@@ -7060,7 +7073,13 @@ function adoptBrokerCashDrift() {
   if (_coreBuyInFlight > 0 || _coreSellInFlight > 0) return 0;
   if (pendingEntryNotional() > 0) return 0;
   if (Object.keys(pendingOrders || {}).length > 0) return 0;
-  const delta = brokerMirror.cash - portfolio.cash;
+  // LEDGER CASH PLUS THE VAULT. The vault debit has no broker counterpart, so comparing
+  // raw ledger cash to broker cash showed a permanent, repeating difference of exactly the
+  // vaulted amount — and this function's stability check (the same delta twice running) is
+  // built to adopt precisely that shape. It handed the $300 straight back into
+  // portfolio.cash while profitVault kept its $300, inventing money out of an internal
+  // transfer and booking it as a dividend in _dividendsTotal.
+  const delta = brokerMirror.cash - (portfolio.cash + Math.max(0, capitalSystem.profitVault || 0));
   if (Math.abs(delta) < cashDriftMin()) return 0;
   // THE DRIFT MUST PERSIST ACROSS TWO SNAPSHOTS BEFORE IT IS BELIEVED.
   // The in-flight counters close the window while an order is outstanding, but they are
@@ -7076,7 +7095,7 @@ function adoptBrokerCashDrift() {
     return 0;
   }
   _lastCashDelta = 0;
-  portfolio.cash = brokerMirror.cash;
+  portfolio.cash = brokerMirror.cash - Math.max(0, capitalSystem.profitVault || 0);
   // Cash appearing from outside is NEW capital to the core, not a gain the trading side
   // made — rebase the peak exactly as a core flow does, or it reads as a drawdown.
   rebasePeakForCoreFlow(-delta);
@@ -7595,7 +7614,29 @@ function partialClose(ticker, direction, fraction, rung, opts = {}) {
       p._pendingRung = rung;
     });
     const total = sells.reduce((sum, x) => sum + x.qty, 0);
-    if (total < 1) return;
+    // A BAIL HERE USED TO LEAVE EVERY LOT MARKED, AND THAT KILLED THE STOP LOSS.
+    //
+    // `p._pendingRung = rung` is set in the loop above, before this guard runs. When the
+    // guard fired, the function returned without submitting an order and without
+    // unmarking — so the mark was permanent for the session. closeLong's phase 1 reads
+    //     if (positions.some(p => p._pendingRung != null)) return;
+    // which means the HARD STOP for that symbol silently stopped working, along with the
+    // trailing stop, every later take-profit rung, and Mercury's predictive exit. The
+    // only cleanup, clearOrphanedInFlightMarks, runs once at boot and never again.
+    //
+    // And the guard itself was wrong for the account this bot is built for. `total < 1`
+    // is a WHOLE-SHARE rule: a 1.81-share lot taking a 40% rung sells 0.724 shares, which
+    // is a perfectly good fractional order, and it tripped this branch every single time.
+    // So on a fractional book the common case was: reach the first take-profit target,
+    // sell nothing, and lose the stop loss for the rest of the day.
+    const minTotal = FRACTIONAL_ENABLED ? 1e-6 : 1;
+    if (!(total >= minTotal)) {
+      sells.forEach(x => {
+        const lot = positions.find(p => p.lotId === x.lotId);
+        if (lot && lot._pendingRung === rung) delete lot._pendingRung;
+      });
+      return;
+    }
     submitBrokerOrder({ kind: 'partial', ticker, direction, fraction, rung, sells,
                         side: direction === 'LONG' ? 'sell' : 'buy', qty: total,
                         refPrice: marketData[ticker]?.price });
@@ -10869,7 +10910,7 @@ module.exports = {
     setBenchmarkStart: (v) => { _benchmarkStart = v; }, setDividendsTotal: (v) => { _dividendsTotal = v; }, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, CORE_BASKET_MAX_NAMES, CORE_TRIMS_PER_CYCLE, cashDriftMin, CASH_DRIFT_ABS, adoptBrokerCashDrift,
     MAX_DAY_VOLUME_SHARE, intendedPositionNotional, verifyStateDir,
     desiredWsSymbols, syncWsSubscription, wsSymbolPriority, WATCHLISTS,
-    pendingEntryTickers, committedPositionCount, dispatchFill, isInsideSessionBuffer,
+    pendingEntryTickers, committedPositionCount, dispatchFill, isInsideSessionBuffer, partialClose,
     detectOvernightGaps, MAX_OPEN_POSITIONS, MAX_SECTOR_EXPOSURE, sectorExposureFor,
     // Test-only handles for the main loop and the state writer, so a soak harness can
     // drive the REAL tick with hostile data instead of a reimplementation of it.

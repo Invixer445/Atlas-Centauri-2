@@ -2657,7 +2657,15 @@ check('broker cash movements are adopted so dividends get reinvested', () => {
                 .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
   const fn = src.slice(src.indexOf('function adoptBrokerCashDrift'), src.indexOf('function executionDriftPct'));
   ok(fn.length > 100, 'adoptBrokerCashDrift must exist');
-  ok(/portfolio\.cash = brokerMirror\.cash;/.test(fn), 'the ledger must conform to the broker');
+  ok(/portfolio\.cash = brokerMirror\.cash - Math\.max\(0, capitalSystem\.profitVault \|\| 0\);/.test(fn),
+     'the ledger must conform to the broker, NET of the vault');
+  // v13.66.2: the vault debits ledger cash with no broker counterpart, so the broker's
+  // balance legitimately exceeds the ledger's by exactly the vaulted amount, for ever.
+  // Comparing them raw made that permanent difference look like a repeating dividend —
+  // and the stability check below is built to adopt exactly that shape, so it handed the
+  // money back while profitVault kept its credit. Money from an internal transfer.
+  ok(/const delta = brokerMirror\.cash - \(portfolio\.cash \+ Math\.max\(0, capitalSystem\.profitVault \|\| 0\)\);/.test(fn),
+     'the drift must be measured against ledger cash PLUS the vault');
   // Anything in flight makes the difference a TIMING artefact: the ledger is debited on
   // submission, the broker only on fill. Adopting then would double-count the spend.
   // BOTH directions. Trims credit the ledger synchronously and the broker pays on fill,
@@ -3081,7 +3089,7 @@ check('a settling order is not mistaken for a dividend', () => {
      'a drift must be seen twice before it is believed');
   ok(/_lastCashDelta = delta;\s*\n\s*return 0;/.test(fn),
      'the first sighting must record the delta and adopt nothing');
-  ok(/_lastCashDelta = 0;\s*\n\s*portfolio\.cash = brokerMirror\.cash;/.test(fn),
+  ok(/_lastCashDelta = 0;\s*\n\s*portfolio\.cash = brokerMirror\.cash -/.test(fn),
      'adopting must clear the record, or the next unrelated drift adopts immediately');
   // The persistence check must come AFTER the size check, or a stream of sub-threshold
   // rounding differences would keep resetting the record and nothing would ever adopt.
@@ -6042,6 +6050,105 @@ check('the last-minutes filter uses the real close, not a constant', () => {
      'using the real close, and falling back to the constant only when there is no calendar');
   ok(/const usOpen  = NASDAQ_NYSE_HOURS\.start;/.test(fn),
      'the open stays constant — Alpaca does not publish late opens');
+});
+
+check('a take-profit that cannot fill must not kill the stop loss', () => {
+  // THE WORST BUG FOUND IN THIS CODEBASE. partialClose phase 1 sets p._pendingRung on
+  // every lot it intends to sell, THEN checks `total < 1` and returns. The return did not
+  // unmark. closeLong's phase 1 reads
+  //     if (positions.some(p => p._pendingRung != null)) return;
+  // so the HARD STOP for that symbol stopped working — silently, for the rest of the
+  // session, along with the trail, every later rung and Mercury's predictive exit. The
+  // only cleanup, clearOrphanedInFlightMarks, runs once at boot.
+  //
+  // And `total < 1` is a WHOLE-SHARE rule on a book that is deliberately fractional: a
+  // 1.81-share lot taking a 40% rung sells 0.724 shares — a perfectly valid order that
+  // tripped this branch every single time. On a fractional account the common case was:
+  // hit the first target, sell nothing, lose the stop for the day.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function partialClose'), src.indexOf('function finalizeClose'));
+  ok(!/if \(total < 1\) return;/.test(fn),
+     'the bare whole-share guard must be gone — it bailed on every fractional rung');
+  ok(/const minTotal = FRACTIONAL_ENABLED \? 1e-6 : 1;/.test(fn),
+     'the minimum must depend on whether fractional orders are available');
+  ok(/if \(lot && lot\._pendingRung === rung\) delete lot\._pendingRung;/.test(fn),
+     'and any bail must unmark every lot it marked');
+  // The unmark must come BEFORE the return, not after it.
+  const iMark = fn.indexOf('p._pendingRung = rung;');
+  const iUnmark = fn.indexOf('delete lot._pendingRung;');
+  ok(iMark > 0 && iUnmark > iMark, 'the unmark belongs in the bail path below the mark');
+
+  // BEHAVIOURAL: a fractional lot at its first target must end up with a clean stop.
+  const savedCash = I.portfolio.cash;
+  try {
+    resetBook();
+    seedSymbol('ZPART', 100);
+    I.portfolio.longPositions.ZPART = [{
+      lotId: 'L1', qty: 1.81, entryPrice: 100, highestPnL: 0.1,
+      openedAt: Date.now() - 7200000, atrFrac: 0.02, partialsTaken: {},
+    }];
+    I.partialClose('ZPART', 'LONG', 0.40, 'tp1');
+    const lot = I.portfolio.longPositions.ZPART && I.portfolio.longPositions.ZPART[0];
+    ok(lot, 'the position must still exist');
+    ok(lot._pendingRung == null,
+       `the lot is still marked _pendingRung='${lot._pendingRung}' — the stop loss for ` +
+       'ZPART is now dead for the rest of the session');
+    // And prove the stop can still fire.
+    I.marketData.ZPART.price = 90;
+    I.closeLong('ZPART', true);
+    ok(!I.portfolio.longPositions.ZPART || I.portfolio.longPositions.ZPART.length === 0,
+       'the hard stop must be able to close the position afterwards');
+  } finally { resetBook(); I.portfolio.cash = savedCash; }
+});
+
+check('vaulting money does not invent money, or invent a drawdown', () => {
+  // processProfitVault debits portfolio.cash and credits capitalSystem.profitVault. No
+  // order is placed and nothing leaves the broker — it is an earmark, not a withdrawal.
+  // Two things followed from treating it as a withdrawal:
+  //   LIVE  — brokerMirror.cash stayed higher by exactly the vaulted amount, for ever.
+  //           adoptBrokerCashDrift's stability check (same delta twice) is built to adopt
+  //           precisely that, so it handed the money back while profitVault kept its
+  //           credit: money created from an internal transfer, booked as a dividend.
+  //   SIM   — tradableValue() fell by the vaulted amount, so the next risk tick read a
+  //           3% drawdown on an account that had not lost a cent.
+  const c = I.capitalSystem, p = I.portfolio;
+  const saved = { pv: c.profitVault, cash: p.cash, core: p.coreHolding, lp: p.longPositions };
+  try {
+    resetBook();
+    p.coreHolding = {};
+    p.cash = 10000; c.profitVault = 0;
+    const before = I.getTotalValue();
+    // Simulate a deposit exactly as processProfitVault performs it.
+    c.profitVault = 300; p.cash = 9700;
+    const after = I.getTotalValue();
+    near(after, before, 1e-9,
+         `vaulting $300 changed total equity from ${before} to ${after} — an earmark is ` +
+         'not a loss, and tradableValue feeds the drawdown that arms safe mode');
+    near(I.tradableValue(), before, 1e-9, 'and the tradable book must not shrink either');
+
+    // The broker-drift comparison must net out the vault, or the deposit reads as a
+    // permanent repeating dividend.
+    const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                  .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+    ok(/const delta = brokerMirror\.cash - \(portfolio\.cash \+ Math\.max\(0, capitalSystem\.profitVault \|\| 0\)\);/.test(src),
+       'drift must be measured against ledger cash PLUS the vault');
+    ok(/portfolio\.cash = acct\.cash - Math\.max\(0, capitalSystem\.profitVault \|\| 0\);/.test(src),
+       'and the boot sync must not silently reverse every vault deposit');
+    ok(/let value = portfolio\.cash \+ Math\.max\(0, capitalSystem\.profitVault \|\| 0\);/.test(src),
+       'total equity must count the vault');
+
+    // BEHAVIOURAL: with a vault set, a broker mirror that matches must adopt NOTHING.
+    const prevCash = p.cash;
+    I.setBrokerMirror({ at: Date.now(), ok: true, cash: 10000, buying_power: 10000, positions: [] });
+    I.adoptBrokerCashDrift(); I.adoptBrokerCashDrift();      // twice: the stability check
+    near(p.cash, prevCash, 1e-9,
+         'broker cash of $10,000 against ledger $9,700 + vault $300 is NOT a dividend');
+    eq(c.profitVault, 300, 'and the vault must be untouched');
+  } finally {
+    c.profitVault = saved.pv; p.cash = saved.cash;
+    p.coreHolding = saved.core; resetBook();
+  }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
