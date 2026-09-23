@@ -84,6 +84,10 @@ share one.
 | `CORE_BASKET_SOURCE` | `fixed` | `venus` lets the research AI pick the basket. Default is `fixed` on purpose — a proposal is a hypothesis until it beats the control basket on data that arrived after it. |
 | `CORE_PHASE1_FRACTION` | `0.97` | Ceiling 0.98. Idle cash costs ~0.48%/yr per percentage point. |
 | `TRADING_UNLOCK_PCT` | `0.10` | The phase gate: trading stays locked until the holding side banks this fraction of starting capital. |
+| `MERCURY_ENABLED` | `true` | ☿ the forecaster. `false` reverts exits to stop/target only. |
+| `MERCURY_MIN_SAMPLES` | `40` | Resolved forecasts a horizon needs before its skill counts at all. |
+| `MERCURY_SKILL_FLOOR` | `0.02` | Brier skill score a horizon must clear. Eight models are scored at once, so this is the multiple-testing bar. |
+| `ALLOC_SHORT_TARGET` | `0.70` | The 70/30 objective. Ramps with measured skill; `ALLOC_RAMP=off` goes straight there. |
 | `ALPACA_DATA_FEED` | `iex` | `sip` needs a paid data plan. |
 | `WS_MAX_SYMBOLS` | `30` | The free IEX tier's subscription cap. Exceeding it is **all-or-nothing** — the whole stream is rejected and the bot goes dark. |
 | `ATLAS_DATA_DIR` | — | Manual override for the state directory. Only needed off Railway. |
@@ -143,7 +147,22 @@ Boot log, in order:
    `core holding OFF`, `CORE_HOLD_FRACTION` is unset and nothing will be bought.
 
 Endpoints: `/` (dashboard), `/api/health`, `/api/portfolio`, `/api/broker`, `/api/venus`,
-`/api/jupiter`, `/api/intel`, `/api/logs`.
+`/api/jupiter`, `/api/oracle`, `/api/intel`, `/api/logs`.
+
+### Is the forecaster working?
+
+`/api/oracle` answers it in one line. Until a horizon has `MERCURY_MIN_SAMPLES` resolved
+forecasts AND a Brier skill score above `MERCURY_SKILL_FLOOR`, it reports
+
+```
+no measured skill yet — forecasts are recorded and scored, but multiply out to zero
+and cannot move money
+```
+
+and that is not a fault: confidence is `support x skill x freshness`, so an unproven
+forecaster multiplies every decision to zero and the engine behaves exactly as it did
+before. It has to earn the right to spend a dollar, out of sample, on your account's own
+data. `node backtest.js --oracle` runs the same measurement over historical bars.
 
 ---
 

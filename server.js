@@ -1851,6 +1851,17 @@ function createJupiter(config = {}) {
       riskFraction *= mult;
     }
 
+    // ── FORWARD CONVICTION — size reflects what is expected, not just what happened ──
+    // Deliberately placed BEFORE the RISK_PER_TRADE_MAX clamp below, so conviction can
+    // shape the size inside the cap and can never lift a position past it. The upside
+    // multiplier is also smaller than the downside one (1.25x vs 0.5x): an unproven
+    // forecast should be able to talk this engine out of risk much more easily than
+    // into it, which is the asymmetry every measured failure in this project argues for.
+    if (T.helpers.mercuryConviction) {
+      const mAdj = clip(T.helpers.mercuryConviction(symbol, direction), 0.5, 1.25);
+      if (Number.isFinite(mAdj)) riskFraction *= mAdj;
+    }
+
     const safeAdjust       = T.capitalSystem.safeMode ? 0.5 : 1.0;
     const aggrAdjust       = 0.7 + T.aiSystem.aggressionLevel * 0.45;
     const stressAdjust     = 1 - (T.helpers.calculateMarketStress() * 0.4);
@@ -2319,7 +2330,17 @@ let capitalSystem = {
   reserveRatio:     0.30,
   reinvestRatio:    0.70,
   vaultTrigger:     0.10,
-  lastVaultValue:   START_CAPITAL,
+  // NOT START_CAPITAL. This was 1000, and processProfitVault measures growth as
+  // (tradableValue - lastVaultValue) / lastVaultValue. Fund the account at anything
+  // else and the difference reads as profit the engine has already earned. Observed
+  // live on the $10,000 account, 2026-09-22, on the first five-minute tick:
+  //     growth = (10000 - 1000) / 1000 = 900%  →  profit $9,000
+  //     amount = 9000 x (1 - 0.70 reinvest)    →  $2,700 LOCKED IN THE VAULT
+  // and the dashboard duly showed `vault $2700.00` on an account that had never taken
+  // a single trade. Twenty-seven percent of the balance moved out of the market, out of
+  // the core's reach, permanently, on a gain that did not exist. Zero means "no
+  // milestone yet" and processProfitVault seeds it from live equity on its first call.
+  lastVaultValue:   0,
   safeMode:         false,
   safeModeManual:   false,   // set via Luna/API — auto-recovery will not clear it
   safeModeDrawdown: 0.10,
@@ -3318,9 +3339,9 @@ function getMarketStatus() {
 function subscribeCoreSymbols(symbols) {
   const list = (symbols || []).filter(Boolean);
   if (!list.length) return;
-  if (dataWs && dataWs.readyState === WebSocket.OPEN) {
-    try { dataWs.send(JSON.stringify({ action: 'subscribe', trades: list })); } catch (e) {}
-  }
+  // NOT a raw send. This is the call that took the feed down on 2026-09-22 — seven
+  // basket names added on top of twenty-six with no idea a cap existed.
+  syncWsSubscription(list);
   // A subscription only delivers the NEXT trade. On a quiet tape that can be minutes,
   // and until then the name still has no price — so pull a snapshot too rather than
   // waiting for the market to volunteer one.
@@ -3454,6 +3475,86 @@ function scheduleWsReconnect(gen) {
   }, delay);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+//  THE SYMBOL CAP BELONGS TO THE CONNECTION, NOT TO ONE CALL SITE
+// ════════════════════════════════════════════════════════════════════════════
+// v12.62 capped the subscription — and capped it in exactly ONE of the three places
+// that subscribe. Observed live 2026-09-22 on the $10,000 account:
+//
+//     [WS] Authenticated — subscribing to 26 symbols
+//     [WS] Subscription confirmed — 26 trade streams active
+//     [CORE] 📡 Subscribed UNH,V,AMZN,HD,CAT,HON,META
+//     [WS] Stream error 405: symbol limit exceeded
+//
+// Venus swapped the basket mid-session, subscribeCoreSymbols() sent seven more names
+// straight at the socket with no knowledge of the cap, 26 + 7 = 33, and Alpaca rejected
+// the lot. The rejection is ALL-OR-NOTHING: the engine keeps the socket but receives no
+// trade ticks at all, every price goes stale 90 seconds later, and mostUnderweightCore()
+// silently skips every name it cannot price. addDynamicSymbol() had the same hole.
+//
+// A cap enforced at one of three doors is not a cap. Every subscription change now goes
+// through syncWsSubscription(), which knows what is currently subscribed, computes the
+// full desired set, drops the lowest-priority names over the cap, and — critically —
+// UNSUBSCRIBES BEFORE IT SUBSCRIBES, because the server counts the union otherwise.
+let wsSubscribed = new Set();
+
+// Lower number = kept first when the cap bites. Ordered by what the account cannot
+// function without: SPY drives the benchmark and the regime, the core basket IS the
+// money, the watchlist is candidate trades, dynamics are speculative by construction.
+function wsSymbolPriority(sym) {
+  if (sym === 'SPY') return 0;
+  if (CORE_HOLD_ON && CORE_HOLD_SYMBOLS.includes(sym)) return 1;
+  if (WATCHLISTS.nasdaq.includes(sym) || WATCHLISTS.nyse.includes(sym)) return 2;
+  return 3;
+}
+
+// Everything the engine would like ticks for, priority-ordered. Pure, so the ordering
+// is testable without a socket. Array.prototype.sort is stable, so names of equal
+// priority keep their insertion order and the basket does not reshuffle on every call.
+function desiredWsSymbols(extra = []) {
+  const wanted = [...new Set(['SPY',
+                      ...(CORE_HOLD_ON ? CORE_HOLD_SYMBOLS : []),
+                      ...WATCHLISTS.nasdaq, ...WATCHLISTS.nyse,
+                      ...Object.keys(dynamicSymbols),
+                      ...(extra || []).filter(Boolean)])];
+  return wanted.sort((a, b) => wsSymbolPriority(a) - wsSymbolPriority(b));
+}
+
+// THE ONLY FUNCTION THAT TELLS THE FEED ABOUT SYMBOLS. Returns what it did so the
+// behaviour is assertable; returns null when there is no open socket to talk to.
+function syncWsSubscription(extra = [], { reset = false } = {}) {
+  if (reset) wsSubscribed = new Set();
+  if (!dataWs || dataWs.readyState !== WebSocket.OPEN) return null;
+  const wanted  = desiredWsSymbols(extra);
+  const keep    = wanted.slice(0, WS_MAX_SYMBOLS);
+  const keepSet = new Set(keep);
+  const add  = keep.filter(x => !wsSubscribed.has(x));
+  const drop = [...wsSubscribed].filter(x => !keepSet.has(x));
+  const dropped = wanted.slice(WS_MAX_SYMBOLS);
+
+  // UNSUBSCRIBE FIRST. Sending the additions before the removals means the server sees
+  // the union at some instant in between, which is precisely the state that trips 405.
+  if (drop.length) {
+    try { dataWs.send(JSON.stringify({ action: 'unsubscribe', trades: drop })); } catch (e) {}
+    drop.forEach(x => wsSubscribed.delete(x));
+  }
+  if (add.length) {
+    try { dataWs.send(JSON.stringify({ action: 'subscribe', trades: add })); } catch (e) {}
+    add.forEach(x => wsSubscribed.add(x));
+  }
+  if (dropped.length) {
+    console.warn(`[WS] ${wanted.length} symbols wanted but the feed caps at ${WS_MAX_SYMBOLS} — ` +
+                 `dropping ${dropped.join(',')}. SPY and the core basket are kept first; going over ` +
+                 `the cap rejects the ENTIRE subscription and leaves the engine with no live prices.`);
+  }
+  if (add.length || drop.length) {
+    console.log(`[WS] Subscription now ${wsSubscribed.size}/${WS_MAX_SYMBOLS}` +
+                (add.length  ? ` · +${add.join(',')}`  : '') +
+                (drop.length ? ` · -${drop.join(',')}` : ''));
+  }
+  return { subscribed: [...wsSubscribed], added: add, removed: drop, dropped };
+}
+
 function connectWebSocket() {
   if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
   if (dataWs) { try { dataWs.removeAllListeners(); dataWs.terminate(); } catch (e) {} }
@@ -3490,16 +3591,6 @@ function connectWebSocket() {
   // Ordered by what the account cannot do without, so the cap sheds the least valuable
   // names first: SPY (benchmark + regime), then the core basket (the actual money),
   // then the trading watchlist, then dynamics (which are speculative by construction).
-  const wanted = [...new Set(['SPY',
-                      ...(CORE_HOLD_ON ? CORE_HOLD_SYMBOLS : []),
-                      ...WATCHLISTS.nasdaq, ...WATCHLISTS.nyse,
-                      ...Object.keys(dynamicSymbols)])];
-  const subSymbols = wanted.slice(0, WS_MAX_SYMBOLS);
-  if (wanted.length > subSymbols.length) {
-    console.warn(`[WS] ${wanted.length} symbols wanted but the feed caps at ${WS_MAX_SYMBOLS} — ` +
-                 `dropping ${wanted.slice(WS_MAX_SYMBOLS).join(',')}. SPY and the core basket are kept first; ` +
-                 `going over the cap rejects the ENTIRE subscription and leaves the engine with no live prices.`);
-  }
 
   dataWs.on('open', () => {
     if (gen !== wsGeneration) return;
@@ -3549,9 +3640,12 @@ function connectWebSocket() {
       // ── Control messages ────────────────────────────────────────────────
       if (T === 'success') {
         if (m.msg === 'authenticated') {
-          // Authenticated → subscribe to trades for the whole watchlist in one shot.
-          try { dataWs.send(JSON.stringify({ action: 'subscribe', trades: subSymbols })); } catch (e) {}
-          console.log(`[WS] Authenticated — subscribing to ${subSymbols.length} symbols`);
+          // Authenticated → hand the whole decision to the subscription manager. `reset`
+          // because a NEW socket knows nothing about what the old one was subscribed to,
+          // and carrying that set over would make every later diff wrong.
+          const r = syncWsSubscription([], { reset: true });
+          console.log(`[WS] Authenticated — subscribing to ${r ? r.subscribed.length : 0} symbols ` +
+                      `(cap ${WS_MAX_SYMBOLS})`);
         }
         continue;
       }
@@ -4595,10 +4689,10 @@ async function addDynamicSymbol(sym, sig) {
     if (b1[sym]?.length >= 15) marketData[sym].history = b1[sym].slice(-40).map(c => c.c);
   } catch (e) { /* candle warmup is best-effort */ }
 
-  // Subscribe on the live stream
-  if (dataWs && dataWs.readyState === WebSocket.OPEN) {
-    try { dataWs.send(JSON.stringify({ action: 'subscribe', trades: [sym] })); } catch (e) {}
-  }
+  // Subscribe on the live stream. Through the manager: a dynamic is the LOWEST priority
+  // symbol there is, so if the cap is already full this correctly refuses to add it
+  // rather than killing the whole stream for a speculative name.
+  syncWsSubscription([sym]);
   console.log(`[JUPITER] ➕ Dynamic add: ${sym} @ $${q.price.toFixed(2)} (vol ${(q.volume / 1e6).toFixed(1)}M) [${sig?.catalyst || '—'}]`);
   return true;
 }
@@ -5472,6 +5566,16 @@ function rebalanceCapital() {
 function rebasePeakForCoreFlow(cashDelta) {
   if (!Number.isFinite(cashDelta) || cashDelta === 0) return;
   riskSystem.peakValue = Math.max(0, (riskSystem.peakValue || 0) - cashDelta);
+  // THE VAULT MILESTONE HAS THE SAME PROBLEM THE PEAK HAD, FOR THE SAME REASON.
+  // processProfitVault measures growth in tradableValue, and every core buy SHRINKS
+  // tradableValue while every core trim GROWS it. Left un-rebased, a routine trim that
+  // moved $600 back from the core to the trading book would read as a $600 trading
+  // profit and skim 30% of it into the vault — money the trading side never made,
+  // removed from the market for good. Rebasing by the same amount the core absorbed
+  // keeps the milestone measuring gains and nothing else.
+  if (Number.isFinite(capitalSystem.lastVaultValue) && capitalSystem.lastVaultValue > 0) {
+    capitalSystem.lastVaultValue = Math.max(0, capitalSystem.lastVaultValue - cashDelta);
+  }
 }
 
 // Open loss sitting in the TRADING book right now, at market. Part of the ceiling
@@ -5589,7 +5693,16 @@ function effectiveCoreFraction() {
   // A Math.min(1, ...) here was provably a no-op — verified against allowances of 2x and
   // 5x the account — and dead code that no mutation can kill is code that rots.
   const freed = allowance / tv;
-  return Math.max(CORE_HOLD_FRACTION, Math.min(CORE_PHASE1_FRACTION, 1 - freed));
+  // THE 70/30 OBJECTIVE, APPLIED AS A CEILING ON THE CORE.
+  // allocationShortTarget() returns 0 whenever the phase gate is shut or Mercury has no
+  // measured skill, and `1 - 0` is 1, which cannot bind — so this line is arithmetically
+  // inert until BOTH conditions are met and the behaviour below is bit-identical to
+  // v12.65 until then. Once they are met it pulls the core down toward 30%, which is
+  // what makes the objective real rather than aspirational. CORE_HOLD_FRACTION still
+  // wins as the floor: the operator's own minimum is never overridden by a target.
+  const allocCeiling = 1 - allocationShortTarget();
+  return Math.max(CORE_HOLD_FRACTION,
+                  Math.min(CORE_PHASE1_FRACTION, 1 - freed, allocCeiling));
 }
 
 // Total market value of the core basket.
@@ -6114,7 +6227,21 @@ function processProfitVault() {
   // Trading equity only: vaulting because the held index rose would siphon trading
   // cash out on a gain the trading engine never made.
   const tv = tradableValue();
-  if (capitalSystem.lastVaultValue <= 0) { capitalSystem.lastVaultValue = tv; return; }
+  if (!(tv > 0)) return;
+  // NOTHING TO LOCK BEFORE THE FIRST TRADE. The vault exists to protect realised
+  // TRADING profit, and while the phase gate is shut the trading side has not taken a
+  // position, cannot have made a dollar, and every cent of movement in tradableValue is
+  // the core being funded or the market moving the basket. Vaulting here does not
+  // protect a gain — it removes working capital from an account that has not started.
+  // This alone would have prevented the $2,700 skim, and it is the backstop for every
+  // other route to the same mistake.
+  if (PHASE_GATE_ENABLED && tradingPhaseLocked()) {
+    if (capitalSystem.lastVaultValue !== tv) capitalSystem.lastVaultValue = tv;
+    return;
+  }
+  // A zero milestone means "no baseline yet" — seed it from where the account actually
+  // is, never from a compile-time constant.
+  if (!(capitalSystem.lastVaultValue > 0)) { capitalSystem.lastVaultValue = tv; return; }
   const growth = (tv - capitalSystem.lastVaultValue) / capitalSystem.lastVaultValue;
   if (growth >= capitalSystem.vaultTrigger) {
     const profit = tv - capitalSystem.lastVaultValue;
@@ -6665,6 +6792,11 @@ function adoptNewAccount(acct) {
   riskSystem.peakValue      = 0;
   riskSystem.peakTotalValue = 0;
   _tradingPeakReseated      = false;
+  // The preservation high-water mark is denominated in the old account's money, so it
+  // goes. Mercury's MODELS and its scoring history stay: a forecast about how AAPL
+  // behaves was right or wrong about AAPL, and which account was watching does not
+  // enter into it — the same reasoning that keeps the closed-trade history.
+  _mercuryPeakEquity = 0;
 }
 
 // Boot sync: adopt the broker's cash as the ledger's cash, and adopt any broker
@@ -7718,6 +7850,16 @@ function buildStateObject() {
     // new account restores a baseline describing money that is not there — see
     // accountIdentityChanged().
     brokerAccountId: _brokerAccountId,
+    // MERCURY LIVES AT TOP LEVEL, NOT INSIDE THE `lumen` BLOCK. loadState routes that
+    // block by CONTENT — whichever half carries calibGlobal/calibLog goes to Venus,
+    // whichever carries winModel/trainLog/signals goes to Jupiter — so a third engine
+    // nested in there would be handed to whichever sniff matched first. Its own key
+    // makes the routing unambiguous and keeps the two existing models untouched.
+    mercury:        MERCURY_ON ? mercury.serialize() : null,
+    // The account's high-water mark. Without it a restart reads the current balance as
+    // the peak, and every gain the bot has already made stops being something it knows
+    // it is protecting — which is the failure this whole layer was added to stop.
+    mercuryPeak:    _mercuryPeakEquity,
     closedTrades:   portfolio.closedTrades.slice(-500),
     marketTransition: marketTransitionData,
     capitalSystem,
@@ -7883,6 +8025,13 @@ function loadState() {
     // baseline may be trusted at all. syncFromBroker compares it against the live account.
     if (typeof state.brokerAccountId === 'string' && state.brokerAccountId) {
       _brokerAccountId = state.brokerAccountId;
+    }
+    if (state.mercury && MERCURY_ON) {
+      try { mercury.loadState(state.mercury); }
+      catch (e) { console.warn('[MERCURY] Could not restore forecast state:', e.message); }
+    }
+    if (Number.isFinite(state.mercuryPeak) && state.mercuryPeak > 0) {
+      _mercuryPeakEquity = state.mercuryPeak;
     }
     if (Number.isFinite(state.startingCapital) && state.startingCapital > 0) {
       _startingCapital = state.startingCapital;
@@ -8290,6 +8439,991 @@ function recordTradeAnalytics(trade, setupType, regime, sector) {
 //   • priceMidpoint (honest name) replaces vwapProxy
 // ════════════════════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════════════════════
+//  ☿ MERCURY — THE FORECASTER
+// ════════════════════════════════════════════════════════════════════════════
+//
+//  WHAT THIS IS FOR, STATED PLAINLY.
+//
+//  Every other decision path in this engine answers "what is this stock doing right
+//  now". A stop fires because price already fell. A target fires because price already
+//  rose. The trailing stop is the purest form of it: by construction it gives back
+//  ATR_TRAIL_MULT x ATR of a gain before it acts, every single time. That is the
+//  machine that took the account to +$50 and handed it back.
+//
+//  Mercury answers a different question: "given everything known, what is the
+//  probability-weighted return from HERE, over each horizon, and is that better than
+//  the alternatives available to this capital." Nothing here waits for a move to
+//  happen before having an opinion about it.
+//
+//  THE HONESTY PROBLEM, AND HOW IT IS SOLVED.
+//
+//  A forecaster is trivial to write and almost impossible to write WELL, and this
+//  project has measured its own strategy space hard enough to know it: 34 rules tested,
+//  34 losses; variance-ratio tests that cannot reject a random walk at p 0.92-0.99;
+//  every sell-on-decline and sell-and-rebuy variant at or below parity. A module that
+//  emitted confident forecasts into that evidence would be a liar with a probability
+//  attached.
+//
+//  So Mercury is built so that its confidence is not its own to assert. Confidence is
+//  the product of three measured things:
+//
+//      support    how many resolved forecasts this horizon's model has trained on
+//      skill      the Brier SKILL SCORE of those forecasts against the base rate
+//      freshness  whether the inputs are actually current
+//
+//  `skill` is the load-bearing one. It is 1 - BS_model / BS_baseline, computed from
+//  Mercury's OWN resolved predictions, where the baseline is "always predict the base
+//  rate". A model with no edge scores BSS <= 0, skill clamps to 0, confidence collapses
+//  to 0, and a zero-confidence forecast is arithmetically incapable of moving a dollar
+//  — every decision below multiplies by it. The forecaster therefore has to EARN the
+//  right to be listened to, out of sample, on this account's own data, before it can
+//  change a single order. If it never earns it, the engine keeps doing the thing that
+//  measurably works (hold a wide, cheap, sector-spread basket) and Mercury is an
+//  expensive logging system. That is the correct failure mode and it is deliberate.
+//
+//  WHAT IS GENUINELY PREDICTABLE, AND WHAT IS NOT.
+//
+//  Direction is close to unpredictable here and the measurements say so. VOLATILITY is
+//  not: squared returns are strongly autocorrelated, which is the most replicated fact
+//  in empirical finance. Mercury therefore splits the problem. Sigma comes from an EWMA
+//  volatility estimate scaled by the square root of the horizon — real, and reliable
+//  enough to size risk with on day one. Only the directional tilt is gated behind
+//  measured skill. The result is that even at zero skill Mercury still improves risk
+//  measurement, which is why it is worth running before it has proved anything.
+//
+//  PAPER-ONLY, AND STRUCTURALLY SO. Mercury never touches the broker. It returns
+//  opinions. Every order still goes through terraValidateTrade and the existing risk
+//  pipeline unchanged, and mercuryDecide() is incapable of raising a size cap, relaxing
+//  a stop, or bypassing a kill switch — it can only decline to act or ask to act less.
+// ════════════════════════════════════════════════════════════════════════════
+
+const MERCURY_ON = (process.env.MERCURY_ENABLED || 'true').toLowerCase() !== 'false';
+
+// Horizons, in TRADING MINUTES (390 per session). Four separate models per direction,
+// because a name can be short-term weak and long-term strong and collapsing that into
+// one number is how a long-term holding gets sold on an afternoon wobble.
+const MERCURY_HORIZONS = [
+  { key: 'immediate', minutes: 30,   label: '30m' },
+  { key: 'short',     minutes: 390,  label: '1d'  },
+  { key: 'medium',    minutes: 1950, label: '1w'  },
+  { key: 'long',      minutes: 8190, label: '1mo' },
+];
+const MERCURY_HORIZON_KEYS = MERCURY_HORIZONS.map(h => h.key);
+
+// A move counts as UP if it exceeds +BAND sigma, DOWN if below -BAND sigma, FLAT
+// between. Banding on sigma rather than on a fixed percentage is what lets one model
+// serve a 0.8%/day mega-cap and a 6%/day miner without relabelling every sample.
+const MERCURY_BAND = 0.5;
+// E[Z | Z > 0.5] for a standard normal = phi(0.5)/(1-Phi(0.5)) = 0.3521/0.3085.
+// Used to turn "probability of an up move" into an EXPECTED RETURN rather than leaving
+// the two conflated, which is the usual way a directional model overstates its payoff.
+const MERCURY_COND_MEAN = 1.141;
+// Shrinkage strength for blendWithPrior. 60 resolved forecasts before the model's own
+// opinion outweighs the prior — deliberately slower than Jupiter's 25, because a
+// forecast is cheaper to generate than a trade and therefore easier to overfit.
+const MERCURY_PRIOR_K = Math.max(5, parseInt(process.env.MERCURY_PRIOR_K || '60', 10));
+// Below this many resolved forecasts a horizon reports ZERO skill regardless of its
+// Brier score — a 9-sample "edge" is noise wearing a number.
+const MERCURY_MIN_SAMPLES = Math.max(10, parseInt(process.env.MERCURY_MIN_SAMPLES || '40', 10));
+// Four horizons x two directions = eight models tested at once. Demanding a positive
+// Brier skill score from each is eight chances to be fooled, so the bar is raised by
+// the same Bonferroni logic used elsewhere in this project: a horizon must clear this
+// BSS before any of its skill counts at all.
+const MERCURY_SKILL_FLOOR = Math.max(0, parseFloat(process.env.MERCURY_SKILL_FLOOR || '0.02'));
+// Inputs older than this are not evidence about now.
+const MERCURY_FRESH_MS = 120000;
+// How long a computed forecast may be reused. This was 2000ms against a 2000ms main
+// loop, so the cache expired exactly as the next tick asked for it and every tick paid
+// the full cold cost — measured at 30.8ms for 26 symbols, against 0.77ms warm. Nothing
+// underneath moves faster than the candle that feeds it, so five seconds costs no
+// responsiveness and takes the forecaster from ~1.5% of the loop budget to ~0.4%.
+const MERCURY_CACHE_MS = Math.max(0, parseInt(process.env.MERCURY_CACHE_MS || '5000', 10));
+const MERCURY_LEDGER_MAX = 4000;
+const MERCURY_OPEN_MAX   = 1200;
+
+const MERCURY_FEATURES = [
+  'ret5', 'ret20', 'ret60', 'rsi', 'adx', 'rvol',
+  'atrRel', 'gap', 'regime', 'breadth', 'relSpy', 'news',
+];
+const MERCURY_DIM = MERCURY_FEATURES.length;
+
+function createMercury() {
+  // THE CLOCK IS AN INPUT. Every timestamp Mercury uses — when a forecast was made, when
+  // it is due, when it resolved — comes from here rather than from _now() directly,
+  // so backtest.js can replay historical bars through the REAL forecaster on BAR time and
+  // measure its skill on data it has never seen. Scoring a predictor on wall-clock time
+  // while feeding it 2019 bars would resolve every prediction instantly against the same
+  // price it was made at, and report a beautiful Brier score that means nothing.
+  let _now = () => Date.now();
+  function setClock(fn) { _now = (typeof fn === 'function') ? fn : (() => Date.now()); }
+
+  // Two models per horizon. P(up) and P(down) are modelled SEPARATELY rather than as
+  // one 3-class softmax so that "no opinion" is representable: both near the base rate
+  // leaves p_flat large, which is the honest answer most of the time and the answer a
+  // forced-choice classifier can never give.
+  const models = {};
+  for (const h of MERCURY_HORIZONS) {
+    models[h.key] = {
+      up:   new OnlineLogistic(MERCURY_DIM, { lr: 0.03, l2: 3e-3, names: MERCURY_FEATURES }),
+      down: new OnlineLogistic(MERCURY_DIM, { lr: 0.03, l2: 3e-3, names: MERCURY_FEATURES }),
+    };
+  }
+
+  // Per-horizon scoring, accumulated from RESOLVED forecasts only.
+  //   brier      sum of (p - outcome)^2 for the up-model
+  //   brierBase  the same sum for "always predict the running base rate"
+  //   hits/n     directional accuracy when the forecast was not FLAT
+  const score = {};
+  for (const h of MERCURY_HORIZONS) {
+    score[h.key] = { n: 0, brier: 0, brierBase: 0, ups: 0, downs: 0, hits: 0, calls: 0,
+                     sumAbsErr: 0, realisedSum: 0, predictedSum: 0 };
+  }
+
+  // Predictions awaiting their horizon. Keyed by id so the sweeper is O(open).
+  let open = {};
+  let nextId = 1;
+  // EWMA of squared 1-minute returns, per symbol. The one genuinely predictable thing.
+  const vol = {};
+  // Last emitted forecast per symbol, so the hot path can reuse within a tick.
+  const cache = {};
+  // When each (symbol, horizon) pair last had a forecast written to the ledger.
+  let lastRecorded = {};
+
+  const clip01 = (x) => Math.max(0, Math.min(1, x));
+  const fin = (x, d = 0) => (typeof x === 'number' && Number.isFinite(x)) ? x : d;
+
+  // ── VOLATILITY ───────────────────────────────────────────────────────────
+  // EWMA(lambda=0.94) on 1-minute log returns — the RiskMetrics parameter, used here
+  // because it is a published default rather than something fitted to this account's
+  // history, and anything fitted on 339 sessions of one basket is a curve.
+  function updateVol(sym) {
+    const m1 = candleData[sym]?.m1;
+    if (!Array.isArray(m1) || m1.length < 6) return;
+    const state = vol[sym] || (vol[sym] = { v: null, at: 0, bars: 0 });
+    const last = m1[m1.length - 1];
+    if (!last || last.t === state.at) return;       // no new bar
+
+    // BACKFILL ON FIRST SIGHT. Updating one bar per call means a symbol needs ten live
+    // ticks before its volatility estimate is usable, and a basket name swapped in
+    // mid-session would sit on the ATR fallback for ten minutes — during which every
+    // forecast about it is sized off the wrong risk. The candle history is already in
+    // memory; walking it costs one pass and makes the name usable immediately.
+    if (state.bars === 0) {
+      for (let i = 1; i < m1.length; i++) {
+        const a = m1[i - 1]?.c, b = m1[i]?.c;
+        if (!(a > 0) || !(b > 0)) continue;
+        const r0 = Math.log(b / a);
+        if (!Number.isFinite(r0)) continue;
+        state.v = state.v == null ? r0 * r0 : (0.94 * state.v + 0.06 * r0 * r0);
+        state.bars++;
+      }
+      state.at = last.t;
+      return;
+    }
+    const prev = m1[m1.length - 2];
+    if (!prev || !(prev.c > 0) || !(last.c > 0)) return;
+    const r = Math.log(last.c / prev.c);
+    if (!Number.isFinite(r)) return;
+    state.v = 0.94 * state.v + 0.06 * r * r;
+    state.at = last.t; state.bars++;
+  }
+
+  // Per-BAR volatility straight from the price history, used when the EWMA has not seen
+  // enough bars yet. marketData[].history is seeded from one-minute closes, so this is a
+  // direct per-minute estimate and needs no unit conversion at all.
+  function historyVol(sym) {
+    const h = marketData[sym]?.history;
+    if (!Array.isArray(h) || h.length < 8) return null;
+    const rs = [];
+    for (let i = 1; i < h.length; i++) {
+      if (!(h[i] > 0) || !(h[i - 1] > 0)) continue;
+      const r = Math.log(h[i] / h[i - 1]);
+      if (Number.isFinite(r)) rs.push(r);
+    }
+    if (rs.length < 6) return null;
+    const mu = rs.reduce((a, b) => a + b, 0) / rs.length;
+    const v = rs.reduce((a, b) => a + (b - mu) ** 2, 0) / (rs.length - 1);
+    return v > 0 ? Math.sqrt(v) : null;
+  }
+
+  // Sigma for one horizon, as a FRACTION of price. Square-root-of-time scaling from the
+  // 1-minute estimate, floored by ATR so a symbol whose candles have not arrived yet is
+  // treated as risky rather than as calm — the failure direction that matters.
+  function sigmaFor(sym, minutes) {
+    const state = vol[sym];
+    let perMin = (state && state.v != null && state.bars >= 10) ? Math.sqrt(state.v) : null;
+    // UNITS. atrPct() is computed from ONE-MINUTE candles (calculateATR reads
+    // candleData[].m1), so it is already a per-minute figure — the first version of this
+    // line divided it by sqrt(390) on the belief that it was daily, which understated
+    // volatility by a factor of twenty. Every expected return is linear in sigma, so a
+    // 20x error there made every forecast twenty times too small to clear a round trip
+    // and Mercury would have sat inert for ever while reporting healthy-looking
+    // probabilities. ATR is roughly 1.25 standard deviations for a normal, hence /1.25.
+    if (perMin == null || !(perMin > 0)) perMin = historyVol(sym);
+    const atrFallback = fin(atrPct(sym), 0.02) / 1.25;
+    if (perMin == null || !(perMin > 0)) perMin = atrFallback;
+    const s = perMin * Math.sqrt(Math.max(1, minutes));
+    // Clamp to something a US equity can plausibly do, so one bad bar cannot produce a
+    // sigma that makes every band unreachable (which would read as permanent FLAT).
+    return Math.max(0.0008, Math.min(1.5, s));
+  }
+
+  // ── FEATURES ─────────────────────────────────────────────────────────────
+  // Everything here is already in memory. No new data source, no network call, nothing
+  // that can fail on the hot path. Each term is scaled to roughly [-1, 1] and swept for
+  // non-finites, because OnlineLogistic will happily train on a NaN-shaped hole.
+  function featuresFor(sym) {
+    const md = marketData[sym];
+    if (!md || !(md.price > 0)) return null;
+    const hist = Array.isArray(md.history) ? md.history : [];
+    const px = md.price;
+    const sig1d = sigmaFor(sym, 390);
+    const ret = (n) => {
+      if (hist.length <= n) return 0;
+      const p0 = hist[hist.length - 1 - n];
+      return (p0 > 0) ? (px - p0) / p0 : 0;
+    };
+    // Returns are divided by the DAILY sigma, so "how big is this move for this stock"
+    // rather than "how big is this move", which is what makes one model serve names
+    // with a 7x volatility spread.
+    const z = (r) => clip(r / Math.max(1e-6, sig1d), -3, 3) / 3;
+    const spySess = (spyData.price > 0 && spyData.prevClose > 0)
+      ? (spyData.price - spyData.prevClose) / spyData.prevClose : 0;
+    const sess = (md.prevClose > 0) ? (px - md.prevClose) / md.prevClose : 0;
+    const gp = gapData[sym];
+    const sig = jupiter.getSignal(sym);
+    const newsTerm = (sig && sig.expiresAt >= _now())
+      ? clip((fin(sig.conviction, 0.5) - 0.5) * 2, -1, 1) * (sig.direction === 'SHORT' ? -1 : 1)
+      : 0;
+    const f = [
+      z(ret(5)),
+      z(ret(20)),
+      z(ret(60)),
+      clip((fin(rsi(hist, STRATEGY.RSI_PERIOD), 50) - 50) / 50, -1, 1),
+      clip((fin(calculateADX(sym)?.adx, 18) - 20) / 30, -1, 1),
+      clip((fin(calculateRVOL(sym), 1) - 1) / 2, -1, 1),
+      clip(fin(atrPct(sym), 0.02) / 0.02 - 1, -1, 2) / 2,
+      z(fin(gp?.gapPct, 0)),
+      fin({ bull: 1, bullish: 1, choppy: 0, neutral: 0, bear: -1, bearish: -1 }[detectMarketRegime()], 0),
+      clip((fin(sentimentData.breadthScore, 0.5) - 0.5) * 2, -1, 1),
+      z(sess - spySess),
+      newsTerm,
+    ];
+    for (let i = 0; i < f.length; i++) if (!Number.isFinite(f[i])) f[i] = 0;
+    return f;
+  }
+
+  // ── SKILL ────────────────────────────────────────────────────────────────
+  // Brier skill score against the base-rate baseline, floored at the multiple-testing
+  // bar and at the minimum sample count. This is the ONLY thing that authorises Mercury
+  // to influence money, and it is computed from Mercury's own out-of-sample record.
+  function skillOf(hKey) {
+    const s = score[hKey];
+    if (!s || s.n < MERCURY_MIN_SAMPLES) return 0;
+    if (!(s.brierBase > 0)) return 0;
+    const bss = 1 - (s.brier / s.brierBase);
+    if (!Number.isFinite(bss) || bss <= MERCURY_SKILL_FLOOR) return 0;
+    // Cap at 0.6: a Brier skill score above that on financial direction is a bug or a
+    // leak, not an edge, and capping means discovering one cannot blow up sizing.
+    return Math.min(0.6, bss);
+  }
+
+  function accuracyFor(hKey) {
+    const s = score[hKey];
+    return (s && s.calls > 0) ? s.hits / s.calls : null;
+  }
+
+  // ── THE FORECAST ─────────────────────────────────────────────────────────
+  function forecast(sym, { record = false } = {}) {
+    if (!MERCURY_ON) return null;
+    const md = marketData[sym];
+    if (!md || !(md.price > 0)) return null;
+    const now = _now();
+    const age = now - fin(md.lastUpdate, 0);
+    // STALE DATA IS NOT EVIDENCE ABOUT NOW. Freshness multiplies confidence rather than
+    // blocking the forecast, so the caller still gets sigma (which is slow-moving and
+    // still useful) but cannot act on a direction derived from an old print.
+    const freshness = clip01(1 - Math.max(0, age - MERCURY_FRESH_MS) / (4 * MERCURY_FRESH_MS));
+
+    const cached = cache[sym];
+    if (cached && now - cached.at < MERCURY_CACHE_MS && !record) return cached;
+
+    updateVol(sym);
+    const f = featuresFor(sym);
+    if (!f) return null;
+
+    const horizons = {};
+    let worstConf = 1;
+    for (const h of MERCURY_HORIZONS) {
+      const m = models[h.key];
+      const sigma = sigmaFor(sym, h.minutes);
+      const nUp = m.up.n, nDn = m.down.n;
+      // The PRIOR is the observed base rate for this horizon, not 0.5. With a +0.5-sigma
+      // band and a small positive drift the unconditional P(up) is a little under a
+      // third, and starting a cold model at a coin flip would have it screaming
+      // opportunity at every symbol on day one.
+      const s = score[h.key];
+      const priorUp = s.n >= 20 ? clip01(s.ups / s.n) : 0.30;
+      const priorDn = s.n >= 20 ? clip01(s.downs / s.n) : 0.30;
+      let pUp = blendWithPrior(m.up.predict(f),   nUp, MERCURY_PRIOR_K, priorUp);
+      let pDn = blendWithPrior(m.down.predict(f), nDn, MERCURY_PRIOR_K, priorDn);
+      // Renormalise if the two independent models claim more than all the probability.
+      const tot = pUp + pDn;
+      if (tot > 0.98) { pUp = pUp / tot * 0.98; pDn = pDn / tot * 0.98; }
+      const pFlat = clip01(1 - pUp - pDn);
+
+      const support = nUp / (nUp + MERCURY_PRIOR_K);
+      const skill   = skillOf(h.key);
+      const confidence = clip01(support * skill * freshness);
+
+      // THE TILT IS GATED, THE RISK IS NOT. expectedReturn carries the confidence
+      // factor, so an unproven model contributes nothing to the direction; sigma and
+      // expectedDownside are reported raw, because volatility is measurable from bar one
+      // and under-reporting risk is the more expensive mistake.
+      const edge = (pUp - pDn) * sigma * MERCURY_COND_MEAN;
+      horizons[h.key] = {
+        label: h.label, minutes: h.minutes,
+        pUp: +pUp.toFixed(4), pDown: +pDn.toFixed(4), pFlat: +pFlat.toFixed(4),
+        sigma: +sigma.toFixed(5),
+        rawEdge: +edge.toFixed(5),
+        expectedReturn: +(edge * confidence).toFixed(6),
+        expectedDownside: +(pDn * sigma * MERCURY_COND_MEAN).toFixed(6),
+        confidence: +confidence.toFixed(4),
+        support: +support.toFixed(3), skill: +skill.toFixed(4), samples: s.n,
+      };
+      worstConf = Math.min(worstConf, confidence);
+    }
+
+    // Time-to-move: the shortest horizon whose raw edge is at least half the longest's.
+    // A stock predicted to move by next month but not by tomorrow is a different
+    // proposition from one predicted to move this afternoon, and sizing should know.
+    const longEdge = Math.abs(horizons.long.rawEdge);
+    let timeToMove = 'long';
+    for (const h of MERCURY_HORIZONS) {
+      if (Math.abs(horizons[h.key].rawEdge) >= 0.5 * longEdge) { timeToMove = h.key; break; }
+    }
+
+    const out = {
+      symbol: sym, at: now, price: md.price, horizons, timeToMove,
+      freshness: +freshness.toFixed(3), dataAgeMs: age,
+      confidence: +Math.max(...MERCURY_HORIZON_KEYS.map(k => horizons[k].confidence)).toFixed(4),
+      features: f,
+    };
+    cache[sym] = out;
+    if (record) recordForecast(out);
+    return out;
+  }
+
+  // ── THE LEDGER ───────────────────────────────────────────────────────────
+  // Every forecast that is going to be SCORED gets written down before the outcome is
+  // known. That ordering is the whole point: a prediction recorded after the fact is
+  // not a prediction, and every "learning" system this project has seen fail did so by
+  // measuring itself on data it had already seen.
+  function recordForecast(fc) {
+    const count = Object.keys(open).length;
+    if (count >= MERCURY_OPEN_MAX) return;
+    for (const h of MERCURY_HORIZONS) {
+      const hz = fc.horizons[h.key];
+      // Only bother scoring horizons whose data was fresh enough to be meaningful.
+      if (fc.freshness < 0.5) continue;
+      // SAMPLE THE HORIZON, DO NOT SPAM IT.
+      // The tick fires every 60s across ~26 symbols. Recording all four horizons every
+      // time creates 104 open predictions a minute, while the one-month horizon does not
+      // resolve for 8,190 trading minutes — so the store fills with long-dated entries in
+      // ELEVEN MINUTES and recordForecast then returns at its first line for ever. The
+      // short horizons, which are the ones that could actually accumulate a skill
+      // measurement quickly, would stop being recorded first and the whole ledger would
+      // freeze while reporting a perfectly healthy "no skill yet".
+      //
+      // One sample per quarter-horizon per symbol keeps roughly four open predictions per
+      // symbol per horizon in flight — about 416 in total on this watchlist, comfortably
+      // inside the cap — and four overlapping samples per horizon is plenty of resolution
+      // for a Brier score. Overlapping windows do make consecutive samples correlated,
+      // which inflates the effective sample size; MERCURY_MIN_SAMPLES and the skill floor
+      // are what stand between that and believing a number too early.
+      const gapKey = fc.symbol + '|' + h.key;
+      const minGap = Math.max(60000, h.minutes * 60000 / 4);
+      if (fc.at - (lastRecorded[gapKey] || 0) < minGap) continue;
+      lastRecorded[gapKey] = fc.at;
+      const id = 'p' + (nextId++);
+      open[id] = {
+        id, sym: fc.symbol, h: h.key, at: fc.at, price: fc.price,
+        sigma: hz.sigma, pUp: hz.pUp, pDown: hz.pDown,
+        resolveAt: fc.at + h.minutes * 60000,
+        hi: fc.price, lo: fc.price,
+        // Rounded: these are clipped to [-1,1] and fed to an SGD learner, so the 12th
+        // decimal is noise — but at full float precision the feature vectors are the
+        // dominant term in the state file, and the whole file is one JSON.stringify
+        // written every five minutes.
+        f: fc.features.map(x => +x.toFixed(4)),
+      };
+    }
+  }
+
+  // Called every tick. Updates MFE/MAE water marks on everything open and resolves
+  // whatever has reached its horizon. Pure bookkeeping — places no orders, and is safe
+  // to call when the market is shut (nothing resolves because prices do not move).
+  function sweep(now = _now()) {
+    let resolved = 0;
+    for (const id of Object.keys(open)) {
+      const p = open[id];
+      const px = marketData[p.sym]?.price;
+      if (px > 0) { p.hi = Math.max(p.hi, px); p.lo = Math.min(p.lo, px); }
+      if (now < p.resolveAt) continue;
+      if (!(px > 0)) { delete open[id]; continue; }   // no price to score against
+      resolveOne(p, px);
+      delete open[id];
+      resolved++;
+    }
+    return resolved;
+  }
+
+  function resolveOne(p, px) {
+    const r = (px - p.price) / p.price;
+    const band = MERCURY_BAND * p.sigma;
+    const wasUp = r > band ? 1 : 0;
+    const wasDown = r < -band ? 1 : 0;
+    const s = score[p.h];
+
+    // Brier on the up-model against the running base rate. Scored BEFORE training, so
+    // every number in `score` is genuinely out of sample for the weights that produced
+    // it — the single most important line in this file.
+    const base = s.n >= 20 ? clip01(s.ups / s.n) : 0.30;
+    s.brier     += (p.pUp - wasUp) ** 2;
+    s.brierBase += (base  - wasUp) ** 2;
+    s.n++; s.ups += wasUp; s.downs += wasDown;
+    if (p.pUp > 0.5 || p.pDown > 0.5) {
+      s.calls++;
+      if ((p.pUp > p.pDown && wasUp) || (p.pDown > p.pUp && wasDown)) s.hits++;
+    }
+    const predicted = (p.pUp - p.pDown) * p.sigma * MERCURY_COND_MEAN;
+    s.predictedSum += predicted; s.realisedSum += r; s.sumAbsErr += Math.abs(predicted - r);
+
+    const m = models[p.h];
+    m.up.update(p.f, wasUp);
+    m.down.update(p.f, wasDown);
+
+    ledger.push({
+      sym: p.sym, h: p.h, at: p.at, resolvedAt: _now(),
+      price: p.price, exit: px, r: +r.toFixed(5),
+      pUp: p.pUp, pDown: p.pDown, predicted: +predicted.toFixed(5),
+      wasUp, wasDown,
+      mfe: +((p.hi - p.price) / p.price).toFixed(5),
+      mae: +((p.lo - p.price) / p.price).toFixed(5),
+      correct: (p.pUp > p.pDown ? wasUp : p.pDown > p.pUp ? wasDown : (!wasUp && !wasDown)) ? 1 : 0,
+    });
+    if (ledger.length > MERCURY_LEDGER_MAX) ledger.splice(0, ledger.length - MERCURY_LEDGER_MAX);
+  }
+
+  const ledger = [];
+
+  // ── METRICS ──────────────────────────────────────────────────────────────
+  // What "is it working" actually means, in numbers that cannot flatter themselves.
+  function metrics() {
+    const out = { horizons: {}, open: Object.keys(open).length, ledger: ledger.length,
+                  enabled: MERCURY_ON, minSamples: MERCURY_MIN_SAMPLES };
+    for (const h of MERCURY_HORIZONS) {
+      const s = score[h.key];
+      const bss = (s.n >= 1 && s.brierBase > 0) ? 1 - s.brier / s.brierBase : null;
+      out.horizons[h.key] = {
+        label: h.label,
+        resolved: s.n,
+        brier: s.n ? +(s.brier / s.n).toFixed(4) : null,
+        brierBaseline: s.n ? +(s.brierBase / s.n).toFixed(4) : null,
+        skillScore: bss == null ? null : +bss.toFixed(4),
+        skillUsed: +skillOf(h.key).toFixed(4),
+        directionalAccuracy: accuracyFor(h.key) == null ? null : +accuracyFor(h.key).toFixed(4),
+        directionalCalls: s.calls,
+        baseRateUp: s.n ? +(s.ups / s.n).toFixed(4) : null,
+        meanAbsError: s.n ? +(s.sumAbsErr / s.n).toFixed(5) : null,
+        predictedMean: s.n ? +(s.predictedSum / s.n).toFixed(5) : null,
+        realisedMean: s.n ? +(s.realisedSum / s.n).toFixed(5) : null,
+        trained: models[h.key].up.n,
+        weights: models[h.key].up.importance(4),
+      };
+    }
+    // ONE NUMBER FOR "IS MERCURY ALLOWED TO DO ANYTHING YET".
+    out.anySkill = MERCURY_HORIZON_KEYS.some(k => skillOf(k) > 0);
+    out.bestSkill = Math.max(0, ...MERCURY_HORIZON_KEYS.map(k => skillOf(k)));
+    return out;
+  }
+
+  function serialize() {
+    return {
+      models: Object.fromEntries(MERCURY_HORIZONS.map(h =>
+        [h.key, { up: models[h.key].up.toJSON(), down: models[h.key].down.toJSON() }])),
+      score, nextId,
+      // Unresolved forecasts MUST survive a restart or every horizon longer than the
+      // deploy interval would be scored never, and the long-horizon models would train
+      // on nothing for ever while reporting "no skill" — indistinguishable from a
+      // genuine absence of edge, which is exactly the confusion this file exists to end.
+      open: Object.values(open).slice(-MERCURY_OPEN_MAX),
+      // Persisted: without it a restart resets every sampling clock to zero and records a
+      // full four-horizon burst for every symbol on the first tick, which is the flood
+      // this throttle exists to prevent — and deploys are frequent.
+      lastRecorded,
+      // 150, not 400. The ledger is a REPORTING artifact — every number the decision
+      // layer reads comes from the `score` aggregates above, which are a few dozen bytes.
+      // At 400 rows it was ~80KB of a 170KB block, in a state file that is one
+      // JSON.stringify written every five minutes, and nothing consumes rows that old.
+      ledger: ledger.slice(-150),
+      dim: MERCURY_DIM,
+    };
+  }
+
+  function loadState(s) {
+    if (!s || typeof s !== 'object') return;
+    // The feature vector is a persistence contract, exactly as Jupiter's is. A saved
+    // model trained on a different feature set is not a head start, it is corruption.
+    if (s.dim && s.dim !== MERCURY_DIM) {
+      console.warn(`[MERCURY] Saved models used a ${s.dim}-feature vector, this build uses ` +
+                   `${MERCURY_DIM} — discarding them and starting clean rather than loading ` +
+                   `weights that mean something else.`);
+      return;
+    }
+    for (const h of MERCURY_HORIZONS) {
+      const mh = s.models && s.models[h.key];
+      if (mh) { models[h.key].up.load(mh.up); models[h.key].down.load(mh.down); }
+      const sc = s.score && s.score[h.key];
+      if (sc && Number.isFinite(sc.n)) Object.assign(score[h.key], sc);
+    }
+    if (Number.isFinite(s.nextId)) nextId = s.nextId;
+    if (Array.isArray(s.open)) {
+      open = {};
+      for (const p of s.open.slice(-MERCURY_OPEN_MAX)) {
+        if (p && typeof p.sym === 'string' && Array.isArray(p.f) && p.f.length === MERCURY_DIM
+            && Number.isFinite(p.resolveAt) && p.price > 0) open[p.id] = p;
+      }
+    }
+    if (s.lastRecorded && typeof s.lastRecorded === 'object') {
+      lastRecorded = {};
+      for (const [k, v] of Object.entries(s.lastRecorded)) if (Number.isFinite(v)) lastRecorded[k] = v;
+    }
+    if (Array.isArray(s.ledger)) ledger.push(...s.ledger.slice(-150));
+    const n = MERCURY_HORIZON_KEYS.reduce((a, k) => a + score[k].n, 0);
+    if (n > 0) console.log(`[MERCURY] ☿ Restored ${n} resolved forecast(s), ` +
+                           `${Object.keys(open).length} awaiting their horizon`);
+  }
+
+  // Test seam. The 2-second cache is correct on the hot path (forecast() is called once
+  // per held position per alternative per tick) but it makes a suite that mutates the
+  // models and re-asks in the same millisecond read a stale answer — which would let a
+  // broken decision layer pass every assertion written about it.
+  function clearCache() { for (const k of Object.keys(cache)) delete cache[k]; }
+
+  // Wipe every learned and recorded thing. Used by backtest.js between replay passes —
+  // a sweep that reused the previous pass's weights would be measuring a model that had
+  // already seen the data, which is the one result this whole subsystem exists to avoid
+  // producing.
+  function reset() {
+    for (const h of MERCURY_HORIZONS) {
+      models[h.key].up   = new OnlineLogistic(MERCURY_DIM, { lr: 0.03, l2: 3e-3, names: MERCURY_FEATURES });
+      models[h.key].down = new OnlineLogistic(MERCURY_DIM, { lr: 0.03, l2: 3e-3, names: MERCURY_FEATURES });
+      Object.assign(score[h.key], { n: 0, brier: 0, brierBase: 0, ups: 0, downs: 0, hits: 0,
+                                    calls: 0, sumAbsErr: 0, realisedSum: 0, predictedSum: 0 });
+    }
+    open = {}; nextId = 1; lastRecorded = {}; ledger.length = 0;
+    for (const k of Object.keys(vol)) delete vol[k];
+    clearCache();
+  }
+
+  return { setClock, reset, forecast, sweep, metrics, serialize, loadState, skillOf, accuracyFor,
+           featuresFor, sigmaFor, updateVol, clearCache, historyVol,
+           resetVol: (sym) => { if (sym) delete vol[sym]; else for (const k of Object.keys(vol)) delete vol[k]; },
+           getOpen: () => open, getLedger: () => ledger, getScore: () => score,
+           getLastRecorded: () => lastRecorded,
+           resetRecordClock: () => { lastRecorded = {}; },
+           getModels: () => models,
+           HORIZONS: MERCURY_HORIZONS, FEATURES: MERCURY_FEATURES };
+}
+
+const mercury = createMercury();
+
+// ════════════════════════════════════════════════════════════════════════════
+//  THE DECISION LAYER — turning forecasts into BUY / HOLD / REDUCE / SELL
+// ════════════════════════════════════════════════════════════════════════════
+//
+//  WHAT THIS REPLACES. Before this, the complete list of reasons a trading position
+//  could be sold was: it fell 2.2xATR (hard stop), it rose 4.6xATR (tp1, 40%), or it
+//  rose 6.9xATR (tp2, 30%). The trailing stop is switched off by ATR_TRAIL_ARM_R = 99
+//  and has been since it was measured turning a 2.09:1 payoff into 1.2:1. So there was
+//  NO mechanism, anywhere in the engine, by which a position whose case had fallen
+//  apart could be sold while still green. A winner could round-trip the entire way from
+//  +4.5xATR back to -2.2xATR and every line of code would consider that correct
+//  behaviour right up to the stop. That is the +$50-then-give-it-back machine, exactly.
+//
+//  WHAT IS SOVEREIGN, AND STAYS SOVEREIGN. The hard stop. This layer runs strictly
+//  AFTER the stop/target sweep has already dispatched, it can only ever ask to sell
+//  MORE or SOONER, and it is structurally incapable of cancelling a stop, widening one,
+//  raising a size cap or bypassing a kill switch. Every order it asks for still passes
+//  terraValidateTrade and the full risk pipeline. The measured history of this project
+//  is that judgement-timed exits destroy value, so judgement is given the power to
+//  accelerate and never the power to veto.
+//
+//  WHY IT CANNOT RUN AWAY. Every term below is multiplied by mercury's measured
+//  confidence, which is itself the product of sample support and the out-of-sample
+//  Brier skill score. Until the forecaster has demonstrated skill on this account's own
+//  resolved predictions, `confidence` is 0, every score is 0, every threshold comparison
+//  fails, and this entire layer is a no-op that only writes logs. It has to earn the
+//  right to spend a dollar, and if it never earns it the engine keeps doing the thing
+//  that measurably works.
+
+// Edge must beat the round trip by this multiple before ANY rotation is worth paying
+// for. Costs are the dominant measured drag in this system and a forecast that is
+// merely positive is not a reason to trade — it has to be positive by more than the
+// spread it will pay twice.
+const MERCURY_EDGE_COST_MULT = Math.max(1, parseFloat(process.env.MERCURY_EDGE_COST_MULT || '1.5'));
+// How much a dollar of expected downside is disliked relative to a dollar of expected
+// upside. 1.0 would be risk-neutral; this is deliberately loss-averse.
+const MERCURY_RISK_AVERSION = Math.max(0, parseFloat(process.env.MERCURY_RISK_AVERSION || '1.4'));
+// Minimum time a position must be held before a predictive exit may fire. Without it, a
+// forecast that flickers across a threshold on consecutive ticks would open and close
+// the same position all afternoon, paying spread on every leg.
+const MERCURY_MIN_HOLD_MS = Math.max(0, parseInt(process.env.MERCURY_MIN_HOLD_MS || '900000', 10));
+// And a floor on how often the same symbol may be acted on predictively at all.
+const MERCURY_ACTION_COOLDOWN_MS = Math.max(0, parseInt(process.env.MERCURY_ACTION_COOLDOWN_MS || '600000', 10));
+// A rotation must beat the incumbent by this much, not merely equal it. This is the
+// anti-churn term: sell-and-rebuy was measured at 0 wins in 360 variants, and the
+// mechanism was always that selling at P and buying at P is a no-op that pays two
+// spreads. An alternative has to be BETTER, by a margin, to be worth the round trip.
+const MERCURY_ROTATE_MARGIN = Math.max(0, parseFloat(process.env.MERCURY_ROTATE_MARGIN || '0.004'));
+// Fraction sold on a predictive REDUCE.
+const MERCURY_REDUCE_FRACTION = Math.min(0.9, Math.max(0.1,
+  parseFloat(process.env.MERCURY_REDUCE_FRACTION || '0.34')));
+// AN ABSOLUTE FLOOR UNDER THE ACTION BAR, IN CASE THE COST ESTIMATE IS WRONG.
+// Every threshold below is a multiple of estimateRoundTripCost, which is the right unit
+// — until the spread estimate returns something near zero for a thinly-quoted or
+// freshly-added name, at which point every bar collapses to ~0 and the smallest negative
+// score trips a sale. A forecast-driven engine with a broken cost input would churn the
+// book flat. 20bps is below any real round trip this bot pays and above any plausible
+// estimator failure, so it binds only when the estimate has gone wrong.
+const MERCURY_MIN_EDGE = Math.max(0, parseFloat(process.env.MERCURY_MIN_EDGE || '0.002'));
+
+// Which horizon governs a decision depends on which sleeve the money is in. A
+// short-term position is judged on tomorrow; a long-term holding is judged on the month,
+// and must NOT be sold because of an afternoon. Collapsing the two is how a long-term
+// thesis gets liquidated by short-term noise.
+const MERCURY_SLEEVE_HORIZON = { short: 'short', long: 'medium', core: 'long' };
+
+let _mercuryLastAction = {};       // sym -> ts of last predictive action
+let _mercuryPeakEquity = 0;        // account high-water mark, persisted
+let _mercuryDecisions = [];        // recent decisions, for the API and the digest
+
+// ── OPPORTUNITY COST ─────────────────────────────────────────────────────────
+// A position does not deserve to stay in the book because it was bought earlier. This
+// returns the best net expected return currently available ELSEWHERE, so every hold
+// decision is made against the real alternative rather than against zero.
+function mercuryBestAlternative(excludeSym, horizonKey) {
+  if (!MERCURY_ON) return { sym: null, net: 0 };
+  let best = { sym: null, net: 0 };
+  const pool = allTradeSymbols(getCurrentMarket() || 'nasdaq');
+  for (const sym of pool) {
+    if (sym === excludeSym) continue;
+    if (CORE_HOLD_ON && CORE_HOLD_SYMBOLS.includes(sym)) continue;   // not a rotation target
+    if (onCooldown(sym)) continue;
+    const fc = mercury.forecast(sym);
+    if (!fc) continue;
+    const hz = fc.horizons[horizonKey];
+    if (!hz) continue;
+    // Net of the round trip it would cost to GET there. An alternative that is better
+    // gross and worse net is not an alternative.
+    const net = hz.expectedReturn - estimateRoundTripCost(sym);
+    if (net > best.net) best = { sym, net, confidence: hz.confidence };
+  }
+  return best;
+}
+
+// ── PEAK-PROFIT PRESERVATION ─────────────────────────────────────────────────
+// The account reached roughly +$50 and gave it back. The failure was not "it did not
+// sell at the top" — nothing sells at the top, and a rule that tried would be the
+// trailing stop again, which this project has already measured destroying a third of
+// its payoff. The failure was that NOTHING CHANGED as the account moved from "starting
+// out" to "holding a gain worth protecting". The risk posture at +$50 was identical to
+// the risk posture at $0.
+//
+// So this does not sell. It returns PRESSURE — a 0..1 number that lowers the bar a
+// forecast must clear before a reduce is taken, and does so only in proportion to how
+// much of a real gain is actually exposed. At a new high with a healthy forecast, the
+// pressure is near zero and the position rides. At a new high with a deteriorating
+// forecast, the bar for trimming drops sharply. No high-water mark, on its own, ever
+// causes a sale.
+function mercuryPeakPressure(totalValue = getTotalValue()) {
+  if (!(totalValue > 0)) return 0;
+  if (totalValue > _mercuryPeakEquity) _mercuryPeakEquity = totalValue;
+  const base = startingCapital();
+  if (!(base > 0)) return 0;
+  // Only gains matter. Below the starting line there is nothing to preserve and the
+  // drawdown machinery is already in charge.
+  const gain = (_mercuryPeakEquity - base) / base;
+  if (gain <= 0) return 0;
+  // Pressure scales with the size of the gain at risk, saturating at a 10% gain. A $20
+  // profit is not worth changing behaviour over; a 10% run is.
+  const sizeTerm = Math.min(1, gain / 0.10);
+  // And with how much of that gain is currently given back — rising as the account
+  // slips from its own high, which is when preservation actually matters.
+  const givenBack = Math.max(0, (_mercuryPeakEquity - totalValue) / Math.max(1e-9, _mercuryPeakEquity - base));
+  const slipTerm = Math.min(1, givenBack / 0.5);
+  return Math.max(0, Math.min(1, 0.5 * sizeTerm + 0.5 * sizeTerm * slipTerm));
+}
+
+// ── 70 / 30 ──────────────────────────────────────────────────────────────────
+// The objective is 70% short-horizon growth, 30% long-horizon growth. It is stated
+// here as an objective and implemented as one, subordinate to risk management exactly
+// as specified — because two measured facts sit against switching it on wholesale
+// tomorrow: the trading side has no demonstrated edge (34 rules tested, 34 losses), and
+// the phase gate returns a trading allowance of exactly zero until the holding side has
+// banked its bar. Moving 70% of the account into a sleeve that measures at no edge, and
+// which the gate will not let spend anyway, converts invested capital into idle cash —
+// the single largest measured drag in this system.
+//
+// So the target RAMPS with demonstrated forecast skill. At zero measured skill it
+// returns 0 and nothing changes. As Mercury's Brier skill score climbs, the short-term
+// sleeve opens toward the full 70%, reaching it at BSS 0.10 — a real but modest edge.
+// The ramp is what makes 70/30 an objective rather than a leap of faith, and
+// ALLOC_RAMP=off hands the operator the leap if they want it.
+const ALLOC_SHORT_TARGET = Math.max(0, Math.min(0.95,
+  parseFloat(process.env.ALLOC_SHORT_TARGET || '0.70')));
+const ALLOC_RAMP_ON = (process.env.ALLOC_RAMP || 'on').toLowerCase() !== 'off';
+const ALLOC_FULL_SKILL = Math.max(0.01, parseFloat(process.env.ALLOC_FULL_SKILL || '0.10'));
+
+function allocationShortTarget() {
+  if (!MERCURY_ON) return 0;
+  if (!ALLOC_RAMP_ON) return ALLOC_SHORT_TARGET;
+  // Both conditions, because either one alone produces idle cash: skill without an open
+  // gate cannot be acted on, and an open gate without skill is the thing that lost money.
+  if (PHASE_GATE_ENABLED && tradingPhaseLocked()) return 0;
+  const earned = Math.max(0, Math.min(1, mercurySkillLevel() / ALLOC_FULL_SKILL));
+  return ALLOC_SHORT_TARGET * earned;
+}
+// Deliberately NOT mercury.metrics().bestSkill. metrics() allocates a report object and
+// sorts every model's weights, and this is read from effectiveCoreFraction — which runs
+// inside the core sizing path. skillOf() is a couple of divisions.
+function mercurySkillLevel() {
+  if (!MERCURY_ON) return 0;
+  try {
+    let best = 0;
+    for (const k of MERCURY_HORIZON_KEYS) best = Math.max(best, mercury.skillOf(k));
+    return best;
+  } catch (e) { return 0; }
+}
+
+// ── THE SCORE ────────────────────────────────────────────────────────────────
+// expected return x confidence, minus expected downside x aversion, minus the cost of
+// acting, minus what the capital could be doing instead. Everything is a fraction of
+// position value, so the comparison is scale-free and works identically at $50 and $10m.
+function mercuryScore(sym, horizonKey, { excludeAlternative = false, held = false } = {}) {
+  const fc = mercury.forecast(sym);
+  if (!fc) return null;
+  const hz = fc.horizons[horizonKey];
+  if (!hz) return null;
+  const cost = estimateRoundTripCost(sym);
+  const alt  = excludeAlternative ? { sym: null, net: 0 } : mercuryBestAlternative(sym, horizonKey);
+  // expectedReturn already carries confidence. expectedDownside deliberately does NOT —
+  // risk is reported at full weight from the first bar, because under-reporting risk is
+  // the more expensive of the two mistakes and volatility, unlike direction, is
+  // genuinely measurable without a track record.
+  // THE ROUND TRIP IS CHARGED TO ACTING, NOT TO EXISTING.
+  // Subtracting it from a position already held was a systematic thumb on the scale
+  // toward selling: a healthy winner with +0.12% expected return and a 0.26% round trip
+  // scored -0.15% and tripped the reduce bar, purely because it was being billed for an
+  // entry it had already paid for and an exit it had not yet made. Measured on a clean
+  // 80-bar advance, that single term turned a HOLD into a REDUCE. The cost of LEAVING is
+  // already represented, on the other side of the comparison, as the bar a negative
+  // score must clear before an exit is worth paying for.
+  const gross = hz.expectedReturn
+              - MERCURY_RISK_AVERSION * hz.expectedDownside * hz.confidence
+              - Math.max(0, alt.net - MERCURY_ROTATE_MARGIN);
+  const score = held ? gross : gross - cost;
+  return {
+    symbol: sym, horizon: horizonKey, score, gross, held, cost, alternative: alt,
+    expectedReturn: hz.expectedReturn, expectedDownside: hz.expectedDownside,
+    confidence: hz.confidence, pUp: hz.pUp, pDown: hz.pDown, pFlat: hz.pFlat,
+    sigma: hz.sigma, skill: hz.skill, samples: hz.samples,
+    timeToMove: fc.timeToMove, freshness: fc.freshness, price: fc.price,
+  };
+}
+
+// ── THE DECISION ─────────────────────────────────────────────────────────────
+function mercuryDecide(sym, { sleeve = 'short', held = false, openedAt = 0, unrealisedPct = 0 } = {}) {
+  const none = (why) => ({ action: 'NONE', reason: why, score: 0, confidence: 0 });
+  if (!MERCURY_ON) return none('Mercury disabled');
+  const horizonKey = MERCURY_SLEEVE_HORIZON[sleeve] || 'short';
+  const s = mercuryScore(sym, horizonKey, { held });
+  if (!s) return none('no forecast — no price or no features');
+
+  // NO SKILL, NO OPINION. This is the gate that makes everything above safe to run
+  // before it has proved anything: confidence is support x measured Brier skill x
+  // freshness, so an unproven or stale forecaster returns exactly zero here and the
+  // function cannot reach a single actionable branch below.
+  if (!(s.confidence > 0)) {
+    return { ...s, action: 'HOLD', reason: 'no measured skill yet — forecast is not actionable', decisionConfidence: 0 };
+  }
+  const now = Date.now();
+  const costBar = Math.max(s.cost * MERCURY_EDGE_COST_MULT, MERCURY_MIN_EDGE);
+
+  if (held) {
+    const heldLongEnough = !openedAt || (now - openedAt) >= MERCURY_MIN_HOLD_MS;
+    const cooled = (now - (_mercuryLastAction[sym] || 0)) >= MERCURY_ACTION_COOLDOWN_MS;
+    const pressure = mercuryPeakPressure();
+    // Peak pressure does not sell. It lowers the bar a bad forecast must clear, by up to
+    // half, and only when there is a real gain exposed.
+    const sellBar   = -costBar * (1 - 0.5 * pressure);
+    const reduceBar = -costBar * 0.4 * (1 - 0.5 * pressure);
+
+    if (!heldLongEnough) return { ...s, action: 'HOLD', reason: `held ${Math.round((now-openedAt)/60000)}m, minimum ${Math.round(MERCURY_MIN_HOLD_MS/60000)}m — too soon to re-trade`, decisionConfidence: s.confidence };
+    if (!cooled)         return { ...s, action: 'HOLD', reason: 'acted on this name recently — cooling off to avoid churn', decisionConfidence: s.confidence };
+
+    if (s.score <= sellBar) {
+      const rot = s.alternative.sym && s.alternative.net > s.expectedReturn + MERCURY_ROTATE_MARGIN;
+      return { ...s, action: 'SELL', peakPressure: pressure, decisionConfidence: s.confidence,
+               reason: rot
+                 ? `forward return ${(s.expectedReturn*100).toFixed(2)}% is worse than ${s.alternative.sym} at ${(s.alternative.net*100).toFixed(2)}% net, by more than the round trip`
+                 : `probability-weighted forward return has turned negative (p(down) ${(s.pDown*100).toFixed(0)}% vs p(up) ${(s.pUp*100).toFixed(0)}%) beyond the cost of exiting` };
+    }
+    if (s.score <= reduceBar) {
+      return { ...s, action: 'REDUCE', fraction: MERCURY_REDUCE_FRACTION, peakPressure: pressure,
+               decisionConfidence: s.confidence,
+               reason: `forward return deteriorated to ${(s.expectedReturn*100).toFixed(2)}% against ${(s.expectedDownside*100).toFixed(2)}% downside` +
+                       (pressure > 0.2 ? ` with ${(pressure*100).toFixed(0)}% preservation pressure on an exposed gain` : '') };
+    }
+    return { ...s, action: 'HOLD', peakPressure: pressure, decisionConfidence: s.confidence,
+             reason: `forward return ${(s.expectedReturn*100).toFixed(2)}% still beats the alternative (${s.alternative.sym || 'cash'} ${(s.alternative.net*100).toFixed(2)}%)` };
+  }
+
+  // ENTRY. Would we want to initiate this RIGHT NOW, knowing what we know — not
+  // "did an indicator cross".
+  if (s.score >= costBar) {
+    return { ...s, action: 'BUY', decisionConfidence: s.confidence,
+             reason: `forward return ${(s.expectedReturn*100).toFixed(2)}% clears ${MERCURY_EDGE_COST_MULT}x the ${(s.cost*100).toFixed(2)}% round trip, p(up) ${(s.pUp*100).toFixed(0)}%, moves on the ${s.timeToMove} horizon` };
+  }
+  return { ...s, action: 'NONE', decisionConfidence: s.confidence,
+           reason: `forward return ${(s.expectedReturn*100).toFixed(2)}% does not clear ${MERCURY_EDGE_COST_MULT}x the ${(s.cost*100).toFixed(2)}% round trip` };
+}
+
+// ── OBSERVABILITY ────────────────────────────────────────────────────────────
+// Structured decision factors, never chain-of-thought. Everything printed here is a
+// number the system actually computed and can be checked against the ledger later.
+function logOracleDecision(d, extra = {}) {
+  if (!d || d.action === 'NONE' || d.action === 'HOLD') return;
+  const pct = (x) => (x == null ? '—' : `${(x * 100).toFixed(2)}%`);
+  const fc = mercury.forecast(d.symbol);
+  const h = fc ? fc.horizons : {};
+  console.log(
+    `[ORACLE] ${d.symbol} @ $${(d.price || 0).toFixed(2)} → ${d.action}\n` +
+    `[ORACLE]   short ${pct(h.short?.rawEdge)} (p↑${((h.short?.pUp||0)*100).toFixed(0)}/p↓${((h.short?.pDown||0)*100).toFixed(0)}) · ` +
+    `medium ${pct(h.medium?.rawEdge)} · long ${pct(h.long?.rawEdge)} · moves on ${d.timeToMove}\n` +
+    `[ORACLE]   E[ret] ${pct(d.expectedReturn)} · E[down] ${pct(d.expectedDownside)} · cost ${pct(d.cost)} · ` +
+    `score ${pct(d.score)} · confidence ${(d.confidence * 100).toFixed(0)}% (skill ${(d.skill * 100).toFixed(1)}% over ${d.samples})\n` +
+    `[ORACLE]   alternative ${d.alternative?.sym || 'none'} ${pct(d.alternative?.net)}` +
+    (d.peakPressure ? ` · preservation pressure ${(d.peakPressure * 100).toFixed(0)}%` : '') +
+    (extra.position ? ` · position ${extra.position}` : '') + `\n` +
+    `[ORACLE]   ${d.reason}`);
+}
+
+function noteMercuryDecision(d) {
+  if (!d) return;
+  _mercuryDecisions.push({ at: Date.now(), sym: d.symbol, action: d.action,
+                           score: +(d.score || 0).toFixed(5), confidence: d.confidence,
+                           reason: d.reason });
+  if (_mercuryDecisions.length > 200) _mercuryDecisions.splice(0, _mercuryDecisions.length - 200);
+}
+
+// ── THE PER-TICK RE-EVALUATION ───────────────────────────────────────────────
+// Runs at the seam in evaluateAndTrade: after every stop, trailing stop and take-profit
+// rung has already been DISPATCHED, and before any of the entry gates that can return
+// early. That position is deliberate and load-bearing:
+//   • stops are dispatched first, so the hard stop is always sovereign;
+//   • closeLong/closeShort have already set _exiting synchronously on anything they are
+//     selling, so a predictive close on that ticker short-circuits and cannot duplicate
+//     an order or race a fill;
+//   • it sits above every early return in the risk gates, so a deteriorating position is
+//     still re-evaluated while the account is in drawdown, phase-locked, at its daily
+//     trade cap or broker-paused — which is exactly when it matters most.
+function mercuryExitPass() {
+  if (!MERCURY_ON) return 0;
+  let acted = 0;
+  const pressure = mercuryPeakPressure();
+  for (const [dir, book] of [['LONG', portfolio.longPositions], ['SHORT', portfolio.shortPositions]]) {
+    for (const ticker of Object.keys(book)) {
+      const lots = book[ticker];
+      if (!lots || !lots.length) continue;
+      // Never touch a ticker the stop sweep is already exiting, or one with a partial in
+      // flight. The engine's own re-entrancy marks are the interlock.
+      if (lots.some(p => p._exiting || p._pendingRung != null)) continue;
+      const px = marketData[ticker]?.price;
+      if (!(px > 0)) continue;
+      let q = 0, c = 0, opened = Infinity;
+      for (const p of lots) { q += p.qty; c += p.entryPrice * p.qty; opened = Math.min(opened, p.openedAt || Infinity); }
+      if (!(q > 0)) continue;
+      const avg = c / q;
+      const upl = dir === 'LONG' ? (px - avg) / avg : (avg - px) / avg;
+      const d = mercuryDecide(ticker, { sleeve: 'short', held: true,
+                                        openedAt: Number.isFinite(opened) ? opened : 0,
+                                        unrealisedPct: upl });
+      if (d.action !== 'SELL' && d.action !== 'REDUCE') continue;
+      logOracleDecision(d, { position: `${q.toFixed(4)} @ $${avg.toFixed(2)} (${(upl * 100).toFixed(2)}%)` });
+      noteMercuryDecision(d);
+      _mercuryLastAction[ticker] = Date.now();
+      // stopLoss=false: this is a judgement exit, not a stop, and must not be recorded
+      // as one — the cooldown and loss-count machinery keys off that flag.
+      if (d.action === 'SELL') {
+        if (dir === 'LONG') closeLong(ticker, false); else closeShort(ticker, false);
+      } else {
+        // A distinct rung, so a predictive trim can never collide with tp1/tp2's
+        // partialsTaken bookkeeping and is excluded from win-rate stats like any partial.
+        partialClose(ticker, dir, d.fraction, 'oracle');
+      }
+      acted++;
+    }
+  }
+  if (acted) console.log(`[ORACLE] Re-evaluated the open book — ${acted} position(s) acted on` +
+                         (pressure > 0.2 ? ` (preservation pressure ${(pressure * 100).toFixed(0)}%)` : ''));
+  return acted;
+}
+
+// Mercury's own clock. Deliberately independent of the trading session: water marks
+// and resolutions must advance whether or not the engine is allowed to trade.
+let _mercuryLastForecastAt = 0;
+let _mercuryLastReport = 0;
+const MERCURY_FORECAST_INTERVAL_MS = Math.max(5000,
+  parseInt(process.env.MERCURY_FORECAST_INTERVAL_MS || '60000', 10));
+
+function mercuryTick() {
+  if (!MERCURY_ON) return;
+  try {
+    // Resolve and water-mark every tick — cheap, and the whole ledger depends on it.
+    mercury.sweep();
+    const now = Date.now();
+    if (now - _mercuryLastForecastAt < MERCURY_FORECAST_INTERVAL_MS) return;
+    _mercuryLastForecastAt = now;
+    // Only RECORD forecasts while the market is open. A forecast stamped at 3am resolves
+    // against a price that never moved, scores as FLAT for free, and would flood the
+    // ledger with samples that teach the model nothing except that nights are quiet.
+    const open = !!getCurrentMarket();
+    const universe = [...new Set([
+      ...allTradeSymbols(getCurrentMarket() || 'nasdaq'),
+      ...(CORE_HOLD_ON ? CORE_HOLD_SYMBOLS : []),
+    ])];
+    for (const sym of universe) {
+      try { mercury.forecast(sym, { record: open }); } catch (e) { /* one bad symbol must not stop the sweep */ }
+    }
+    if (now - _mercuryLastReport > 3600000) {
+      _mercuryLastReport = now;
+      const m = mercury.metrics();
+      const parts = MERCURY_HORIZON_KEYS.map(k => {
+        const h = m.horizons[k];
+        return `${h.label} ${h.resolved}${h.skillScore == null ? '' : ` bss ${h.skillScore.toFixed(3)}`}` +
+               `${h.directionalAccuracy == null ? '' : ` acc ${(h.directionalAccuracy*100).toFixed(0)}%`}`;
+      });
+      console.log(`[MERCURY] ☿ ${parts.join(' · ')} | open ${m.open} | ` +
+        (m.anySkill
+          ? `measured skill ${(m.bestSkill*100).toFixed(1)}% — forecasts are influencing decisions`
+          : `NO measured skill yet — forecasts are logged and scored but cannot move money`));
+    }
+  } catch (e) { console.error('[MERCURY] tick failed:', e.message); }
+}
+
 function evaluateAndTrade() {
   const market = getCurrentMarket();
   if (!market) return;
@@ -8390,6 +9524,15 @@ function evaluateAndTrade() {
   longsToClose.forEach(t => closeLong(t, false));
   shortsStop.forEach(t    => closeShort(t, true));
   shortsToClose.forEach(t => closeShort(t, false));
+
+  // ── 1b. FORWARD RE-EVALUATION OF THE OPEN BOOK ───────────────────────────
+  // Every stop, trail and take-profit rung above has now been DISPATCHED, so the
+  // arithmetic rules are sovereign and this can only ever sell more or sooner, never
+  // instead. It sits here rather than lower down because everything below can return
+  // early — and a position whose forward case has collapsed still needs re-examining
+  // when the account is in drawdown, phase-locked or at its daily trade cap, which is
+  // precisely when the old code stopped looking.
+  try { mercuryExitPass(); } catch (e) { console.error('[ORACLE] exit pass failed:', e.message); }
 
   // ── 2. RISK GATES ─────────────────────────────────────────────────────────
   const totalValue = getTotalValue();
@@ -8705,14 +9848,45 @@ function evaluateAndTrade() {
 
     const shortReady = shortScore >= minThreshold && regime !== 'bull' && tf15mBias !== 'bullish' && gate.shortGate;
 
-    if (longReady) {
-      const reason = `weighted ${longScore.toFixed(2)}/1.0 ${gate.detail} tf5m ${tf5mTrend} tf15m ${tf15mBias} vol ${volumeBreakout ? 'YES' : 'no'} ${regime}${aiAdj.note}`;
+    // ── FORWARD ENTRY CHECK ──────────────────────────────────────────────
+    // "Given everything currently known, would I still want to initiate this position
+    // right now?" — asked of the FORECAST, not of the indicator that fired. Structured
+    // as a VETO rather than as a replacement for the scoring above: the weighted gate is
+    // measured, the forecaster is not, and six separate edges in this project were
+    // believed before they were tested. So Mercury may refuse an entry the old logic
+    // wanted, and may never conjure one the old logic did not — and while it has no
+    // measured skill its decision is 'HOLD' with zero confidence, which vetoes nothing.
+    // The veto is computed PER DIRECTION and applied per direction. Folding it into the
+    // existing if/else-if chain as another branch would have made a vetoed long swallow
+    // the short arm entirely — the two are alternatives to each other, not to a refusal.
+    const mLong  = longReady  ? mercuryDecide(symbol, { sleeve: 'short', held: false }) : null;
+    const mShort = shortReady ? mercuryDecide(symbol, { sleeve: 'short', held: false }) : null;
+    const mercuryVetoes = (d) => !!(d && d.confidence > 0 && d.action !== 'BUY');
+    const vetoLog = (sym, d) => {
+      noteMercuryDecision(d);
+      noteDailyRejection('forward expected return below the round trip');
+      if (Date.now() - (evaluateAndTrade._lastOracleVeto || 0) > 60000) {
+        evaluateAndTrade._lastOracleVeto = Date.now();
+        console.log(`[ORACLE] ${sym} entry declined — ${d.reason}`);
+      }
+    };
+    if (mercuryVetoes(mLong))  vetoLog(symbol, mLong);
+    if (mercuryVetoes(mShort)) vetoLog(symbol, mShort);
+    const longOk  = longReady  && !mercuryVetoes(mLong);
+    const shortOk = shortReady && !mercuryVetoes(mShort);
+
+    if (longOk) {
+      const reason = `weighted ${longScore.toFixed(2)}/1.0 ${gate.detail} tf5m ${tf5mTrend} tf15m ${tf15mBias} vol ${volumeBreakout ? 'YES' : 'no'} ${regime}${aiAdj.note}` +
+                     (mLong && mLong.confidence > 0 ? ` | oracle E[ret] ${(mLong.expectedReturn*100).toFixed(2)}% conf ${(mLong.confidence*100).toFixed(0)}%` : '');
+      if (mLong && mLong.confidence > 0) { logOracleDecision(mLong); noteMercuryDecision(mLong); }
       if (executeLong(symbol, q.price, reason, Math.round(longScore * 7))) {
         aiSystem.currentReasoning.signalScore = Math.round(longScore * 7); // store 0-7 int, consistent with trade records
         return;
       }
-    } else if (shortReady) {
-      const reason = `weighted ${shortScore.toFixed(2)}/1.0 ${gate.detail} tf5m ${tf5mTrend} tf15m ${tf15mBias} vol ${volumeBreakout ? 'YES' : 'no'} ${regime}${aiAdj.note}`;
+    } else if (shortOk) {
+      const reason = `weighted ${shortScore.toFixed(2)}/1.0 ${gate.detail} tf5m ${tf5mTrend} tf15m ${tf15mBias} vol ${volumeBreakout ? 'YES' : 'no'} ${regime}${aiAdj.note}` +
+                     (mShort && mShort.confidence > 0 ? ` | oracle E[ret] ${(mShort.expectedReturn*100).toFixed(2)}% conf ${(mShort.confidence*100).toFixed(0)}%` : '');
+      if (mShort && mShort.confidence > 0) { logOracleDecision(mShort); noteMercuryDecision(mShort); }
       if (executeShort(symbol, q.price, reason, Math.round(shortScore * 7))) {
         aiSystem.currentReasoning.signalScore = Math.round(shortScore * 7);
         return;
@@ -8943,6 +10117,45 @@ function buildIntelSummary() {
 app.get('/api/intel', (req, res) => res.json({ ...buildIntelSummary(), recentOutcomes: jupiter.getState().recentOutcomes }));
 app.get('/api/venus', (req, res) => res.json({ ...venus.getState(), research: venus.getResearch(), watchlist: venus.getResearch().watchlist }));   // research engine
 app.get('/api/jupiter',   (req, res) => res.json({ ...jupiter.getState(), dynamicWatchlist: Object.keys(dynamicSymbols) }));  // trading engine
+
+// ☿ THE FORECASTER'S REPORT CARD. Read-only, no token needed — nothing here mutates
+// state and the whole point is that the numbers are checkable. `verdict` is the one
+// line that matters: it is derived from the SAME skillOf() the decision layer gates on,
+// so the dashboard cannot say "working" while the engine is ignoring the model.
+app.get('/api/oracle', (req, res) => {
+  if (!MERCURY_ON) return res.json({ enabled: false, reason: 'MERCURY_ENABLED=false' });
+  const m = mercury.metrics();
+  const sym = typeof req.query.symbol === 'string' ? req.query.symbol.toUpperCase() : null;
+  res.json({
+    enabled: true,
+    verdict: m.anySkill
+      ? `measured skill ${(m.bestSkill * 100).toFixed(1)}% — forecasts are influencing decisions`
+      : `no measured skill yet — forecasts are recorded and scored, but multiply out to zero ` +
+        `and cannot move money (needs ${MERCURY_MIN_SAMPLES}+ resolved forecasts on a horizon ` +
+        `and a Brier skill score above ${MERCURY_SKILL_FLOOR})`,
+    metrics: m,
+    allocation: {
+      shortTermTarget: +allocationShortTarget().toFixed(4),
+      objective: ALLOC_SHORT_TARGET,
+      fullAtSkill: ALLOC_FULL_SKILL,
+      coreFractionNow: +effectiveCoreFraction().toFixed(4),
+      phaseLocked: PHASE_GATE_ENABLED && tradingPhaseLocked(),
+    },
+    preservation: {
+      peakEquity: +_mercuryPeakEquity.toFixed(2),
+      totalValue: +getTotalValue().toFixed(2),
+      pressure: +mercuryPeakPressure().toFixed(4),
+    },
+    thresholds: {
+      edgeCostMultiple: MERCURY_EDGE_COST_MULT, riskAversion: MERCURY_RISK_AVERSION,
+      minHoldMinutes: MERCURY_MIN_HOLD_MS / 60000,
+      cooldownMinutes: MERCURY_ACTION_COOLDOWN_MS / 60000,
+      rotateMargin: MERCURY_ROTATE_MARGIN, reduceFraction: MERCURY_REDUCE_FRACTION,
+    },
+    recentDecisions: _mercuryDecisions.slice(-40).reverse(),
+    forecast: sym ? mercury.forecast(sym) : undefined,
+  });
+});
 app.post('/api/intel/analyze', async (req, res) => {
   if (!adminAllowed(req)) return res.status(401).json({ ok: false, error: 'unauthorized (ADMIN_TOKEN)' });
   if (!AI_ENABLED) return res.status(503).json({ error: 'Venus disabled — set GROQ_API_KEY (free, console.groq.com) or ANTHROPIC_API_KEY' });
@@ -9275,6 +10488,22 @@ if (require.main === module) app.listen(PORT, async () => {
       sessionFraction: () => { const { hours } = getEasternTimeParts(); return Math.max(0, Math.min(1, (hours - 9.5) / 6.5)); },
       spread: (sym) => estimateDynamicSpread(sym),
       tradingCapitalAllowed,
+      // Mercury's forward view, expressed as a size multiplier around 1.0. Returns
+      // exactly 1.0 (no effect) whenever the forecaster has no measured skill, no
+      // forecast, or stale inputs — so Jupiter's behaviour is bit-identical until the
+      // forecaster has earned its say.
+      mercuryConviction: (sym, dir) => {
+        try {
+          if (!MERCURY_ON) return 1;
+          const fc = mercury.forecast(sym);
+          if (!fc) return 1;
+          const hz = fc.horizons.short;
+          if (!hz || !(hz.confidence > 0)) return 1;
+          const signed = (dir === 'SHORT') ? -1 : 1;
+          const edge = clip((hz.pUp - hz.pDown) * signed, -1, 1) * hz.confidence;
+          return clip(1 + edge * 0.5, 0.5, 1.25);
+        } catch (e) { return 1; }
+      },
       quote: (sym) => { const m = marketData[sym]; return m ? { price: m.price, prevClose: m.prevClose } : null; }
     }
   });
@@ -9296,6 +10525,15 @@ if (require.main === module) app.listen(PORT, async () => {
     }
   } else {
     console.log('🟢 SIM MODE — no real orders (LIVE_TRADING != true). Broker routing is a no-op.');
+  }
+  if (MERCURY_ON) {
+    console.log(`[MERCURY] ☿ Forecaster ON — ${MERCURY_HORIZONS.map(h => h.label).join('/')} horizons, ` +
+                `${MERCURY_DIM} features, scored on its own resolved predictions. It cannot influence a ` +
+                `single order until it has ${MERCURY_MIN_SAMPLES}+ resolved forecasts on a horizon AND a ` +
+                `Brier skill score above ${MERCURY_SKILL_FLOOR} — until then confidence is 0 and every ` +
+                `decision multiplies out to nothing. Report card: /api/oracle`);
+  } else {
+    console.log('[MERCURY] ☿ Forecaster OFF (MERCURY_ENABLED=false) — exits revert to stop/target only');
   }
   console.log(`[STRATEGY] EMA(${STRATEGY.EMA_FAST}/${STRATEGY.EMA_SLOW}) + RSI(${STRATEGY.RSI_PERIOD}) gate ${STRATEGY_GATE_ENABLED ? 'ON' : 'OFF'}`);
   console.log(`[MODE] Autonomous entries ${AUTONOMOUS_TRADING ? 'ON (ATLAS is the brain)' : 'OFF (pure executor — TradingView drives entries)'}`);
@@ -9357,6 +10595,12 @@ if (require.main === module) app.listen(PORT, async () => {
     computeMarketBreadth();
     updateSymbolMetrics();
     updateLearning();
+    // MERCURY RUNS OUTSIDE evaluateAndTrade ON PURPOSE. evaluateAndTrade returns at its
+    // second line when the session is closed, and a forecast ledger that only ticks
+    // during RTH would never advance the water marks on an overnight horizon, never
+    // resolve a prediction made before the close, and would report "no skill" for
+    // reasons that have nothing to do with skill.
+    mercuryTick();
     evaluateAndTrade();
   }, 2000);
 
@@ -9484,6 +10728,21 @@ module.exports = {
     LLM_MAX_TOKENS, noteFinishReason, MAX_ARTICLES_PER_CALL,
     setBenchmarkStart: (v) => { _benchmarkStart = v; }, setDividendsTotal: (v) => { _dividendsTotal = v; }, CORE_BUYS_PER_CYCLE, CORE_INTERVAL_MS, BACKUP_FILE, DATA_DIR, CORE_BASKET_MIN_HOLD_MS, CORE_BASKET_MAX_NAMES, CORE_TRIMS_PER_CYCLE, cashDriftMin, CASH_DRIFT_ABS, adoptBrokerCashDrift,
     MAX_DAY_VOLUME_SHARE, intendedPositionNotional, verifyStateDir,
+    desiredWsSymbols, syncWsSubscription, wsSymbolPriority, WATCHLISTS,
+    // ☿ v13.66 — the forecaster and the decision layer
+    mercury, MERCURY_ON, MERCURY_HORIZONS, MERCURY_FEATURES, MERCURY_DIM, MERCURY_BAND,
+    MERCURY_MIN_SAMPLES, MERCURY_SKILL_FLOOR, MERCURY_PRIOR_K, MERCURY_COND_MEAN,
+    mercuryDecide, mercuryScore, mercuryBestAlternative, mercuryPeakPressure,
+    mercuryExitPass, mercuryTick, mercurySkillLevel, allocationShortTarget,
+    ALLOC_SHORT_TARGET, ALLOC_FULL_SKILL, MERCURY_EDGE_COST_MULT, MERCURY_RISK_AVERSION,
+    MERCURY_MIN_HOLD_MS, MERCURY_ACTION_COOLDOWN_MS, MERCURY_ROTATE_MARGIN,
+    MERCURY_REDUCE_FRACTION, MERCURY_SLEEVE_HORIZON, logOracleDecision, MERCURY_MIN_EDGE, MERCURY_CACHE_MS,
+    atrPct, rsi, calculateADX, calculateRVOL,
+    getMercuryPeak: () => _mercuryPeakEquity,
+    setMercuryPeak: (v) => { _mercuryPeakEquity = v; },
+    getMercuryDecisions: () => _mercuryDecisions,
+    resetMercuryActionClock: () => { _mercuryLastAction = {}; },
+    getWsSubscribed: () => [...wsSubscribed], processProfitVault,
     // v12.65 — account-size portability
     affordableBasketNames, coreMinSlice, minimumTradingCapital,
     accountIdentityChanged, adoptNewAccount, logCapitalDependentConfig,

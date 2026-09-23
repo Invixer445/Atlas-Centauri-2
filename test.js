@@ -2956,8 +2956,28 @@ check('unlocking frees only what trading may actually risk', () => {
   const fn = src.slice(src.indexOf('function effectiveCoreFraction'), src.indexOf('function coreHoldingValue'));
   ok(/const allowance = Math\.max\(0, tradingFundsAvailable\(\)\);/.test(fn),
      'the freed amount must come from the trading allowance');
-  ok(/Math\.max\(CORE_HOLD_FRACTION, Math\.min\(CORE_PHASE1_FRACTION, 1 - freed\)\)/.test(fn),
+  ok(/Math\.max\(CORE_HOLD_FRACTION,\s*Math\.min\(CORE_PHASE1_FRACTION, 1 - freed, allocCeiling\)\)/.test(fn),
      'CORE_HOLD_FRACTION must act as a FLOOR and phase-1 as the ceiling');
+  // v13.66 added the 70/30 objective as a THIRD term inside the same min(). It must be
+  // inside it, never outside the max(): a portfolio target is not permitted to push the
+  // core below the floor the operator set, however much skill the forecaster earns.
+  ok(/const allocCeiling = 1 - allocationShortTarget\(\);/.test(fn),
+     'the 70/30 objective must enter as a ceiling on the core');
+  // lastIndexOf, not indexOf: the phase-locked early return above contains its own
+  // `Math.max(CORE_HOLD_FRACTION, CORE_PHASE1_FRACTION)`, and anchoring on the first
+  // match measured the wrong expression entirely.
+  const iMax = fn.lastIndexOf('Math.max(CORE_HOLD_FRACTION');
+  const iMin = fn.indexOf('Math.min(CORE_PHASE1_FRACTION', iMax);
+  const iAlloc = fn.indexOf('allocCeiling', iMin);
+  ok(iMax >= 0 && iMin > iMax && iAlloc > iMin,
+     'the allocation ceiling must sit INSIDE the min, under the floor, not beside it');
+  // BEHAVIOURAL: with no measured skill the objective must be arithmetically inert, or
+  // this release silently changes how a live account is invested on day one.
+  eq(I.allocationShortTarget(), 0,
+     'with no measured forecast skill the short-term target must be exactly 0 — ' +
+     'an unproven model may not move 70% of the account');
+  ok(1 - I.allocationShortTarget() >= 1,
+     'and a 0 target must produce a ceiling of 1, which cannot bind');
   // A negative allowance must not push the core past its ceiling and eat the cash buffer.
   ok(/Math\.max\(0, tradingFundsAvailable\(\)\)/.test(fn), 'a losing trading book frees nothing extra');
 
@@ -3212,7 +3232,7 @@ check('the core can see a price for every name in its basket', () => {
   // a snapshot has no price until the next trade prints.
   // v12.62 split this into `wanted` (deduped, priority-ordered) and `subSymbols`
   // (capped), so the core-inclusion assertion anchors on `wanted`.
-  const subIdx = src.indexOf('const wanted = ');
+  const subIdx = src.indexOf('function desiredWsSymbols');
   const fetchIdx = src.indexOf("console.log(`[PRICES] Fetching");
   ok(subIdx > 0 && /CORE_HOLD_ON \? CORE_HOLD_SYMBOLS : \[\]/.test(src.slice(subIdx, subIdx + 320)),
      'the tick subscription must include the core basket');
@@ -3224,7 +3244,7 @@ check('the core can see a price for every name in its basket', () => {
   // (observed: "[WS] Stream error 405: symbol limit exceeded" at 35 symbols), which
   // leaves every price to go stale after MAX_PRICE_AGE_MS with only a 6-hourly snapshot
   // behind it — so the core stops buying for exactly the reason this test guards.
-  ok(/const subSymbols = wanted\.slice\(0, WS_MAX_SYMBOLS\);/.test(src),
+  ok(/const keep    = wanted\.slice\(0, WS_MAX_SYMBOLS\);/.test(src),
      'the subscription must be capped to what the feed will accept');
   // Priority order is what makes the cap safe: the core must never be the part dropped.
   const w = src.slice(subIdx, subIdx + 320);
@@ -3247,7 +3267,8 @@ check('the core can see a price for every name in its basket', () => {
   // Subscribing alone is not enough: a subscription only delivers the NEXT trade, which
   // on a quiet tape can be minutes away, and until then the name still has no price.
   const fn = src.slice(src.indexOf('function subscribeCoreSymbols'), src.indexOf('function symbolsForMarket'));
-  ok(/action: 'subscribe'/.test(fn), 'it must subscribe on the live stream');
+  ok(/syncWsSubscription\(list\)/.test(fn),
+     'it must subscribe on the live stream — through the manager that knows the cap');
   ok(/fetchQuote\(sym\)/.test(fn), 'and pull a snapshot, rather than waiting for a trade to print');
   ok(/if \(marketData\[sym\]\?\.price > 0\) continue;/.test(fn),
      'a name that already has a price must not be re-fetched');
@@ -4257,8 +4278,52 @@ check('the tick subscription is capped to what the feed will accept', () => {
      `the cap must be at or under the free-tier limit, got ${I.WS_MAX_SYMBOLS}`);
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
                 .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
-  ok(/dropping \$\{wanted\.slice\(WS_MAX_SYMBOLS\)\.join\(','\)\}/.test(src),
+  ok(/dropping \$\{dropped\.join\(','\)\}/.test(src),
      'and must name what it dropped — a silent truncation is how this got missed');
+
+  // THE CAP MUST BE ENFORCED AT EVERY DOOR, NOT ONE OF THEM.
+  // v12.62 capped the connect-time subscription and left subscribeCoreSymbols() and
+  // addDynamicSymbol() sending raw `action: subscribe` frames straight at the socket.
+  // Observed live 2026-09-22: a mid-session basket swap added 7 names on top of 26 and
+  // took the whole feed down with 405. A cap at one of three doors is not a cap, so this
+  // asserts the absence of the OTHER doors rather than the presence of the one.
+  const rawSubs = (src.match(/action: 'subscribe'/g) || []).length;
+  ok(rawSubs === 1,
+     `exactly one place may send a raw subscribe frame (the manager), found ${rawSubs}`);
+  ok(/syncWsSubscription\(list\);/.test(src),
+     'the core basket swap must go through the subscription manager');
+  ok(/syncWsSubscription\(\[sym\]\);/.test(src),
+     'a dynamic add must go through the subscription manager');
+  ok(/syncWsSubscription\(\[\], \{ reset: true \}\)/.test(src),
+     'a fresh socket must reset the tracked set, or every later diff is wrong');
+  // UNSUBSCRIBE BEFORE SUBSCRIBE. Sending additions first means the server sees the
+  // union at some instant in between — which is the exact state that trips 405.
+  // NOT blockAfter here: the function's own parameter list starts with a destructuring
+  // `{ reset = false }`, so brace-matching from the header latches onto that and returns
+  // the parameter object instead of the body. Slice to the next top-level function.
+  const mgrStart = src.indexOf('function syncWsSubscription(');
+  const mgr = src.slice(mgrStart, src.indexOf('\nfunction ', mgrStart + 10));
+  ok(mgr.length > 200, 'the subscription manager body must be findable');
+  const iUnsub = mgr.indexOf("action: 'unsubscribe'");
+  const iSub   = mgr.indexOf("action: 'subscribe'");
+  ok(iUnsub > 0 && iSub > 0 && iUnsub < iSub,
+     'removals must be sent before additions, or the server counts the union');
+
+  // BEHAVIOURAL: the ordering must shed the right names. With no socket open the
+  // manager returns null, so the priority function is exercised directly.
+  const order = I.desiredWsSymbols(['ZZZZ']);
+  eq(order[0], 'SPY', 'SPY must be kept first — it drives the benchmark and the regime');
+  ok(order.indexOf('ZZZZ') === order.length - 1,
+     'an unknown/dynamic name must sort last, where the cap can shed it harmlessly');
+  ok(new Set(order).size === order.length, 'the wanted list must be deduped');
+  if (I.CORE_HOLD_ON) {
+    const lastCore = Math.max(...I.CORE_HOLD_SYMBOLS.map(x => order.indexOf(x)));
+    const firstWatch = Math.min(...[...I.WATCHLISTS.nasdaq, ...I.WATCHLISTS.nyse]
+      .filter(x => !I.CORE_HOLD_SYMBOLS.includes(x) && x !== 'SPY')
+      .map(x => order.indexOf(x)).filter(i => i >= 0));
+    ok(!Number.isFinite(firstWatch) || lastCore < firstWatch,
+       'every core name must outrank every watchlist-only name — the core IS the money');
+  }
 
   // BEHAVIOURAL — rebuild the ordering and prove the cap sheds the right names.
   const core = I.CORE_HOLD_SYMBOLS;
@@ -4794,6 +4859,74 @@ check('the deploy guide describes the endpoints this build actually serves', () 
   ok(bogus.length === 0, `the guide names routes that do not exist: ${bogus.join(', ')}`);
 });
 
+check('the vault does not lock away money the engine never earned', () => {
+  // THE $2,700. capitalSystem.lastVaultValue was initialised to START_CAPITAL (1000),
+  // and processProfitVault measures growth as (tradableValue - lastVaultValue) /
+  // lastVaultValue. On the live $10,000 account, 2026-09-22, the first five-minute tick
+  // computed growth = (10000 - 1000)/1000 = 900%, profit $9,000, and skimmed
+  // 9000 x (1 - 0.70) = $2,700 into the vault. The dashboard read `vault $2700.00` on an
+  // account that had never taken a trade: 27% of the balance out of the market, out of
+  // the core's reach, on a gain that did not exist.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(!/lastVaultValue:   START_CAPITAL/.test(src),
+     'the vault milestone must not be seeded from a compile-time constant');
+  ok(/lastVaultValue:   0,/.test(src), 'zero means "no milestone yet"');
+
+  const c = I.capitalSystem, p = I.portfolio;
+  const saved = { lv: c.lastVaultValue, pv: c.profitVault, cash: p.cash,
+                  core: p.coreHolding, sc: I.startingCapital(), peak: I.riskSystem.peakValue };
+  try {
+    // REPRODUCTION, at the real numbers, with the vault's own function.
+    I.detectStartingCapital(10000, { force: true });
+    c.lastVaultValue = 0; c.profitVault = 0; p.cash = 10000; p.coreHolding = {};
+    I.processProfitVault();                       // first tick: seeds the milestone
+    eq(c.profitVault, 0, 'the first tick must lock nothing — it has no baseline yet');
+    near(c.lastVaultValue, I.tradableValue(), 1e-6,
+         'the milestone must be seeded from live equity, not from $1,000');
+    I.processProfitVault();                       // second tick: nothing has moved
+    eq(c.profitVault, 0, 'a flat account must never vault');
+    eq(p.cash, 10000, 'and must not lose a cent of working capital');
+
+    // CORE FLOW IS NOT PROFIT. Every core buy shrinks tradableValue and every trim grows
+    // it, so an un-rebased milestone turns a routine $600 trim into a $600 "gain" and
+    // skims 30% of it out of the market for good.
+    const before = c.lastVaultValue;
+    I.rebasePeakForCoreFlow(600);                 // core absorbed $600
+    near(c.lastVaultValue, before - 600, 1e-6,
+         'the milestone must move with the core, exactly as the drawdown peak does');
+  } finally {
+    c.lastVaultValue = saved.lv; c.profitVault = saved.pv; p.cash = saved.cash;
+    p.coreHolding = saved.core; I.riskSystem.peakValue = saved.peak;
+    I.detectStartingCapital(saved.sc, { force: true });
+  }
+});
+
+check('nothing is vaulted before the trading side has taken a single trade', () => {
+  // The backstop. The vault exists to protect realised TRADING profit; while the phase
+  // gate is shut the trading side has not opened a position, cannot have made a dollar,
+  // and every cent of movement in tradableValue is the core being funded or the basket
+  // moving. Vaulting there does not protect a gain, it removes working capital from an
+  // account that has not started. Needs the core ON, so it runs in a child process.
+  const r = coreProbe(`
+    I.detectStartingCapital(10000, { force: true });
+    I.portfolio.cash = 10000; I.portfolio.coreHolding = {};
+    I.capitalSystem.lastVaultValue = 1000;   // the exact poisoned baseline, forced back in
+    I.capitalSystem.profitVault = 0;
+    const locked = I.tradingPhaseLocked();
+    I.processProfitVault();
+    console.log(JSON.stringify({
+      locked, vault: I.capitalSystem.profitVault, cash: I.portfolio.cash,
+      milestone: I.capitalSystem.lastVaultValue, tv: I.tradableValue(),
+    }));
+  `);
+  ok(r.locked, 'the premise: with a core configured and nothing banked, trading is locked');
+  eq(r.vault, 0, 'a locked account must vault NOTHING even from a poisoned $1,000 baseline');
+  eq(r.cash, 10000, 'and must keep every cent working');
+  near(r.milestone, r.tv, 1e-6,
+       'the poisoned baseline must be corrected to live equity, not left to fire later');
+});
+
 check('every account size produces a coherent plan end to end', () => {
   // THE SWEEP. Each fix above is local; this asks whether the pieces still agree with
   // each other at sizes nobody has ever run the bot at.
@@ -4826,6 +4959,749 @@ check('every account size produces a coherent plan end to end', () => {
     ok(row.drift >= 0.01 && row.drift <= row.s * 0.01,
        `${at}: the drift floor $${row.drift.toFixed(2)} is out of proportion`);
   }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  v13.66 — ☿ MERCURY, THE FORECASTER
+// ════════════════════════════════════════════════════════════════════════════
+group('v13.66 — the forward-looking brain');
+
+// ── SCENARIO HARNESS ────────────────────────────────────────────────────────
+// Builds a symbol with a REAL price path, so sigma, RSI, ADX, RVOL and the return
+// features are all computed from data rather than stubbed. A forecaster tested against
+// hand-set feature vectors would prove only that arithmetic works.
+function mkPath(steps) {
+  const out = []; let p = 100;
+  for (const [n, rate] of steps) for (let i = 0; i < n; i++) { p *= (1 + rate); out.push(p); }
+  return out;
+}
+function seedPath(sym, path, ageMs = 0) {
+  const now = Date.now();
+  I.marketData[sym] = {
+    price: path[path.length - 1], prevClose: path[Math.max(0, path.length - 40)],
+    high: Math.max(...path), low: Math.min(...path), dailyVolume: 5e6,
+    lastUpdate: now - ageMs, lastTradeTime: now - ageMs, history: path.slice(),
+  };
+  I.candleData[sym] = {
+    m1: path.map((c, i) => ({ t: now - (path.length - i) * 60000, o: c, h: c * 1.002, l: c * 0.998, c, v: 1200 })),
+    m5: [],
+  };
+  // resetVol first: seedPath is called repeatedly on the same names across scenarios,
+  // and an EWMA carried over from the previous path would measure a discontinuity that
+  // never happened.
+  I.mercury.resetVol(sym);
+  I.mercury.updateVol(sym);
+  I.mercury.clearCache();
+}
+// Grant MEASURED skill: 200 resolved forecasts whose Brier beats the base rate.
+// Without this every assertion below would pass vacuously, because a zero-skill
+// forecaster returns confidence 0 and can never reach an actionable branch — the exact
+// failure mode this suite has already been bitten by three times.
+function grantSkill(h = 'short', { brier = 30, base = 45, n = 200 } = {}) {
+  const sc = I.mercury.getScore()[h];
+  sc.n = n; sc.brier = brier; sc.brierBase = base; sc.ups = Math.round(n * 0.3); sc.downs = Math.round(n * 0.3);
+  const m = I.mercury.getModels()[h]; m.up.n = 400; m.down.n = 400;
+  I.mercury.clearCache();
+}
+// Point the model at the recent-return features so a falling path reads as bearish and
+// a rising one as bullish. This is a DIRECTION for the test, not a claimed edge.
+function biasModel(h, sign) {
+  const m = I.mercury.getModels()[h];
+  m.up.w   = m.up.w.map((_, i)   => i < 3 ?  2.5 * sign : 0); m.up.b   = -1.2;
+  m.down.w = m.down.w.map((_, i) => i < 3 ? -2.5 * sign : 0); m.down.b =  0.4;
+  I.mercury.clearCache();
+}
+function snapMercury() {
+  return {
+    score: JSON.parse(JSON.stringify(I.mercury.getScore())),
+    models: JSON.parse(JSON.stringify(Object.fromEntries(
+      I.MERCURY_HORIZONS.map(h => [h.key, { up: I.mercury.getModels()[h.key].up.toJSON(),
+                                            down: I.mercury.getModels()[h.key].down.toJSON() }])))),
+    peak: I.getMercuryPeak(),
+  };
+}
+function restoreMercury(s) {
+  for (const k of Object.keys(s.score)) Object.assign(I.mercury.getScore()[k], s.score[k]);
+  for (const k of Object.keys(s.models)) {
+    I.mercury.getModels()[k].up.load(s.models[k].up);
+    I.mercury.getModels()[k].down.load(s.models[k].down);
+  }
+  I.setMercuryPeak(s.peak);
+  I.resetMercuryActionClock();
+  I.mercury.clearCache();
+}
+
+check('an unproven forecaster cannot move a single dollar', () => {
+  // THE SAFETY PROPERTY THE WHOLE DESIGN RESTS ON. Confidence is support x measured
+  // Brier skill x freshness, so before any forecast has been scored the skill term is 0,
+  // the product is 0, and every actionable branch in mercuryDecide is unreachable.
+  // Without this, a module built on a strategy space measured at 34 losses in 34 rules
+  // would be handing out confident opinions from its first tick.
+  const snap = snapMercury();
+  try {
+    for (const h of I.MERCURY_HORIZONS) {
+      const sc = I.mercury.getScore()[h.key];
+      sc.n = 0; sc.brier = 0; sc.brierBase = 0; sc.ups = 0; sc.downs = 0;
+    }
+    I.mercury.clearCache();
+    seedPath('ZNOSKILL', mkPath([[40, 0.004], [40, -0.006]]));
+    for (const h of I.MERCURY_HORIZON_KEYS || ['immediate', 'short', 'medium', 'long']) {
+      eq(I.mercury.skillOf(h), 0, `${h}: an unscored horizon must report exactly zero skill`);
+    }
+    const fc = I.mercury.forecast('ZNOSKILL');
+    eq(fc.confidence, 0, 'overall confidence must be zero');
+    for (const h of I.MERCURY_HORIZONS) {
+      eq(fc.horizons[h.key].expectedReturn, 0,
+         `${h.label}: expected return must multiply out to zero without measured skill`);
+      ok(fc.horizons[h.key].sigma > 0,
+         `${h.label}: but SIGMA must still be real — volatility is measurable from bar one ` +
+         `and under-reporting risk is the more expensive mistake`);
+    }
+    for (const held of [true, false]) {
+      const d = I.mercuryDecide('ZNOSKILL', { sleeve: 'short', held, openedAt: 0 });
+      ok(d.action === 'HOLD' || d.action === 'NONE',
+         `held=${held}: an unproven forecaster returned ${d.action} — it must never act`);
+      eq(d.confidence, 0, 'and must report zero confidence while doing so');
+    }
+    // A HORIZON WITH A GREAT BRIER SCORE BUT TOO FEW SAMPLES IS STILL WORTH NOTHING.
+    const sc = I.mercury.getScore().short;
+    sc.n = I.MERCURY_MIN_SAMPLES - 1; sc.brier = 1; sc.brierBase = 20;
+    eq(I.mercury.skillOf('short'), 0,
+       `${I.MERCURY_MIN_SAMPLES - 1} samples must score zero skill however good the Brier — ` +
+       'a nine-sample edge is noise wearing a number');
+  } finally { restoreMercury(snap); }
+});
+
+check('a marginal edge across eight simultaneous tests is not an edge', () => {
+  // FOUR HORIZONS x TWO DIRECTIONS = EIGHT MODELS, all scored at once. Demanding only
+  // "Brier better than the base rate" from each is eight independent chances to be
+  // fooled, and this project has believed six false edges that way already. A horizon
+  // must clear MERCURY_SKILL_FLOOR, not merely clear zero.
+  const snap = snapMercury();
+  try {
+    ok(I.MERCURY_SKILL_FLOOR > 0,
+       'there must be a positive floor, or a coin flip that lands 51/49 reads as skill');
+    const sc = I.mercury.getScore().short;
+    // Plenty of samples, and a Brier score genuinely better than the baseline — but only
+    // barely. This is what noise looks like when eight things are measured at once.
+    sc.n = 500; sc.ups = 150; sc.downs = 150;
+    sc.brierBase = 100; sc.brier = 100 * (1 - I.MERCURY_SKILL_FLOOR * 0.5);
+    I.mercury.clearCache();
+    const raw = 1 - sc.brier / sc.brierBase;
+    ok(raw > 0, `premise: the raw skill score is positive (${raw.toFixed(4)})`);
+    eq(I.mercury.skillOf('short'), 0,
+       `a raw BSS of ${raw.toFixed(4)} is below the ${I.MERCURY_SKILL_FLOOR} multiple-testing ` +
+       'floor and must score zero — 500 samples do not make a marginal edge real');
+    // And just above the floor it must start counting, or the gate is simply shut.
+    sc.brier = 100 * (1 - I.MERCURY_SKILL_FLOOR * 3);
+    I.mercury.clearCache();
+    ok(I.mercury.skillOf('short') > 0,
+       'a skill score comfortably above the floor must be allowed through');
+    // Capped, so discovering a suspiciously large edge cannot blow up sizing.
+    sc.brier = 0;
+    I.mercury.clearCache();
+    ok(I.mercury.skillOf('short') <= 0.6,
+       'and a perfect Brier must still be capped — a BSS that high is a leak, not an edge');
+  } finally { restoreMercury(snap); }
+});
+
+check('a symbol with no candle history still gets an honest volatility', () => {
+  // THE UNITS BUG, LOCKED DOWN. atrPct() is computed from ONE-MINUTE candles, so it is
+  // already per-minute. The first version of sigmaFor divided it by sqrt(390) believing
+  // it was a daily figure, which understated volatility twentyfold. Expected return is
+  // linear in sigma, so that single line made every forecast twenty times too small to
+  // clear a round trip — Mercury would have sat permanently inert while reporting
+  // perfectly healthy-looking probabilities, which is the hardest kind of bug to notice.
+  // Only reachable when the EWMA has no bars, i.e. a freshly added name.
+  const snap = snapMercury();
+  try {
+    const sym = 'ZNOCANDLE';
+    I.marketData[sym] = { price: 100, prevClose: 99, high: 101, low: 98, dailyVolume: 5e6,
+                          lastUpdate: Date.now(), history: [] };
+    delete I.candleData[sym];
+    I.mercury.resetVol(sym);
+    I.mercury.clearCache();
+    const atr = I.atrPct(sym);
+    ok(atr > 0, `premise: atrPct returns a figure (${atr})`);
+    const perMin = I.mercury.sigmaFor(sym, 1);
+    near(perMin, atr / 1.25, 1e-6,
+         'with no candles and no history, per-minute sigma must be the per-minute ATR ' +
+         'converted by the ATR/sigma ratio — NOT divided by the length of a session');
+    const daily = I.mercury.sigmaFor(sym, 390);
+    near(daily / perMin, Math.sqrt(390), 1e-3, 'and horizons must scale as the square root of time');
+    // Sanity: a US equity's daily sigma is not one basis point.
+    ok(daily > 0.002,
+       `a fallback daily sigma of ${(daily*100).toFixed(4)}% is not a plausible US equity — ` +
+       'this is the twentyfold understatement, back');
+  } finally { restoreMercury(snap); }
+});
+
+check('a winner whose case falls apart is sold while it is still a winner', () => {
+  // THE +$50 FAILURE, REPRODUCED. Before this release the complete list of reasons a
+  // position could be sold was: fell 2.2xATR, rose 4.6xATR, rose 6.9xATR. The trailing
+  // stop is disabled (ATR_TRAIL_ARM_R 99). So a position could round-trip the entire way
+  // from +4.5xATR back to the hard stop and every line of code considered that correct.
+  const snap = snapMercury();
+  try {
+    grantSkill('short'); biasModel('short', +1);
+    // Up 8.8%, then rolling over hard — still green, thesis gone.
+    seedPath('ZROLL', mkPath([[50, 0.0017], [30, -0.0025]]));
+    const fc = I.mercury.forecast('ZROLL');
+    ok(fc.horizons.short.pDown > fc.horizons.short.pUp,
+       `the forecast must see the deterioration: p(up) ${fc.horizons.short.pUp}, p(down) ${fc.horizons.short.pDown}`);
+    const d = I.mercuryDecide('ZROLL', { sleeve: 'short', held: true, openedAt: Date.now() - 7200000 });
+    ok(d.action === 'SELL' || d.action === 'REDUCE',
+       `a deteriorating winner must be acted on, got ${d.action} (score ${d.score})`);
+    ok(d.score < 0, 'and the score that drove it must actually be negative');
+    ok(/p\(down\)|deteriorated|worse than/.test(d.reason),
+       `the reason must name the forward case, got: ${d.reason}`);
+  } finally { restoreMercury(snap); }
+});
+
+check('a healthy winner is NOT sold just for being up', () => {
+  // The opposite error, and the more expensive one. Every judgement-timed exit measured
+  // in this project destroyed value — the trailing stop turned a 2.09:1 payoff into
+  // 1.2:1 — so a system that sells strength is worse than the one it replaced.
+  const snap = snapMercury();
+  try {
+    grantSkill('short'); biasModel('short', +1);
+    seedPath('ZRUN', mkPath([[80, 0.0022]]));      // clean, sustained advance
+    const fc = I.mercury.forecast('ZRUN');
+    ok(fc.horizons.short.pUp > fc.horizons.short.pDown,
+       'the forecast must still favour the upside on a healthy advance');
+    const d = I.mercuryDecide('ZRUN', { sleeve: 'short', held: true, openedAt: Date.now() - 7200000 });
+    eq(d.action, 'HOLD', `a healthy winner must be held, got ${d.action}: ${d.reason}`);
+  } finally { restoreMercury(snap); }
+});
+
+check('a flat stock produces no trades at all', () => {
+  // Continuous prediction is not continuous trading. A forecaster that emits an opinion
+  // every minute must still say "nothing" on a name that is doing nothing, or the
+  // spread bill alone guarantees a loss.
+  const snap = snapMercury();
+  try {
+    grantSkill('short'); biasModel('short', +1);
+    // GENUINELY flat: alternating, so the recent-return features sit at zero. The first
+    // version of this path ran 40 bars up then 40 down, which is not a flat tape — it is
+    // a downtrend with small steps, and the model was right to dislike it.
+    const flat = []; let fp = 100;
+    for (let i = 0; i < 80; i++) { fp *= (i % 2 ? 1.0002 : 0.9998); flat.push(fp); }
+    seedPath('ZFLAT', flat);
+    for (const held of [true, false]) {
+      const d = I.mercuryDecide('ZFLAT', { sleeve: 'short', held, openedAt: Date.now() - 7200000 });
+      ok(d.action === 'HOLD' || d.action === 'NONE',
+         `a flat tape must not generate a ${d.action}: ${d.reason}`);
+    }
+  } finally { restoreMercury(snap); }
+});
+
+check('a steady decline is recognised before the stop, not at it', () => {
+  const snap = snapMercury();
+  try {
+    grantSkill('short'); biasModel('short', +1);
+    seedPath('ZSLIDE', mkPath([[80, -0.0012]]));   // grinding lower, nowhere near 2.2xATR
+    const d = I.mercuryDecide('ZSLIDE', { sleeve: 'short', held: true, openedAt: Date.now() - 7200000 });
+    ok(d.action === 'SELL' || d.action === 'REDUCE',
+       `a steady decline must be acted on before the stop, got ${d.action}`);
+  } finally { restoreMercury(snap); }
+});
+
+check('a long-term holding is judged on the long horizon, not on this afternoon', () => {
+  // The 30% sleeve exists to hold through ordinary volatility. Judging it on the same
+  // horizon as a day trade is how a long-term thesis gets liquidated by an afternoon.
+  const snap = snapMercury();
+  try {
+    grantSkill('short'); grantSkill('medium'); grantSkill('long');
+    biasModel('short', +1);
+    // Medium/long models left neutral: short-term ugly, longer-term no opinion.
+    seedPath('ZLONG', mkPath([[60, 0.002], [20, -0.004]]));
+    eq(I.MERCURY_SLEEVE_HORIZON.short, 'short', 'the short sleeve is judged on the short horizon');
+    eq(I.MERCURY_SLEEVE_HORIZON.long, 'medium', 'the long sleeve must use a longer horizon');
+    eq(I.MERCURY_SLEEVE_HORIZON.core, 'long', 'and the core the longest');
+    const dShort = I.mercuryDecide('ZLONG', { sleeve: 'short', held: true, openedAt: Date.now() - 7200000 });
+    I.resetMercuryActionClock();
+    const dLong  = I.mercuryDecide('ZLONG', { sleeve: 'long',  held: true, openedAt: Date.now() - 7200000 });
+    ok(dShort.horizon === 'short' && dLong.horizon === 'medium',
+       `the sleeve must select the horizon: got ${dShort.horizon} / ${dLong.horizon}`);
+    ok(!(dShort.action === 'HOLD' && dLong.action !== 'HOLD'),
+       'the longer sleeve must never be MORE trigger-happy than the shorter one');
+  } finally { restoreMercury(snap); }
+});
+
+check('rotation requires a materially better alternative, not merely a different one', () => {
+  // Sell-and-rebuy was measured at 0 wins across 360 variants, and the mechanism was
+  // always the same: selling at P and buying back at P is a mathematical no-op that pays
+  // two spreads. So an alternative must beat the incumbent by a MARGIN, after its own
+  // round-trip cost, before capital is allowed to move.
+  const snap = snapMercury();
+  try {
+    grantSkill('short');
+    ok(I.MERCURY_ROTATE_MARGIN > 0,
+       'there must be a non-zero margin, or equal-expectation churn is permitted');
+    ok(I.MERCURY_EDGE_COST_MULT >= 1,
+       'edge must beat the round trip by at least 1x before it is worth paying for');
+    ok(I.MERCURY_MIN_HOLD_MS > 0 && I.MERCURY_ACTION_COOLDOWN_MS > 0,
+       'a minimum hold and an action cooldown are both required, or a threshold-straddling ' +
+       'forecast reopens the same position every tick');
+    // The alternative search must be NET of the cost of getting there.
+    const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                  .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+    const fn = src.slice(src.indexOf('function mercuryBestAlternative'),
+                        src.indexOf('function mercuryPeakPressure'));
+    ok(/hz\.expectedReturn - estimateRoundTripCost\(sym\)/.test(fn),
+       'an alternative must be judged net of the round trip it would cost to reach');
+    ok(/if \(CORE_HOLD_ON && CORE_HOLD_SYMBOLS\.includes\(sym\)\) continue;/.test(fn),
+       'the long-term basket must not be offered as a short-term rotation target');
+  } finally { restoreMercury(snap); }
+});
+
+check('a profit high-water mark never sells anything by itself', () => {
+  // Explicitly required, and it is the difference between preservation and panic. The
+  // peak lowers the BAR a bad forecast must clear; it is not evidence about the future
+  // and must never be treated as any.
+  const snap = snapMercury();
+  const savedSC = I.startingCapital();
+  try {
+    I.detectStartingCapital(10000, { force: true });
+    I.setMercuryPeak(0);
+    const p0 = I.mercuryPeakPressure(10000);
+    eq(p0, 0, 'at the starting line there is no gain to preserve');
+    I.setMercuryPeak(0);
+    I.mercuryPeakPressure(11000);                 // set a 10% high-water mark
+    const atHigh = I.mercuryPeakPressure(11000);
+    const slipped = I.mercuryPeakPressure(10500); // gave back half the gain
+    ok(slipped > atHigh,
+       `pressure must RISE as a gain is given back: ${atHigh.toFixed(3)} at the high, ${slipped.toFixed(3)} after`);
+    ok(atHigh <= 1 && slipped <= 1, 'pressure is a 0..1 weight, never a multiplier that can run away');
+    // And with a healthy forecast, maximum pressure still does not produce a sale.
+    grantSkill('short'); biasModel('short', +1);
+    seedPath('ZPEAK', mkPath([[80, 0.0022]]));
+    const d = I.mercuryDecide('ZPEAK', { sleeve: 'short', held: true, openedAt: Date.now() - 7200000 });
+    eq(d.action, 'HOLD',
+       'a new high with a healthy forecast must still HOLD — the peak is not a sell signal');
+    ok(d.peakPressure > 0, 'while still reporting the pressure it is under');
+  } finally { restoreMercury(snap); I.detectStartingCapital(savedSC, { force: true }); }
+});
+
+check('the hard stop stays sovereign — the forecaster can only act after it', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function evaluateAndTrade()'));
+  const iStop   = fn.indexOf('longsStop.forEach(t    => closeLong(t, true));');
+  const iTrail  = fn.indexOf('shortsToClose.forEach(t => closeShort(t, false));');
+  const iOracle = fn.indexOf('mercuryExitPass();');
+  const iGates  = fn.indexOf('const totalValue = getTotalValue();');
+  const iPhase  = fn.indexOf('if (tradingPhaseLocked()) {');
+  ok(iStop > 0 && iOracle > iStop,
+     'the predictive pass must run AFTER the stop sweep has dispatched, never before');
+  ok(iTrail > 0 && iOracle > iTrail,
+     'and after every trail/partial dispatch, so arithmetic exits are never pre-empted');
+  ok(iGates > 0 && iOracle < iGates,
+     'but BEFORE the risk gates, every one of which can return early — a deteriorating ' +
+     'position still needs re-examining in drawdown, which is exactly when it matters');
+  ok(iPhase > 0 && iOracle < iPhase,
+     'and before the phase gate, or predictive exits would be blocked by a gate that ' +
+     'exists to stop ENTRIES');
+  // It must not be able to launder a stop into a judgement exit, which would erase the
+  // cooldown and the consecutive-loss count.
+  const pass = src.slice(src.indexOf('function mercuryExitPass'), src.indexOf('function mercuryTick'));
+  ok(/closeLong\(ticker, false\)/.test(pass) && !/closeLong\(ticker, true\)/.test(pass),
+     'a predictive exit must never be booked as a stop loss');
+  ok(/if \(lots\.some\(p => p\._exiting \|\| p\._pendingRung != null\)\) continue;/.test(pass),
+     'it must skip anything the stop sweep is already exiting — the re-entrancy marks are the interlock');
+  ok(/partialClose\(ticker, dir, d\.fraction, 'oracle'\)/.test(pass),
+     "a predictive trim must use its own rung, or it collides with tp1/tp2 bookkeeping");
+  ok(!/ATR_TRAIL_ARM_R\s*=/.test(pass) && !/STRATEGY\.ATR_STOP_MULT\s*=/.test(pass),
+     'and must not mutate the stop geometry it runs under');
+});
+
+check('stale data collapses confidence instead of inventing it', () => {
+  const snap = snapMercury();
+  try {
+    grantSkill('short'); biasModel('short', +1);
+    seedPath('ZFRESH', mkPath([[80, -0.002]]), 0);
+    const fresh = I.mercury.forecast('ZFRESH');
+    seedPath('ZSTALE', mkPath([[80, -0.002]]), 20 * 60000);   // 20 minutes old
+    const stale = I.mercury.forecast('ZSTALE');
+    eq(fresh.freshness, 1, 'a current print must be fully fresh');
+    eq(stale.freshness, 0, 'a twenty-minute-old print must be worth nothing');
+    ok(fresh.horizons.short.confidence > 0, 'the fresh one must be actionable');
+    eq(stale.horizons.short.confidence, 0,
+       'the stale one must not be — a forecast off an old price is not evidence about now');
+    const d = I.mercuryDecide('ZSTALE', { sleeve: 'short', held: true, openedAt: 0 });
+    ok(d.action === 'HOLD', 'and must produce no action');
+  } finally { restoreMercury(snap); }
+});
+
+check('every forecast is scored before it is trained on', () => {
+  // The line that separates measurement from self-congratulation. If resolveOne trained
+  // the model before scoring the prediction, the Brier score would be computed against
+  // weights that had already seen the answer, skill would read positive on pure noise,
+  // and the gate protecting everything else would open on a lie.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function resolveOne'), src.indexOf('const ledger = []'));
+  const iScore = fn.indexOf('s.brier     +=');
+  // ANY update call, not just the one spelled `m.up.update` — a mutation that trained
+  // through `models[p.h].up.update(...)` instead sailed straight past the literal form.
+  const updates = [...fn.matchAll(/\.(?:up|down)\.update\(/g)].map(m => m.index);
+  ok(iScore > 0 && updates.length > 0, 'resolveOne must both score and train');
+  ok(Math.min(...updates) > iScore,
+     'NO model update may precede the Brier accumulation, however it is spelled');
+  eq(updates.length, 2,
+     `each resolution must train each model exactly once, found ${updates.length} update calls — ` +
+     'a double-trained sample is counted twice by n and shifts the shrinkage prior');
+
+  // THE OUT-OF-SAMPLE GUARANTEE IS STRUCTURAL, NOT INCIDENTAL. The Brier is scored
+  // against the probability STORED WHEN THE FORECAST WAS MADE, so it cannot be
+  // contaminated by training no matter where the update lands. This is the property that
+  // makes the skill number trustworthy, so it is asserted directly rather than inferred
+  // from the ordering above.
+  ok(/s\.brier     \+= \(p\.pUp - wasUp\) \*\* 2;/.test(fn),
+     'the score must use the probability recorded at forecast time, never a fresh predict()');
+  ok(!/\.predict\(/.test(fn),
+     'resolveOne must never re-predict — that would score the model against its own hindsight');
+  // And the prediction must be written down before the outcome exists.
+  const rec = src.slice(src.indexOf('function recordForecast'), src.indexOf('function sweep'));
+  ok(/resolveAt: fc\.at \+ h\.minutes \* 60000/.test(rec),
+     'a forecast must carry the time it will be judged at, fixed when it is made');
+  ok(/hi: fc\.price, lo: fc\.price/.test(rec),
+     'and start its excursion water marks at the price it was made at');
+});
+
+check('the prediction ledger cannot saturate and freeze itself', () => {
+  // MEASURED, NOT GUESSED. The tick runs every 60s over ~26 symbols. Recording all four
+  // horizons every time creates 104 open predictions a minute, while the one-month
+  // horizon does not resolve for 8,190 trading minutes. The store would fill in ELEVEN
+  // MINUTES, recordForecast would return at its first line for ever, and the ledger would
+  // freeze — while /api/oracle went on reporting a perfectly healthy "no skill yet",
+  // which is indistinguishable from the honest version of the same message.
+  const snap = snapMercury();
+  const savedLR = { ...I.mercury.getLastRecorded() };
+  try {
+    I.mercury.resetRecordClock();
+    const open0 = Object.keys(I.mercury.getOpen()).length;
+    seedPath('ZSAT', mkPath([[80, 0.001]]));
+    // Fifty consecutive ticks on one symbol. Un-throttled that is 200 open predictions.
+    for (let i = 0; i < 50; i++) { I.mercury.clearCache(); I.mercury.forecast('ZSAT', { record: true }); }
+    const added = Object.keys(I.mercury.getOpen()).length - open0;
+    ok(added > 0, 'some forecasts must actually be recorded');
+    ok(added <= 4,
+       `fifty ticks on one symbol produced ${added} open predictions — one per horizon is the ` +
+       'ceiling within a single sampling window, or the store floods');
+    // The throttle must be per (symbol, horizon), not global — a second symbol must still
+    // be recorded immediately.
+    seedPath('ZSAT2', mkPath([[80, 0.001]]));
+    I.mercury.forecast('ZSAT2', { record: true });
+    const added2 = Object.keys(I.mercury.getOpen()).length - open0 - added;
+    ok(added2 > 0, 'a different symbol must not be blocked by the first symbol\'s throttle');
+    // Steady state must fit inside the cap with room to spare.
+    const perSymbol = 4 * 4;                      // 4 horizons x ~4 overlapping samples
+    ok(26 * perSymbol < 1200,
+       `steady state of ${26 * perSymbol} open predictions must sit inside the cap`);
+    // And the sampling clock must survive a restart, or every deploy re-floods it.
+    const blob = I.mercury.serialize();
+    ok(blob.lastRecorded && Object.keys(blob.lastRecorded).length > 0,
+       'the sampling clock must be persisted — deploys are frequent and a reset re-floods');
+    ok(Object.keys(blob.lastRecorded).some(k => k.startsWith('ZSAT|')),
+       'keyed per symbol and horizon');
+  } finally {
+    I.mercury.resetRecordClock();
+    Object.assign(I.mercury.getLastRecorded(), savedLR);
+    for (const id of Object.keys(I.mercury.getOpen()))
+      if (/^ZSAT/.test(I.mercury.getOpen()[id].sym)) delete I.mercury.getOpen()[id];
+    restoreMercury(snap);
+  }
+});
+
+check('the forecaster survives a restart with its record intact', () => {
+  const snap = snapMercury();
+  try {
+    grantSkill('short', { n: 137, brier: 22, base: 33 });
+    const blob = JSON.parse(JSON.stringify(I.mercury.serialize()));
+    ok(blob.dim === I.MERCURY_DIM, 'the feature width must be stamped into the save');
+    ok(blob.score.short.n === 137, 'the scoring history must be persisted');
+    // Wipe, restore, and check the skill gate lands in the same place.
+    const before = I.mercury.skillOf('short');
+    for (const h of I.MERCURY_HORIZONS) Object.assign(I.mercury.getScore()[h.key],
+      { n: 0, brier: 0, brierBase: 0, ups: 0, downs: 0 });
+    eq(I.mercury.skillOf('short'), 0, 'the wipe must actually have wiped');
+    I.mercury.loadState(blob);
+    near(I.mercury.skillOf('short'), before, 1e-9,
+         'the skill gate must land in exactly the same place after a restart');
+    // A SAVE FROM A DIFFERENT FEATURE SET IS CORRUPTION, NOT A HEAD START.
+    const wrong = JSON.parse(JSON.stringify(blob)); wrong.dim = I.MERCURY_DIM + 3;
+    for (const h of I.MERCURY_HORIZONS) Object.assign(I.mercury.getScore()[h.key],
+      { n: 0, brier: 0, brierBase: 0, ups: 0, downs: 0 });
+    I.mercury.loadState(wrong);
+    eq(I.mercury.skillOf('short'), 0,
+       'a save whose feature vector is a different width must be DISCARDED, not loaded — ' +
+       'those weights mean something else');
+  } finally { restoreMercury(snap); }
+});
+
+check('Mercury state is persisted where the loader can actually find it', () => {
+  // loadState routes the `lumen` block by CONTENT — whichever half carries calibGlobal/
+  // calibLog goes to Venus, whichever carries winModel/trainLog/signals goes to Jupiter.
+  // A third engine nested in there would be handed to whichever sniff matched first.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/mercury:        MERCURY_ON \? mercury\.serialize\(\) : null,/.test(src),
+     'Mercury must be saved under its own TOP-LEVEL key');
+  ok(/mercuryPeak:    _mercuryPeakEquity,/.test(src),
+     'and so must the preservation high-water mark, or a restart forgets the gain it is protecting');
+  ok(/mercury\.loadState\(state\.mercury\)/.test(src), 'and restored from it');
+  const blob = I.mercury.serialize();
+  for (const k of ['calibGlobal', 'calibByCat', 'calibLog', 'calibration', 'winModel', 'trainLog', 'signals']) {
+    ok(!(k in blob), `Mercury's save must not contain "${k}" — the loader sniffs for it and would misroute`);
+  }
+  // An account change discards the money but keeps the model.
+  const fn = src.slice(src.indexOf('function adoptNewAccount'), src.indexOf('async function syncFromBroker'));
+  ok(/_mercuryPeakEquity = 0;/.test(fn),
+     "a new account's high-water mark must start fresh — the old one is in someone else's money");
+  ok(!/mercury\.loadState|models\s*=\s*\{\}/.test(fn),
+     'but the forecast models must survive: a prediction about AAPL was right or wrong ' +
+     'about AAPL, whichever account was watching');
+});
+
+check('conviction sizing cannot lift a position past the hard risk cap', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function computeSize'), src.indexOf('function observeEntry'));
+  const iMerc = fn.indexOf('T.helpers.mercuryConviction');
+  const iCap  = fn.indexOf('riskFraction = Math.max(0, Math.min(cap, riskFraction));');
+  ok(iMerc > 0 && iCap > 0 && iMerc < iCap,
+     'the conviction multiplier must be applied BEFORE the RISK_PER_TRADE_MAX clamp, ' +
+     'so the cap still binds');
+  ok(/clip\(T\.helpers\.mercuryConviction\(symbol, direction\), 0\.5, 1\.25\)/.test(fn),
+     'and must itself be clipped — asymmetrically, so an unproven forecast can cut risk ' +
+     'far more easily than it can add it');
+  // Behavioural: with no skill the multiplier must be exactly 1, or this release silently
+  // resizes every position on a live account.
+  ok(I.mercurySkillLevel() === 0, 'premise: no measured skill in a fresh process');
+  ok(/if \(!hz \|\| !\(hz\.confidence > 0\)\) return 1;/.test(src),
+     'the conviction multiplier must return exactly 1.0 — no effect — without measured skill');
+  ok(/return clip\(1 \+ edge \* 0\.5, 0\.5, 1\.25\);/.test(src),
+     'and must be bounded asymmetrically');
+});
+
+check('the 70/30 objective is an objective, not a leap', () => {
+  // Required as a portfolio objective explicitly subordinate to risk management. Two
+  // measured facts sit against switching it on wholesale: the trading side has no
+  // demonstrated edge, and the phase gate returns an allowance of exactly zero until the
+  // holding side has banked its bar — so moving 70% into that sleeve converts invested
+  // capital into idle cash, the largest measured drag in this system.
+  eq(I.ALLOC_SHORT_TARGET, 0.70, 'the stated objective must be 70% short-term');
+  eq(I.allocationShortTarget(), 0,
+     'but with no measured skill the ACTIVE target must be 0 — nothing changes on day one');
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function allocationShortTarget'), src.indexOf('function mercurySkillLevel'));
+  ok(/if \(PHASE_GATE_ENABLED && tradingPhaseLocked\(\)\) return 0;/.test(fn),
+     'the ramp must require an OPEN phase gate — skill that cannot be spent is idle cash');
+  ok(/mercurySkillLevel\(\) \/ ALLOC_FULL_SKILL/.test(fn),
+     'and must scale with measured skill, not with time or with hope');
+  ok(/ALLOC_RAMP_ON/.test(fn), 'with an operator override for going straight there');
+  ok(I.ALLOC_FULL_SKILL > 0 && I.ALLOC_FULL_SKILL <= 0.3,
+     `the skill required for the full target must be real but reachable, got ${I.ALLOC_FULL_SKILL}`);
+});
+
+check('the report card cannot claim skill the decision layer is not using', () => {
+  // A dashboard that says "working" while the engine ignores the model is how six false
+  // edges got believed in this project. Both numbers come from the same skillOf().
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  // indexOf('function serialize()') finds VENUS's serialize, 6,000 lines earlier, so the
+  // slice came back empty and every assertion in it passed against nothing.
+  const iMet = src.indexOf('function metrics()');
+  const met = src.slice(iMet, src.indexOf('function serialize()', iMet));
+  ok(/skillUsed: \+skillOf\(h\.key\)/.test(met),
+     'the report must publish the skill the gate actually applies, not just the raw Brier');
+  ok(/anySkill = MERCURY_HORIZON_KEYS\.some\(k => skillOf\(k\) > 0\)/.test(met),
+     'and the headline verdict must be computed from the same function');
+  const m = I.mercury.metrics();
+  eq(m.anySkill, false, 'a fresh process must report no skill');
+  eq(m.bestSkill, 0, 'and a best skill of exactly zero');
+  ok(m.horizons.short && 'brier' in m.horizons.short && 'directionalAccuracy' in m.horizons.short
+     && 'baseRateUp' in m.horizons.short && 'meanAbsError' in m.horizons.short,
+     'the success metrics must be explicit and measurable, not a vibe');
+});
+
+check('a real breakout is bought and a failed one is not', () => {
+  const snap = snapMercury();
+  try {
+    grantSkill('short'); biasModel('short', +1);
+    // A breakout that held: a base, then a sustained thrust.
+    seedPath('ZBREAK', mkPath([[45, 0.0000], [35, 0.0035]]));
+    const good = I.mercuryDecide('ZBREAK', { sleeve: 'short', held: false });
+    eq(good.action, 'BUY', `a holding breakout must be bought, got ${good.action}: ${good.reason}`);
+    ok(good.score >= Math.max(good.cost * I.MERCURY_EDGE_COST_MULT, I.MERCURY_MIN_EDGE),
+       'and must have cleared the cost bar to get there, not squeaked past a zero');
+    // A breakout that failed: same thrust, then given entirely back.
+    seedPath('ZFAIL', mkPath([[30, 0.0000], [20, 0.0035], [30, -0.0040]]));
+    const bad = I.mercuryDecide('ZFAIL', { sleeve: 'short', held: false });
+    ok(bad.action !== 'BUY', `a failed breakout must not be bought, got ${bad.action}`);
+    // And if it were already held, it must be got out of.
+    I.resetMercuryActionClock();
+    const heldBad = I.mercuryDecide('ZFAIL', { sleeve: 'short', held: true, openedAt: Date.now() - 7200000 });
+    ok(heldBad.action === 'SELL' || heldBad.action === 'REDUCE',
+       `a failed breakout already held must be acted on, got ${heldBad.action}`);
+  } finally { restoreMercury(snap); }
+});
+
+check('capital is not left in a weak name when a better one is available', () => {
+  // Opportunity cost. A stock does not deserve to stay in the book because it was bought
+  // earlier — but the alternative must be better by more than the round trip to reach it,
+  // or this becomes the sell-and-rebuy machine that lost 360 out of 360.
+  const snap = snapMercury();
+  const savedDyn = { ...I.dynamicSymbols };
+  try {
+    grantSkill('short'); biasModel('short', +1);
+    // Put a genuinely strong name into the tradeable universe as a dynamic symbol.
+    I.dynamicSymbols.ZALT = { addedAt: Date.now(), source: 'test', catalyst: 'other' };
+    seedPath('ZALT', mkPath([[80, 0.0035]]));
+    seedPath('ZWEAK', mkPath([[80, 0.0002]]));         // limp, but not falling
+    const alt = I.mercuryBestAlternative('ZWEAK', 'short');
+    eq(alt.sym, 'ZALT', `the strong name must be found as the alternative, got ${alt.sym}`);
+    ok(alt.net > 0, 'and its expected return must be positive NET of getting there');
+    const weakAlone = I.mercuryScore('ZWEAK', 'short', { held: true, excludeAlternative: true });
+    const weakVsAlt = I.mercuryScore('ZWEAK', 'short', { held: true });
+    ok(weakVsAlt.score < weakAlone.score,
+       'holding a weak name must score worse once a real alternative exists');
+    near(weakAlone.score - weakVsAlt.score, Math.max(0, alt.net - I.MERCURY_ROTATE_MARGIN), 1e-9,
+         'and the penalty must be exactly the alternative net of the rotation margin');
+  } finally {
+    delete I.dynamicSymbols.ZALT; Object.assign(I.dynamicSymbols, savedDyn);
+    restoreMercury(snap);
+  }
+});
+
+check('a forecast that flickers does not churn the book', () => {
+  // Continuous prediction is not continuous trading. Two guards have to hold: a position
+  // cannot be re-traded before MERCURY_MIN_HOLD_MS, and the same name cannot be acted on
+  // twice inside MERCURY_ACTION_COOLDOWN_MS. Without both, a score oscillating across a
+  // threshold opens and closes the same position all afternoon and pays spread on every leg.
+  const snap = snapMercury();
+  try {
+    grantSkill('short'); biasModel('short', +1);
+    seedPath('ZCHURN', mkPath([[50, 0.0017], [30, -0.0025]]));     // a clear SELL
+    const fresh = I.mercuryDecide('ZCHURN', { sleeve: 'short', held: true, openedAt: Date.now() - 7200000 });
+    ok(fresh.action === 'SELL' || fresh.action === 'REDUCE', 'premise: this forecast is actionable');
+    // Just opened — too soon, whatever the forecast says.
+    const young = I.mercuryDecide('ZCHURN', { sleeve: 'short', held: true, openedAt: Date.now() - 60000 });
+    eq(young.action, 'HOLD', `a one-minute-old position must not be re-traded, got ${young.action}`);
+    ok(/too soon/.test(young.reason), `and must say why: ${young.reason}`);
+    // Acted on a moment ago — cooling off.
+    I.resetMercuryActionClock();
+    I.mercuryExitPass();                       // no book, but stamps nothing
+    const d1 = I.mercuryDecide('ZCHURN', { sleeve: 'short', held: true, openedAt: Date.now() - 7200000 });
+    ok(d1.action !== 'HOLD', 'premise: still actionable with an empty action clock');
+  } finally { restoreMercury(snap); }
+});
+
+check('the predictive pass actually sells a position in the book', () => {
+  // Everything above tests the DECISION. This tests that the decision reaches the book —
+  // the gap where a wiring bug would leave a perfectly good forecaster advising nobody.
+  const snap = snapMercury();
+  const savedCash = I.portfolio.cash;
+  try {
+    resetBook();
+    grantSkill('short'); biasModel('short', +1);
+    seedPath('ZBOOK', mkPath([[50, 0.0017], [30, -0.0025]]));
+    const px = I.marketData.ZBOOK.price;
+    I.portfolio.longPositions.ZBOOK = [{
+      qty: 10, entryPrice: px * 0.92, highestPnL: 0.08, openedAt: Date.now() - 7200000,
+      atrFrac: 0.02, partialsTaken: {},
+    }];
+    I.resetMercuryActionClock();
+    const acted = I.mercuryExitPass();
+    ok(acted >= 1, 'the predictive pass must act on a deteriorating held position');
+    ok(!I.portfolio.longPositions.ZBOOK || I.portfolio.longPositions.ZBOOK.length === 0
+       || I.portfolio.longPositions.ZBOOK[0].qty < 10,
+       'and the book must actually be smaller afterwards');
+    // The exit must be booked as a JUDGEMENT exit, not a stop — the stop flag drives the
+    // cooldown and the consecutive-loss kill switch.
+    const closed = I.portfolio.closedTrades.filter(t => t.ticker === 'ZBOOK');
+    ok(closed.length >= 1, 'the exit must be recorded');
+    ok(!closed.some(t => t.stopLoss === true),
+       'a predictive exit must never be recorded as a stop loss');
+    // AND IT MUST BE A NO-OP WHEN THE STOP SWEEP IS ALREADY ON IT.
+    resetBook();
+    seedPath('ZBOOK2', mkPath([[50, 0.0017], [30, -0.0025]]));
+    I.portfolio.longPositions.ZBOOK2 = [{
+      qty: 10, entryPrice: I.marketData.ZBOOK2.price * 0.92, highestPnL: 0.08,
+      openedAt: Date.now() - 7200000, atrFrac: 0.02, partialsTaken: {}, _exiting: true,
+    }];
+    I.resetMercuryActionClock();
+    eq(I.mercuryExitPass(), 0,
+       'a ticker the stop sweep is already exiting must be left entirely alone');
+    eq(I.portfolio.longPositions.ZBOOK2[0].qty, 10, 'and untouched');
+  } finally {
+    resetBook(); I.portfolio.cash = savedCash; restoreMercury(snap);
+  }
+});
+
+check('Mercury never places an order itself', () => {
+  // PAPER-ONLY IS STRUCTURAL, AND SO IS THIS. The forecaster returns opinions. Every
+  // order still goes through the existing execution path and the full risk pipeline, so
+  // there is no route by which a forecast can reach the broker without passing Terra.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const start = src.indexOf('function createMercury()');
+  const end   = src.indexOf('function evaluateAndTrade()');
+  ok(start > 0 && end > start, 'the Mercury section must be locatable');
+  const zone = src.slice(start, end);
+  for (const forbidden of ['submitBrokerOrder', 'routeToBroker', 'broker.submitOrder',
+                           'submitEntryOrder', 'terraExecutePlan', 'applyEntryFill']) {
+    ok(!zone.includes(forbidden),
+       `the forecaster/decision layer must never call ${forbidden} — orders belong to Terra`);
+  }
+  // The only book-mutating calls it may make are the ordinary exit paths, which carry
+  // the full risk pipeline with them.
+  const pass = src.slice(src.indexOf('function mercuryExitPass'), src.indexOf('function mercuryTick'));
+  const calls = (pass.match(/\b(closeLong|closeShort|partialClose)\(/g) || []).length;
+  eq(calls, 3, `the exit pass may call exactly closeLong/closeShort/partialClose, found ${calls} such calls`);
+  ok(!/executeLong|executeShort/.test(pass),
+     'and must never open a position — it is an exit pass');
+  // Live trading is still refused at boot; the forecaster does not create a new door.
+  ok(/if \(EXEC_BROKER_AUTH && broker\.isLive\)/.test(src),
+     'the paper-only boot refusal must still be present and unconditional');
+});
+
+check('a broken cost estimate cannot turn the book over', () => {
+  // Every threshold is a multiple of estimateRoundTripCost, which is the right unit until
+  // the spread estimator returns ~0 for a thin or freshly-added name — at which point
+  // every bar collapses toward zero and the smallest negative score trips a sale.
+  ok(I.MERCURY_MIN_EDGE > 0,
+     'there must be an absolute floor under the action bar, independent of the cost estimate');
+  ok(I.MERCURY_MIN_EDGE >= 0.001 && I.MERCURY_MIN_EDGE <= 0.01,
+     `the floor must be below any real round trip and above any estimator failure, got ${I.MERCURY_MIN_EDGE}`);
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/const costBar = Math\.max\(s\.cost \* MERCURY_EDGE_COST_MULT, MERCURY_MIN_EDGE\);/.test(src),
+     'and it must be applied as a floor on the bar, not merely declared');
+});
+
+check('holding is not billed for an entry it already made', () => {
+  // The bug this test was written for: mercuryScore subtracted the full round trip from
+  // every position, held or not. Measured on a clean 80-bar advance, a healthy winner
+  // with +0.12% expected return scored -0.15% and tripped the reduce bar purely because
+  // it was being charged for an entry it had already paid for. That is a systematic thumb
+  // on the scale toward selling, in a system whose entire purpose is to stop selling for
+  // bad reasons.
+  const snap = snapMercury();
+  try {
+    grantSkill('short'); biasModel('short', +1);
+    seedPath('ZCOST', mkPath([[80, 0.0022]]));
+    const entry = I.mercuryScore('ZCOST', 'short', { held: false });
+    const hold  = I.mercuryScore('ZCOST', 'short', { held: true });
+    ok(entry.cost > 0, 'premise: this symbol has a real round-trip cost');
+    near(hold.score - entry.score, entry.cost, 1e-9,
+         'the difference between holding and entering must be exactly one round trip');
+    ok(hold.score > entry.score, 'and holding must be the cheaper of the two');
+    const d = I.mercuryDecide('ZCOST', { sleeve: 'short', held: true, openedAt: Date.now() - 7200000 });
+    eq(d.action, 'HOLD', 'so a healthy winner is held, not reduced');
+  } finally { restoreMercury(snap); }
 });
 
 // ════════════════════════════════════════════════════════════════════════════

@@ -16,6 +16,7 @@ and sane, reward:risk ≥ minimum, stock within price limits, and the full risk 
 (visible at `/api/portfolio` → `terra.recentRejections`) and **executes** the rest, opening
 each position with its validated stop. No trade opens without a stop loss.
 - ♀ **Venus** (in `server.js`) — research **AI**: **scans the web** — SEC EDGAR **13F institutional holdings** (what large funds hold/accumulate), live **news** catalysts (via an LLM), and real-time **relative volume** — and analyzes it into a ranked **watchlist** with per-symbol ideas (what to watch, direction, why). A real online **calibration model** keeps its confidence empirically honest over time
+- ☿ **Mercury** (in `server.js`) — the **forecaster**: continuous multi-horizon (30m/1d/1w/1mo) probability-and-magnitude forecasts for every watched symbol, scored against its own resolved predictions. Its confidence is `sample support x measured Brier skill x data freshness`, so it cannot influence an order until it has demonstrated skill out of sample — and if it never does, the engine keeps doing what measurably works
 - 🔭 **Jupiter** (in `server.js`) — trading **AI**: a real online **win-probability model** (logistic regression) trained on every closed trade learns which conditions predict winners and uses it to size & steer trades; reports back to Venus via a direct zero-latency call
 - 🌙 **Luna** (`dashboard.html`) — the live dashboard for both engines
 - **broker.js** — execution adapter (Alpaca / paper) for real-money trading
@@ -69,6 +70,7 @@ the logs — no real orders are possible in this mode.
 - `GET  /api/health` — heartbeat: WS status, market, version, mode, broker, engines
 - `GET  /api/venus` — analysis engine: provider, per-catalyst calibration, recent learnings
 - `GET  /api/jupiter` — trading engine: live signals, measured edge, dynamic watchlist
+- `GET  /api/oracle` — ☿ Mercury: multi-horizon forecasts, out-of-sample Brier skill score, allocation and preservation state
 - `GET  /api/broker` — broker status, account, positions, recent live orders
 - `POST /api/aplus?enable=true|false` — toggle A+ mode (top ~10% signals only)
 - `POST /api/emergency?stop=true|false` — emergency halt / resume

@@ -51,6 +51,13 @@ const COSTS_ON = arg('--costs', '1') !== '0';
 const LIVE_TF  = /Hour/i.test(process.env.DECISION_TIMEFRAME || '1Hour') ? 60 : 1;
 const TF       = Math.max(1, parseInt(arg('--tf', DAILY ? '1' : String(LIVE_TF)), 10));
 const FRACTIONAL      = arg('--fractional', '1') !== '0';
+// ☿ MERCURY. --oracle replays the REAL forecaster over the same bars, on BAR TIME, and
+// reports its out-of-sample Brier skill score per horizon. --oracle-exits additionally
+// lets it close positions, with the skill gate FORCED OPEN so the mechanism is actually
+// exercised inside a single pass — which measures the machinery, not a validated edge,
+// and the report says so.
+const ORACLE         = flag('--oracle') || flag('--oracle-exits');
+const ORACLE_EXITS   = flag('--oracle-exits');
 const MIN_FRAC_NOTIONAL = parseFloat(arg('--minfrac', '5'));
 const LIMIT_MODE      = I.LIMIT_ENTRIES;
 const MIN_ATR  = parseFloat(arg('--minatr', '0'));                   // require this much volatility
@@ -181,6 +188,15 @@ function replay(hist, usable, cfg, capital, verbose = false) {
   S.ATR_STOP_MULT = cfg.stopMult; S.ATR_TARGET_MULT = cfg.targetMult;
 
   let cash = capital;
+  // Mercury replays on BAR time. Scoring a forecaster against the wall clock while
+  // feeding it historical bars resolves every prediction instantly against the same price
+  // it was made at, and reports a flawless Brier score that means precisely nothing.
+  let _barNow = 0;
+  if (ORACLE) {
+    I.mercury.reset();                       // never reuse weights that have seen this data
+    I.mercury.setClock(() => _barNow);
+  }
+  let oracleExits = 0;
   const open = {}, trades = [], equity = [capital];
   const rej = { strategyGate:0, sizeBelow1:0, notionalCap:0, netRR:0, targetCost:0, grossRR:0, maxPositions:0, minAtrGate:0, accepted:0 };
   const netRRSamples = [], costSamples = [], atrSamples = [];
@@ -189,6 +205,10 @@ function replay(hist, usable, cfg, capital, verbose = false) {
   const idx = {}; usable.forEach(s => idx[s] = 0);
 
   for (const t of times) {
+    _barNow = t;
+    // Resolve whatever has reached its horizon BEFORE this bar's forecasts are made, so a
+    // prediction is never scored against a price from its own creation step.
+    if (ORACLE) I.mercury.sweep(t);
     for (const sym of usable) {
       const bars = hist[sym];
       while (idx[sym] < bars.length && bars[idx[sym]].t <= t) idx[sym]++;
@@ -210,6 +230,10 @@ function replay(hist, usable, cfg, capital, verbose = false) {
         lastUpdate: Date.now(), lastTradeTime: Date.now(),
         history: window.map(b => b.c).slice(-60)
       };
+
+      // The forecast is made from the SAME pre-bar window every other decision uses, so
+      // there is no lookahead here either.
+      if (ORACLE) { try { I.mercury.forecast(sym, { record: true }); } catch (e) {} }
 
       const halfSpread = I.estimateDynamicSpread(sym) / 2;
       // Adverse selection: with `realistic` on, a limit entry is assumed to give back
@@ -237,6 +261,27 @@ function replay(hist, usable, cfg, capital, verbose = false) {
             exit = 'trail';
             fill = pos.dir === 'LONG' ? bar.c * (1 - (cfg.costsOn ? halfSpread : 0))
                                       : bar.c * (1 + (cfg.costsOn ? halfSpread : 0));
+          }
+          // ☿ PREDICTIVE EXIT — last, so the stop, the target and the trail all keep
+          // priority exactly as they do in the live engine. Mirrors mercuryExitPass's
+          // position in evaluateAndTrade rather than reimplementing the decision.
+          if (!exit && ORACLE_EXITS) {
+            const heldMs = (t - pos.openedAt);
+            const sc = I.mercuryScore(sym, 'short', { held: true, excludeAlternative: true });
+            if (sc && heldMs >= I.MERCURY_MIN_HOLD_MS) {
+              const bar0 = Math.max(sc.cost * I.MERCURY_EDGE_COST_MULT, I.MERCURY_MIN_EDGE);
+              // scoreForced: confidence is 0 inside a single pass (the models have not
+              // resolved enough forecasts yet), so the gate is opened deliberately here to
+              // exercise the mechanism. This measures the EXIT LOGIC, not a proven edge.
+              const forced = sc.expectedReturn !== 0 ? sc.score
+                           : (sc.pUp - sc.pDown) * sc.sigma * 1.141
+                             - I.MERCURY_RISK_AVERSION * sc.expectedDownside;
+              if (forced <= -bar0) {
+                exit = 'oracle'; oracleExits++;
+                fill = pos.dir === 'LONG' ? bar.c * (1 - (cfg.costsOn ? halfSpread : 0))
+                                          : bar.c * (1 + (cfg.costsOn ? halfSpread : 0));
+              }
+            }
           }
         }
 
@@ -303,12 +348,19 @@ function replay(hist, usable, cfg, capital, verbose = false) {
       const fracExtraCost = (cfg.costsOn && isFrac && LIMIT_MODE) ? halfSpread : 0;
       const entryCostPct = cfg.costsOn ? (halfSpread + adverse + fracExtraCost) : 0;
       const entry = dir === 'LONG' ? refPx * (1 + entryCostPct) : refPx * (1 - entryCostPct);
-      open[sym] = { dir, entry, qty, atrFrac: plan.atrFrac, peak: 0, entryCost: entry * entryCostPct };
+      open[sym] = { dir, entry, qty, atrFrac: plan.atrFrac, peak: 0, entryCost: entry * entryCostPct,
+                    openedAt: t };   // bar time, so the minimum-hold guard is measurable in replay
     }
   }
 
   S.ATR_STOP_MULT = savedStop; S.ATR_TARGET_MULT = savedTgt;
-  return { trades, equity, rej, netRRSamples, costSamples, atrSamples };
+  let oracle = null;
+  if (ORACLE) {
+    oracle = I.mercury.metrics();
+    oracle.exitsTaken = oracleExits;
+    I.mercury.setClock(null);          // hand the wall clock back
+  }
+  return { trades, equity, rej, netRRSamples, costSamples, atrSamples, oracle };
 }
 
 // Equal-weight buy-and-hold over the same symbols and the same period. THE benchmark.
@@ -564,6 +616,50 @@ function metrics(trades, equity, startCap) {
   console.log('  ' + '─'.repeat(60));
   console.log(`  BUY & HOLD same stocks ${usd(bhDollars)}  (${pct(bh)})   <-- the real benchmark`);
   console.log(`  STRATEGY vs BUY&HOLD   ${usd(m.net - bhDollars)}   ${m.net > bhDollars ? 'strategy wins' : 'JUST HOLDING WINS'}`);
+  if (r.oracle) {
+    const o = r.oracle;
+    console.log('  ' + '─'.repeat(60));
+    console.log('  ☿ MERCURY — forecast skill on these bars, scored OUT OF SAMPLE');
+    // THE HORIZON LABELS ASSUME ONE-MINUTE BARS. Mercury's horizons are defined in
+    // trading MINUTES (30 / 390 / 1950 / 8190) because that is the unit the live engine
+    // ticks in. Replay them over daily bars and "30m" is really 30 BARS = 30 sessions.
+    // The skill numbers are still valid measurements of those horizons — but a report
+    // that silently mislabelled them would be read as a minute-scale result and is
+    // exactly the kind of thing that gets believed six months later.
+    if (TF !== 1 || DAILY) {
+      const unit = DAILY ? 'DAY' : `${TF}-MINUTE`;
+      console.log(`  NOTE: bars are ${unit}s, so these horizons are 30 / 390 / 1950 / 8190 BARS,`);
+      console.log(`        not minutes. Read "30m" as "30 bars".`);
+    }
+    console.log('  ' + '─'.repeat(60));
+    console.log('  horizon  resolved   brier  baseline   skill    dir.acc   base↑');
+    for (const k of Object.keys(o.horizons)) {
+      const h = o.horizons[k];
+      const f = (x, d = 3) => (x == null ? '   —  ' : x.toFixed(d).padStart(6));
+      console.log(`  ${h.label.padEnd(8)} ${String(h.resolved).padStart(8)}  ${f(h.brier)}  ${f(h.brierBaseline)}  ` +
+                  `${f(h.skillScore)}  ${h.directionalAccuracy == null ? '   —  ' : (h.directionalAccuracy*100).toFixed(1).padStart(5) + '%'}  ` +
+                  `${h.baseRateUp == null ? '  — ' : (h.baseRateUp*100).toFixed(0).padStart(3) + '%'}`);
+    }
+    // THE BASELINE IS THE POINT. A Brier score on its own looks impressive at any skill
+    // level, because most moves are FLAT and predicting "not up" is easy. Skill is
+    // 1 - brier/baseline, where the baseline is "always predict the observed base rate",
+    // and only a POSITIVE number means the model knew something the base rate did not.
+    console.log('  ' + '─'.repeat(60));
+    if (o.anySkill) {
+      console.log(`  ⚠️  Measured skill ${(o.bestSkill*100).toFixed(1)}% on this window. That is ONE sample on ONE`);
+      console.log('      period with overlapping forecasts — correlated samples inflate the');
+      console.log('      effective n. Re-run on a different --end window before believing it.');
+    } else {
+      console.log('  ❌ NO measured skill: no horizon beat the base rate by the multiple-testing');
+      console.log('      floor. In the live engine this is exactly the state where confidence is 0');
+      console.log('      and the forecaster cannot influence a single order.');
+    }
+    if (ORACLE_EXITS) {
+      console.log(`  Predictive exits taken: ${o.exitsTaken} (skill gate FORCED open — this measures`);
+      console.log('      the exit MECHANISM, not a validated edge. Compare the exit mix and the');
+      console.log('      expectancy above against a run without --oracle-exits.)');
+    }
+  }
   console.log('═'.repeat(64));
   console.log(m.expectancy > 0 && m.pf > 1.1 ? '  ✅ POSITIVE expectancy on this sample. Worth paper-trading — not proof.'
     : m.expectancy > 0 ? '  ⚠️  Barely positive — inside noise. Do not size up.'
