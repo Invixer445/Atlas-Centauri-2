@@ -3112,7 +3112,8 @@ check('a settling order is not mistaken for a dividend', () => {
   let r;
   try {
     const out = require('child_process').execFileSync(process.execPath, ['-e', probe], {
-      env: { ...process.env, LIVE_TRADING: 'true' }, encoding: 'utf8', timeout: 60000,
+      env: { ...process.env, LIVE_TRADING: 'true' }, encoding: 'utf8', timeout: 180000,   // not 60s: these spawn a full engine load, and a single
+                       // transient failure under machine load teaches you to edit the test
     });
     r = JSON.parse(out.trim().split('\n').filter(l => l.startsWith('{')).pop());
   } catch (e) { throw new Error('probe failed: ' + (e.stdout || e.message)); }
@@ -4530,7 +4531,8 @@ function coreProbe(body, extraEnv = {}) {
   `;
   const out = require('child_process').execFileSync(process.execPath, ['-e', probe], {
     env: { ...process.env, CORE_HOLD_FRACTION: '0.5', ...extraEnv },
-    encoding: 'utf8', timeout: 60000,
+    encoding: 'utf8', timeout: 180000,   // not 60s: these spawn a full engine load, and a single
+                       // transient failure under machine load teaches you to edit the test
   });
   return JSON.parse(out.trim().split('\n').filter(l => l.startsWith('{')).pop());
 }
@@ -5375,6 +5377,61 @@ check('every forecast is scored before it is trained on', () => {
      'a forecast must carry the time it will be judged at, fixed when it is made');
   ok(/hi: fc\.price, lo: fc\.price/.test(rec),
      'and start its excursion water marks at the price it was made at');
+});
+
+check('a forecast scored long after its window is discarded, not believed', () => {
+  // resolveAt is an ABSOLUTE timestamp and this process is not always running. A deploy,
+  // a crash, or simply a weekend means the sweep can first see a due prediction days
+  // late. A 30-minute forecast made at 15:50 on Friday and resolved on Monday would be
+  // scored against a price that moved for three days including an opening gap: the
+  // realised return an order of magnitude too large, the UP/DOWN label near random, and
+  // both the Brier score and the weights fed from it. The skill gate is the one number
+  // this whole subsystem rests on, so a sample that cannot be trusted is dropped.
+  const snap = snapMercury();
+  const savedDrops = I.mercury.getStaleDrops();
+  try {
+    I.mercury.reset();
+    seedPath('ZSTALE2', mkPath([[80, 0.001]]));
+    let clock = Date.now();
+    I.mercury.setClock(() => clock);
+    I.mercury.forecast('ZSTALE2', { record: true });
+    const ids = Object.keys(I.mercury.getOpen());
+    ok(ids.length > 0, 'premise: predictions were recorded');
+    const shortId = ids.find(k => I.mercury.getOpen()[k].h === 'immediate');
+    ok(shortId, 'premise: a 30-minute prediction exists');
+
+    // ON TIME (one minute after its window) — must be scored.
+    clock += 31 * 60000;
+    I.mercury.sweep(clock);
+    eq(I.mercury.getScore().immediate.n, 1, 'a punctual resolution must be scored');
+    eq(I.mercury.getStaleDrops(), 0, 'and must not count as stale');
+
+    // FAR TOO LATE (a weekend) — must be dropped unscored.
+    I.mercury.reset();
+    clock = Date.now();
+    I.mercury.forecast('ZSTALE2', { record: true });
+    const before = I.mercury.getScore().immediate.n;
+    clock += 3 * 24 * 3600 * 1000;
+    I.mercury.sweep(clock);
+    eq(I.mercury.getScore().immediate.n, before,
+       'a 30-minute forecast resolved three days late must NOT be scored');
+    ok(I.mercury.getStaleDrops() > 0,
+       'and the drop must be counted, so a constantly-restarting bot reads as "learning ' +
+       'nothing" rather than as "no edge"');
+    ok('staleDrops' in I.mercury.metrics(), 'the count must be visible in the report card');
+    // The grace must scale with the horizon: a monthly forecast a day late is fine.
+    I.mercury.reset();
+    clock = Date.now();
+    I.mercury.forecast('ZSTALE2', { record: true });
+    clock += (8190 + 1440) * 60000;          // one day past a one-month horizon
+    I.mercury.sweep(clock);
+    ok(I.mercury.getScore().long.n >= 1,
+       'a one-month forecast one day late is still inside one horizon of grace');
+  } finally {
+    I.mercury.setClock(null);
+    I.mercury.reset();
+    restoreMercury(snap);
+  }
 });
 
 check('the prediction ledger cannot saturate and freeze itself', () => {

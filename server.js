@@ -8712,6 +8712,10 @@ function createMercury() {
   const cache = {};
   // When each (symbol, horizon) pair last had a forecast written to the ledger.
   let lastRecorded = {};
+  // Predictions dropped unscored because the sweep reached them too late to be honest
+  // about. Surfaced in metrics() so a bot that is restarting constantly is visible as a
+  // bot that is learning nothing, rather than as a bot with no edge.
+  let _mercuryStaleDrops = 0;
 
   const clip01 = (x) => Math.max(0, Math.min(1, x));
   const fin = (x, d = 0) => (typeof x === 'number' && Number.isFinite(x)) ? x : d;
@@ -9007,6 +9011,19 @@ function createMercury() {
       if (px !== null) { p.hi = Math.max(p.hi, px); p.lo = Math.min(p.lo, px); }
       if (now < p.resolveAt) continue;
       if (px === null) { delete open[id]; continue; }   // no usable price to score against
+      // A PREDICTION SCORED LONG AFTER ITS WINDOW IS NOT A PREDICTION ABOUT ITS WINDOW.
+      // resolveAt is absolute, and this process is not always running: a deploy, a crash,
+      // or simply a weekend means the sweep can first see a due prediction days late. A
+      // 30-minute forecast made at 15:50 on Friday and resolved on Monday would be scored
+      // against a price that moved for three days including an opening gap — the realised
+      // return would be an order of magnitude too large, it would label UP or DOWN almost
+      // at random, and it would feed both the Brier score and the weights. The skill gate
+      // is the single number this whole subsystem rests on, so a sample it cannot trust is
+      // dropped rather than guessed at. One full horizon of grace: overnight and the
+      // closing bell are fine, a missed session is not.
+      const lateBy = now - p.resolveAt;
+      const horizon = (MERCURY_HORIZONS.find(h => h.key === p.h) || { minutes: 30 }).minutes * 60000;
+      if (lateBy > horizon) { delete open[id]; _mercuryStaleDrops++; continue; }
       resolveOne(p, px);
       delete open[id];
       resolved++;
@@ -9061,6 +9078,7 @@ function createMercury() {
   // What "is it working" actually means, in numbers that cannot flatter themselves.
   function metrics() {
     const out = { horizons: {}, open: Object.keys(open).length, ledger: ledger.length,
+                  staleDrops: _mercuryStaleDrops,
                   enabled: MERCURY_ON, minSamples: MERCURY_MIN_SAMPLES };
     for (const h of MERCURY_HORIZONS) {
       const s = score[h.key];
@@ -9164,7 +9182,7 @@ function createMercury() {
       Object.assign(score[h.key], { n: 0, brier: 0, brierBase: 0, ups: 0, downs: 0, hits: 0,
                                     calls: 0, sumAbsErr: 0, realisedSum: 0, predictedSum: 0 });
     }
-    open = {}; nextId = 1; lastRecorded = {}; ledger.length = 0;
+    open = {}; nextId = 1; lastRecorded = {}; ledger.length = 0; _mercuryStaleDrops = 0;
     for (const k of Object.keys(vol)) delete vol[k];
     clearCache();
   }
@@ -9174,6 +9192,7 @@ function createMercury() {
            resetVol: (sym) => { if (sym) delete vol[sym]; else for (const k of Object.keys(vol)) delete vol[k]; },
            getOpen: () => open, getLedger: () => ledger, getScore: () => score,
            getLastRecorded: () => lastRecorded,
+           getStaleDrops: () => _mercuryStaleDrops,
            resetRecordClock: () => { lastRecorded = {}; },
            getModels: () => models,
            HORIZONS: MERCURY_HORIZONS, FEATURES: MERCURY_FEATURES };
