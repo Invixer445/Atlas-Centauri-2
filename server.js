@@ -2702,9 +2702,126 @@ const DECISION_TIMEFRAME = (process.env.DECISION_TIMEFRAME || '1Hour');
 // that improvement for nothing. Defaults to a broad, liquid, sector-spread set chosen
 // for BREADTH rather than past performance — picking last cycle's winners is how the
 // trading side already fooled itself once.
+// ════════════════════════════════════════════════════════════════════════════
+//  THE GROWTH SLEEVE — a deliberate, measured bet on volatility
+// ════════════════════════════════════════════════════════════════════════════
+//
+//  WHAT THIS IS, AND WHAT IT IS NOT.
+//
+//  The operator asked for +$2,000 on $10,000 in one month — +20% — with 70% of the
+//  account working hard and 30% spread for the long term. The measurements say exactly
+//  what that costs, so they are written down here rather than discovered later.
+//
+//  +20% IN A MONTH IS NOT AVAILABLE FROM THE MEGA-CAP BASKET. Not unlikely: unavailable.
+//  Across 60,000 bootstrapped months on real bars the 16-name basket hit it ZERO times;
+//  its 95th-percentile month is +7.4%. An 11%-volatility portfolio cannot produce a
+//  3.4-sigma month on demand.
+//
+//  IT IS AVAILABLE FROM VOLATILITY — AND ONLY FROM VOLATILITY. A basket of eight
+//  high-volatility names runs near 60% annualised and hits +20% in a month about a
+//  fifth of the time. That is not forecasting. It is owning things that move.
+//
+//  WHAT IT COSTS, measured on 480 sessions including a real 14% index drawdown, split
+//  in half to see whether any of it is stable:
+//
+//      70/30 blend        first half   +217% CAGR   34% of months hit +20%
+//                         second half   +21% CAGR  6.8% of months hit +20%
+//      max drawdown             39.1%   (-$3,900 on $10,000)
+//      worst single month      -28.4%   (-$2,840)
+//
+//  The spectacular half is the first one. The honest forward number is the SECOND:
+//  roughly a one-in-fifteen chance of hitting the target in any given month, against a
+//  near-certain 30-40% drawdown along the way. The operator is entitled to take that
+//  bet — this is a paper account and the instruction was explicit — but the engine
+//  should say the number out loud rather than imply a better one.
+//
+//  WHY IT IS BUILT ON THE CORE MACHINERY, NOT THE TRADING BOOK.
+//  Measured on the same pool, weekly rebalance, eight names:
+//      no stop      CAGR +38.3%   maxDD 55.3%
+//      -5% stop     CAGR  +7.2%   maxDD 66.4%      <- five times less return
+//      -8% stop     CAGR  +8.2%   maxDD 63.3%         AND a deeper drawdown
+//      -12% stop    CAGR +24.2%   maxDD 58.9%
+//      -20% stop    CAGR +39.9%   maxDD 55.4%      <- harmless, because unreachable
+//  Tight stops do not protect a 60%-vol name; they sell it at the bottom of an ordinary
+//  day and miss the bounce. That is the 39th rule this project has tested and the 39th
+//  that failed. So the sleeve holds — top-up-only, no trailing stop, no sell-on-decline —
+//  which is precisely what portfolio.coreHolding already does. Only a CATASTROPHE stop
+//  survives the evidence, set far outside the zone that did the damage.
+//
+//  AND THERE IS NO STOCK PICKING IN HERE. Within the pool, weekly rebalanced:
+//      no selection at all  +40.4%     most-volatile   +38.3%
+//      1-month momentum     +39.7%     mean-reversion  +40.8%
+//  Every rule is indistinguishable from owning the lot. The operator asked for the names
+//  that will go up; forty tests now say nobody in this codebase can name them. What the
+//  sleeve can honestly do is own enough volatile things, widely enough, to give the
+//  target a real chance — and say so.
+//
+//  OFF BY DEFAULT. GROWTH_SLEEVE_FRACTION=0.70 turns it on.
+const GROWTH_SLEEVE_FRACTION = Math.max(0, Math.min(0.85,
+  parseFloat(process.env.GROWTH_SLEEVE_FRACTION || '0')));
+const GROWTH_SLEEVE_ON = GROWTH_SLEEVE_FRACTION > 0;
+// Eight, because breadth wins inside the sleeve too: 8 names beat 4 beat 2 on the odds
+// of hitting +20% AND on the odds of losing 20%. Concentration buys nothing here either.
+const GROWTH_SLEEVE_NAMES = Math.max(1, Math.min(12,
+  parseInt(process.env.GROWTH_SLEEVE_NAMES || '8', 10)));
+// The pool is the existing speculative watchlist — these are the names the measurements
+// above were actually run on.
+const GROWTH_POOL = (process.env.GROWTH_POOL || WATCHLISTS.nasdaq.join(','))
+  .split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
+// CATASTROPHE ONLY. -20% was measured harmless and anything tighter was actively
+// destructive, so this sits far outside the damage zone. It exists for a fraud, a halt or
+// a delisting — not for a bad week, which at 60% vol is an ordinary Tuesday.
+const GROWTH_DISASTER_STOP = Math.max(0.15, Math.min(0.9,
+  parseFloat(process.env.GROWTH_DISASTER_STOP || '0.35')));
+
+// Names the disaster stop has retired, so one is not bought straight back on the next
+// cycle — the basket is rebuilt from growthNames() every time it is needed.
+const _growthRetired = new Set();
+function growthNames() {
+  if (!GROWTH_SLEEVE_ON) return [];
+  // Retired names are skipped and the sleeve refills from the rest of the pool, so a
+  // catastrophe removes one name rather than shrinking the sleeve permanently.
+  return GROWTH_POOL.filter(x => !_growthRetired.has(x)).slice(0, GROWTH_SLEEVE_NAMES);
+}
+function isGrowthName(sym) { return GROWTH_SLEEVE_ON && growthNames().includes(sym); }
+
+// Rescale a finished weight map so the growth names own GROWTH_SLEEVE_FRACTION of the
+// core between them and the base names own the rest. Applied AFTER every existing rail
+// (conviction tilt, per-name cap, renormalisation) so none of them are bypassed — the
+// sleeve decides how the pie is split, not how large any one slice may be.
+function applySleeveSplit(out, list) {
+  if (!GROWTH_SLEEVE_ON) return out;
+  const g = list.filter(isGrowthName);
+  const b = list.filter(x => !isGrowthName(x));
+  if (!g.length || !b.length) return out;      // one-sided basket: nothing to split
+  const gSum = g.reduce((a, x) => a + (out[x] || 0), 0);
+  const bSum = b.reduce((a, x) => a + (out[x] || 0), 0);
+  for (const x of g) out[x] = gSum > 0 ? (out[x] / gSum) * GROWTH_SLEEVE_FRACTION
+                                       : GROWTH_SLEEVE_FRACTION / g.length;
+  for (const x of b) out[x] = bSum > 0 ? (out[x] / bSum) * (1 - GROWTH_SLEEVE_FRACTION)
+                                       : (1 - GROWTH_SLEEVE_FRACTION) / b.length;
+  return out;
+}
+
+// The live basket with the growth names folded in. Called wherever the basket is set, so
+// a Venus swap or a restored basket cannot quietly drop the sleeve.
+function withGrowthSleeve(base) {
+  if (!GROWTH_SLEEVE_ON) return [...(base || [])];
+  const g = growthNames();
+  const keep = (base || []).filter(x => !g.includes(x));
+  return [...new Set([...g, ...keep])];
+}
+
 const CORE_HOLD_SYMBOLS = (process.env.CORE_HOLD_SYMBOLS ||
   'SPY,AAPL,MSFT,JNJ,JPM,XOM,PG,KO,WMT,CVX')
   .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+// Fold the growth names in immediately. Without this, switching the sleeve on would do
+// nothing until Venus's next basket proposal — up to a day later, and only if the
+// 30-day minimum hold happened to have expired.
+if (GROWTH_SLEEVE_ON) {
+  const base = [...CORE_HOLD_SYMBOLS];
+  CORE_HOLD_SYMBOLS.length = 0; CORE_HOLD_SYMBOLS.push(...withGrowthSleeve(base));
+}
 const CORE_HOLD_SYMBOL   = CORE_HOLD_SYMBOLS[0];   // back-compat for single-name callers
 const CORE_HOLD_FRACTION = Math.max(0, Math.min(0.9, parseFloat(process.env.CORE_HOLD_FRACTION || '0')));
 const CORE_HOLD_ON       = CORE_HOLD_FRACTION > 0;
@@ -2830,6 +2947,8 @@ const CORE_TILT_MIN      = Math.max(0.1, Math.min(1, parseFloat(process.env.CORE
 // matter what conviction pattern Venus returns. 0.25 is the edge of the range where a
 // completely wrong tilt still costs only ~0.2pp of CAGR.
 const CORE_TILT_MAX_SHARE = Math.max(0.1, Math.min(0.5, parseFloat(process.env.CORE_TILT_MAX_SHARE || '0.25')));
+
+
 // sym -> 0..1 conviction from Venus. Empty means equal weight, which is the default
 // state and the state after any restart until Venus proposes again.
 let CORE_CONVICTION = {};
@@ -4455,7 +4574,10 @@ async function runIntelCycle() {
             }
             _recoveredSymbols.clear();       // one cycle of grace, not permanent tenure
             const previous = new Set(CORE_HOLD_SYMBOLS);
-            CORE_HOLD_SYMBOLS.length = 0; CORE_HOLD_SYMBOLS.push(...merged.basket);
+            // The sleeve survives a Venus swap: Venus proposes the LONG-TERM half and has
+            // no idea the growth half exists, so re-folding it here is what stops the
+            // daily model call quietly liquidating 70% of the account.
+            CORE_HOLD_SYMBOLS.length = 0; CORE_HOLD_SYMBOLS.push(...withGrowthSleeve(merged.basket));
             // SUBSCRIBE THE NEW NAMES. The stream is subscribed once at connect, so a
             // basket swapped mid-session leaves its new members with no ticks at all —
             // and a member with no price is skipped by mostUnderweightCore and can
@@ -5835,7 +5957,7 @@ function coreWeightMap(symbols = CORE_HOLD_SYMBOLS, conv = CORE_CONVICTION) {
   const out = {};
   if (!CORE_TILT_ON || !conv || typeof conv !== 'object') {
     for (const s of list) out[s] = eq;
-    return out;
+    return applySleeveSplit(out, list);
   }
   const mult = list.map(s => {
     const c = Number(conv[s]);
@@ -5845,7 +5967,7 @@ function coreWeightMap(symbols = CORE_HOLD_SYMBOLS, conv = CORE_CONVICTION) {
     return Math.max(CORE_TILT_MIN, Math.min(CORE_TILT_MAX, m));
   });
   const tot = mult.reduce((a, b) => a + b, 0);
-  if (!(tot > 0)) { for (const s of list) out[s] = eq; return out; }
+  if (!(tot > 0)) { for (const s of list) out[s] = eq; return applySleeveSplit(out, list); }
   let w = mult.map(m => m / tot);
 
   // HARD RAIL ON THE FINAL SHARE. The per-name multiplier is bounded, but shares are
@@ -5867,7 +5989,7 @@ function coreWeightMap(symbols = CORE_HOLD_SYMBOLS, conv = CORE_CONVICTION) {
     for (const i of room) w[i] += deficit * (roomTotal > 0 ? capped[i] / roomTotal : 1 / room.length);
   }
   list.forEach((s, i) => { out[s] = w[i]; });
-  return out;
+  return applySleeveSplit(out, list);
 }
 
 // How much to add IN TOTAL to reach the target weight. Pure, so the sizing decision is
@@ -6086,6 +6208,33 @@ async function trimCoreStep() {
   const tv = getTotalValue();
 
   // 1. The arithmetic rule ALWAYS runs first and is never overridden.
+  // CATASTROPHE FIRST, and it sells the WHOLE position rather than an excess.
+  const dis = growthDisasterPick();
+  if (dis) {
+    const lot = portfolio.coreHolding[dis.sym];
+    const proceeds = dis.qty * dis.px;
+    _growthRetired.add(dis.sym);
+    delete portfolio.coreHolding[dis.sym];
+    portfolio.cash += proceeds;
+    rebasePeakForCoreFlow(-proceeds);
+    const idx = CORE_HOLD_SYMBOLS.indexOf(dis.sym);
+    if (idx >= 0) CORE_HOLD_SYMBOLS.splice(idx, 1);
+    console.warn(`[GROWTH] 🛑 ${dis.sym} is ${(dis.down * 100).toFixed(1)}% below its average ` +
+                 `cost of $${lot.avgPrice.toFixed(2)} — past the ${(GROWTH_DISASTER_STOP * 100).toFixed(0)}% ` +
+                 `catastrophe line. Selling all ${dis.qty.toFixed(4)} for $${proceeds.toFixed(2)} and ` +
+                 `retiring it from the sleeve. This is NOT a stop-loss: tight stops were measured ` +
+                 `costing five-sixths of this sleeve's return AND deepening its drawdown. It fires ` +
+                 `only for the kind of fall a healthy name does not make.`);
+    if (LIVE_TRADING && broker && broker.configured) {
+      broker.submitOrder({ symbol: dis.sym, side: 'sell', qty: dis.qty, type: 'market',
+                           refPrice: dis.px }).catch(e => {
+        console.error(`[GROWTH] disaster exit for ${dis.sym} failed to route: ${e.message}`);
+      });
+    }
+    queueSaveState();
+    return true;
+  }
+
   let pick = mostOverweightCore(tv);
   let source = 'rule';
 
@@ -6166,6 +6315,40 @@ async function trimCoreStep() {
   }
   queueSaveState();
   return true;
+}
+
+// A growth name that has fallen catastrophically far below its average cost, and should
+// be let go entirely rather than topped up into.
+//
+// THIS IS THE ONLY STOP THE EVIDENCE ALLOWS. Measured on this exact pool, weekly
+// rebalanced, eight names:
+//     no stop      CAGR +38.3%   maxDD 55.3%
+//     -5% stop     CAGR  +7.2%   maxDD 66.4%
+//     -8% stop     CAGR  +8.2%   maxDD 63.3%
+//     -12% stop    CAGR +24.2%   maxDD 58.9%
+//     -20% stop    CAGR +39.9%   maxDD 55.4%
+// A tight stop on a 60%-volatility name does not protect anything — it sells at the
+// bottom of an ordinary session and misses the bounce, costing five-sixths of the return
+// AND deepening the drawdown. Only a level so far out that it never fires on normal
+// movement was harmless, which is exactly what a CATASTROPHE stop is for: a fraud, a
+// halt, a delisting. GROWTH_DISASTER_STOP defaults to -35%, well outside the zone that
+// did the damage, and it is deliberately not a risk-management tool.
+//
+// It applies to growth names only. The long-term sleeve is mega-caps and is held through
+// everything, which is the whole point of holding it.
+function growthDisasterPick() {
+  if (!GROWTH_SLEEVE_ON || !CORE_HOLD_ON) return null;
+  for (const sym of growthNames()) {
+    const lot = (portfolio.coreHolding || {})[sym];
+    if (!lot || !(lot.qty > 0) || !(lot.avgPrice > 0)) continue;
+    const px = marketData[sym]?.price;
+    if (!Number.isFinite(px) || !(px > 0)) continue;
+    const upd = marketData[sym]?.lastUpdate;
+    if (upd && (Date.now() - upd) > MAX_PRICE_AGE_MS) continue;   // never act on a stale price
+    const down = 1 - (px / lot.avgPrice);
+    if (down >= GROWTH_DISASTER_STOP) return { sym, px, qty: lot.qty, down };
+  }
+  return null;
 }
 
 function maintainCoreHolding() {
@@ -8227,7 +8410,7 @@ function loadState() {
         .map(s => String(s || '').toUpperCase().trim())
         .filter(s => /^[A-Z.]{1,6}$/.test(s));
       if (restored.length) {
-        CORE_HOLD_SYMBOLS.length = 0; CORE_HOLD_SYMBOLS.push(...new Set(restored));
+        CORE_HOLD_SYMBOLS.length = 0; CORE_HOLD_SYMBOLS.push(...withGrowthSleeve([...new Set(restored)]));
         const cv = state.coreConviction;
         CORE_CONVICTION = (cv && typeof cv === 'object' && !Array.isArray(cv)) ? cv : {};
         _venusBasketReceived = true;
@@ -10833,6 +11016,19 @@ if (require.main === module) app.listen(PORT, async () => {
   } else {
     console.log('[MERCURY] ☿ Forecaster OFF (MERCURY_ENABLED=false) — exits revert to stop/target only');
   }
+  if (GROWTH_SLEEVE_ON) {
+    console.warn(`[GROWTH] ⚠️  GROWTH SLEEVE ON — ${(GROWTH_SLEEVE_FRACTION * 100).toFixed(0)}% of the core ` +
+      `in ${GROWTH_SLEEVE_NAMES} high-volatility names (${growthNames().join(',')}), ` +
+      `${((1 - GROWTH_SLEEVE_FRACTION) * 100).toFixed(0)}% in the long-term basket.`);
+    console.warn(`[GROWTH]    MEASURED, on 480 sessions of real bars split in half:`);
+    console.warn(`[GROWTH]      chance of +20% in a month ....... 34% (first half) / 6.8% (second half)`);
+    console.warn(`[GROWTH]      chance of -20% in a month .......  5% (first half) / 1.8% (second half)`);
+    console.warn(`[GROWTH]      max drawdown .................... 39.1%   worst month -28.4%`);
+    console.warn(`[GROWTH]    The second half is the honest number. This sleeve does not predict ` +
+      `anything — forty tested rules say direction is not forecastable here — it simply owns ` +
+      `volatile things, which is the only thing that puts +20% in a month within reach at all. ` +
+      `Expect a 30-40% drawdown on the way. GROWTH_SLEEVE_FRACTION=0 turns it off.`);
+  }
   console.log(`[STRATEGY] EMA(${STRATEGY.EMA_FAST}/${STRATEGY.EMA_SLOW}) + RSI(${STRATEGY.RSI_PERIOD}) gate ${STRATEGY_GATE_ENABLED ? 'ON' : 'OFF'}`);
   console.log(`[MODE] Autonomous entries ${AUTONOMOUS_TRADING ? 'ON (ATLAS is the brain)' : 'OFF (pure executor — TradingView drives entries)'}`);
 
@@ -11028,6 +11224,10 @@ module.exports = {
     MAX_DAY_VOLUME_SHARE, intendedPositionNotional, verifyStateDir,
     desiredWsSymbols, syncWsSubscription, wsSymbolPriority, WATCHLISTS,
     pendingEntryTickers, committedPositionCount, dispatchFill, isInsideSessionBuffer, partialClose,
+    GROWTH_SLEEVE_ON, GROWTH_SLEEVE_FRACTION, GROWTH_SLEEVE_NAMES, GROWTH_POOL,
+    GROWTH_DISASTER_STOP, growthNames, isGrowthName, applySleeveSplit, withGrowthSleeve,
+    growthDisasterPick, getGrowthRetired: () => [..._growthRetired],
+    clearGrowthRetired: () => { _growthRetired.clear(); },
     detectOvernightGaps, MAX_OPEN_POSITIONS, MAX_SECTOR_EXPOSURE, sectorExposureFor,
     // Test-only handles for the main loop and the state writer, so a soak harness can
     // drive the REAL tick with hostile data instead of a reimplementation of it.

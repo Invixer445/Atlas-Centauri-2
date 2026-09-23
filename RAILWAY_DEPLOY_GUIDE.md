@@ -88,6 +88,9 @@ share one.
 | `MERCURY_MIN_SAMPLES` | `40` | Resolved forecasts a horizon needs before its skill counts at all. |
 | `MERCURY_SKILL_FLOOR` | `0.02` | Brier skill score a horizon must clear. Eight models are scored at once, so this is the multiple-testing bar. |
 | `ALLOC_SHORT_TARGET` | `0.70` | The 70/30 objective. Ramps with measured skill; `ALLOC_RAMP=off` goes straight there. |
+| `GROWTH_SLEEVE_FRACTION` | `0` (off) | ☢️ Puts this share of the core into high-volatility names. `0.70` is the aggressive setting. **Measured: 39% max drawdown, worst month −28%, and roughly a 1-in-15 chance of +20% in any month out of sample.** Read §8 before turning it on. |
+| `GROWTH_SLEEVE_NAMES` | `8` | How many. Breadth was measured better on BOTH tails — do not narrow it. |
+| `GROWTH_DISASTER_STOP` | `0.35` | Catastrophe exit only. Tighter was measured to cost five-sixths of the return AND deepen the drawdown. |
 | `ALPACA_DATA_FEED` | `iex` | `sip` needs a paid data plan. |
 | `WS_MAX_SYMBOLS` | `30` | The free IEX tier's subscription cap. Exceeding it is **all-or-nothing** — the whole stream is rejected and the bot goes dark. |
 | `ATLAS_DATA_DIR` | — | Manual override for the state directory. Only needed off Railway. |
@@ -176,3 +179,60 @@ data. `node backtest.js --oracle` runs the same measurement over historical bars
 | Nothing is ever bought, no errors | `CORE_HOLD_FRACTION` unset (`core holding OFF` in the banner), or the phase gate is shut and trading has no funds yet. |
 | Prices never update / no ticks | More than `WS_MAX_SYMBOLS` symbols requested — the IEX subscription is rejected whole. |
 | Two services, one volume | Not possible. Railway mounts a volume to one service. |
+
+
+---
+
+## 8. The growth sleeve — read this before turning it on
+
+`GROWTH_SLEEVE_FRACTION=0.70` puts 70% of the holding side into eight high-volatility
+names and leaves 30% in the long-term basket. It exists because **+20% in a month is not
+available from the mega-cap basket** — across 60,000 bootstrapped months on real bars it
+hit that target zero times, and its 95th-percentile month is +7.4%.
+
+It is available from volatility, and only from volatility. Measured on 480 sessions of
+real daily bars, split in half to see what is stable:
+
+| | first half | second half |
+|---|---|---|
+| chance of +20% in a month | 34% | **6.8%** |
+| chance of −20% in a month | 5.0% | **1.8%** |
+| annualised return | +217% | **+21%** |
+| max drawdown | 39.1% | 37.0% |
+| worst single month | −28.4% | −22.5% |
+
+**Believe the second half.** The spectacular numbers are all in the first. A realistic
+expectation is roughly a one-in-fifteen chance of hitting +20% in any given month, and a
+30–40% drawdown somewhere along the way — about −$3,700 on a $10,000 account.
+
+### What it does NOT do
+
+It does not predict. Forty rules have now been tested in this project and all forty
+failed, including — within this exact pool, weekly rebalanced — momentum (+39.7%),
+mean-reversion (+40.8%) and most-volatile (+38.3%) against **no selection at all
+(+40.4%)**. Picking is indistinguishable from not picking. The sleeve owns eight volatile
+things because that is what puts the target within reach; it does not claim to know which
+of them will rise.
+
+### Why there is no stop loss
+
+There is only a catastrophe stop, at −35%, and that is a measured decision:
+
+| stop | return | max drawdown |
+|---|---|---|
+| none | +38.3% | 55.3% |
+| −5% | **+7.2%** | **66.4%** |
+| −8% | +8.2% | 63.3% |
+| −12% | +24.2% | 58.9% |
+| −20% | +39.9% | 55.4% |
+
+A tight stop on a 60%-volatility name does not protect anything. It sells at the bottom
+of an ordinary session and misses the bounce — costing five-sixths of the return *and*
+deepening the drawdown. Only a level far outside normal movement was harmless, which is
+what −35% is for: a fraud, a halt, a delisting. A name it retires is replaced from the
+rest of the pool.
+
+### Turning it off
+
+`GROWTH_SLEEVE_FRACTION=0`. The next core cycle rebalances back toward the long-term
+basket on its own; nothing is force-sold.

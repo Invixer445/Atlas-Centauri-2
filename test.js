@@ -2615,7 +2615,7 @@ check('a restart does not liquidate the basket Venus chose', () => {
      'the basket must not be saved unconditionally — a fixed basket is env-authoritative');
 
   // 2. It must be restored BEFORE any interval can fire.
-  const loadIdx = src.indexOf('CORE_HOLD_SYMBOLS.push(...new Set(restored))');
+  const loadIdx = src.indexOf('CORE_HOLD_SYMBOLS.push(...withGrowthSleeve([...new Set(restored)]))');
   const startIdx = src.indexOf('setInterval(maintainCoreHolding');
   ok(loadIdx > 0 && loadIdx < startIdx, 'the basket must be restored before the core intervals start');
 
@@ -3300,8 +3300,18 @@ check('a recovered holding is not force-sold by a proposal that never knew it ex
   // otherwise a broker full of strays widens the basket straight back past the balance.
   ok(/const unionCap = affordableBasketNames\(getTotalValue\(\), CORE_BASKET_MAX_NAMES\);/.test(branch),
      'the carried-holdings cap must be account-relative, not the raw CORE_BASKET_MAX_NAMES');
-  ok(/CORE_HOLD_SYMBOLS\.push\(\.\.\.merged\.basket\)/.test(branch),
+  ok(/CORE_HOLD_SYMBOLS\.push\(\.\.\.withGrowthSleeve\(merged\.basket\)\)/.test(branch),
      'the MERGED basket, not the raw proposal, must become the live basket');
+  // v13.67: and the growth sleeve must survive the swap. Venus proposes the LONG-TERM
+  // half and has no idea the growth half exists, so without re-folding it here a routine
+  // daily model call would quietly liquidate 70% of the account.
+  const src2 = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                 .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const sets = (src2.match(/CORE_HOLD_SYMBOLS\.push\(/g) || []).length;
+  const folded = (src2.match(/CORE_HOLD_SYMBOLS\.push\(\.\.\.withGrowthSleeve\(/g) || []).length;
+  eq(folded, sets,
+     `${sets - folded} of ${sets} basket assignments skip withGrowthSleeve() — every one ` +
+     'must fold the sleeve back in, or a swap silently drops it');
   // ONE CYCLE OF GRACE. Without the clear, a recovered name could never be dropped —
   // it would be re-carried at every future swap and hold tenure for ever.
   ok(/_recoveredSymbols\.clear\(\);/.test(branch),
@@ -3535,7 +3545,7 @@ check('venus basket mode buys nothing until Venus has actually proposed', () => 
   // core start buying the DEFAULT basket while believing it had Venus's.
   ok(src.split('_venusBasketReceived = true').length - 1 === 2,
      'the flag must be set in exactly two places: the basket swap and the state restore');
-  const loadIdx = src.indexOf('CORE_HOLD_SYMBOLS.push(...new Set(restored))');
+  const loadIdx = src.indexOf('CORE_HOLD_SYMBOLS.push(...withGrowthSleeve([...new Set(restored)]))');
   ok(loadIdx > 0, 'the saved basket must be restored on load');
   ok(src.slice(loadIdx, loadIdx + 400).includes('_venusBasketReceived = true'),
      'restoring a saved basket must also mark it received, or the core waits for a proposal it already has');
@@ -6354,6 +6364,183 @@ check('a horizon that is not merely unskilled but broken heals itself', () => {
     eq(I.mercury.getScore().short.n, I.MERCURY_MIN_SAMPLES,
        'one short ugly stretch must not wipe a horizon — it needs a real sample first');
   } finally { restoreMercury(snap); }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  v13.67 — THE GROWTH SLEEVE
+// ════════════════════════════════════════════════════════════════════════════
+group('v13.67 — a measured bet on volatility');
+
+function sleeveProbe(body, frac = '0.70') {
+  const probe = `
+    const I = require('${require('path').join(__dirname, 'server.js').replace(/\\/g, '/')}')._internals;
+    ${body}
+  `;
+  const out = require('child_process').execFileSync(process.execPath, ['-e', probe], {
+    env: { ...process.env, CORE_HOLD_FRACTION: '0.5', GROWTH_SLEEVE_FRACTION: frac },
+    encoding: 'utf8', timeout: 180000,
+  });
+  return JSON.parse(out.trim().split('\n').filter(l => l.startsWith('{')).pop());
+}
+
+check('the sleeve is OFF unless the operator turns it on', () => {
+  // This puts 70% of the account into 60%-volatility names with a measured 39% drawdown.
+  // It must never arrive by accident, by default, or by a deploy that forgot a variable.
+  eq(I.GROWTH_SLEEVE_FRACTION, 0, 'the default fraction must be exactly zero');
+  eq(I.GROWTH_SLEEVE_ON, false, 'so the sleeve is off');
+  eq(I.growthNames().length, 0, 'and names nothing');
+  eq(I.isGrowthName('PLTR'), false, 'and claims nothing');
+  // With it off, the weight map must be byte-identical to before it existed.
+  const w = I.coreWeightMap();
+  const n = I.CORE_HOLD_SYMBOLS.length;
+  for (const s of I.CORE_HOLD_SYMBOLS) near(w[s], 1 / n, 1e-9, `${s} must stay equal-weight`);
+  eq(I.withGrowthSleeve(['A', 'B']).join(','), 'A,B', 'and the basket passes through untouched');
+});
+
+check('turning it on splits the core exactly 70/30', () => {
+  const r = sleeveProbe(`
+    const w = I.coreWeightMap();
+    let g = 0, b = 0, gn = 0, bn = 0;
+    for (const [s, x] of Object.entries(w)) { if (I.isGrowthName(s)) { g += x; gn++; } else { b += x; bn++; } }
+    console.log(JSON.stringify({ g, b, gn, bn, sum: g + b, names: I.growthNames(),
+                                 basket: I.CORE_HOLD_SYMBOLS, perG: w[I.growthNames()[0]] }));
+  `);
+  near(r.g, 0.70, 1e-9, 'the growth names must own exactly 70% of the core between them');
+  near(r.b, 0.30, 1e-9, 'and the long-term names exactly 30%');
+  near(r.sum, 1, 1e-9, 'the weights must still sum to one');
+  eq(r.gn, I.GROWTH_SLEEVE_NAMES, 'with the configured number of growth names');
+  ok(r.bn >= 5, `and a genuinely spread long-term half, got ${r.bn} names`);
+  near(r.perG, 0.70 / r.gn, 1e-9, 'growth names equal-weighted within their sleeve');
+  // Breadth inside the sleeve is measured, not stylistic: 8 names beat 4 beat 2 on the
+  // odds of hitting +20% AND on the odds of losing 20%.
+  ok(I.GROWTH_SLEEVE_NAMES >= 6,
+     `the sleeve must stay broad, got ${I.GROWTH_SLEEVE_NAMES} — concentration was measured worse on BOTH tails`);
+
+  // EVERY RETURN PATH, not just the one the default config happens to take.
+  // coreWeightMap has three: no-tilt, degenerate-total, and the normal tilted path. A
+  // mutation that dropped the split from the no-tilt branch survived a green suite
+  // because CORE_TILT defaults on, so that branch is never reached here.
+  const noTilt = require('child_process').execFileSync(process.execPath, ['-e', `
+    const I = require('${require('path').join(__dirname, 'server.js').replace(/\\/g, '/')}')._internals;
+    const w = I.coreWeightMap();
+    let g = 0, b = 0;
+    for (const [s, x] of Object.entries(w)) { if (I.isGrowthName(s)) g += x; else b += x; }
+    console.log(JSON.stringify({ g, b }));
+  `], { env: { ...process.env, CORE_HOLD_FRACTION: '0.5', GROWTH_SLEEVE_FRACTION: '0.70',
+               CORE_TILT: 'false' }, encoding: 'utf8', timeout: 180000 });
+  const nt = JSON.parse(noTilt.trim().split('\n').filter(l => l.startsWith('{')).pop());
+  near(nt.g, 0.70, 1e-9, 'the split must hold with the conviction tilt OFF as well');
+  near(nt.b, 0.30, 1e-9, 'on both sides');
+  for (const g of r.names) ok(r.basket.includes(g), `${g} must actually be in the live basket`);
+});
+
+check('a Venus swap cannot liquidate the sleeve', () => {
+  // Venus proposes the LONG-TERM half from CORE_BASKET_POOL and has no idea the growth
+  // half exists. Without re-folding, one routine daily model call would sell 70% of the
+  // account into the long-term basket.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const sets = (src.match(/CORE_HOLD_SYMBOLS\.push\(/g) || []).length;
+  const folded = (src.match(/CORE_HOLD_SYMBOLS\.push\(\.\.\.withGrowthSleeve\(/g) || []).length;
+  ok(sets >= 3, 'there must be several basket assignments to check');
+  eq(folded, sets, `${sets - folded} basket assignment(s) skip withGrowthSleeve()`);
+  const r = sleeveProbe(`
+    const merged = I.withGrowthSleeve(['AAPL','MSFT','JNJ','KO','PG','XOM']);
+    console.log(JSON.stringify({ merged, growth: I.growthNames() }));
+  `);
+  for (const g of r.growth) ok(r.merged.includes(g), `${g} must survive a proposal that omits it`);
+  for (const b of ['AAPL','MSFT','JNJ','KO','PG','XOM'])
+    ok(r.merged.includes(b), `${b} from the proposal must survive too`);
+  eq(new Set(r.merged).size, r.merged.length, 'and the union must be deduped');
+});
+
+check('the only stop is a catastrophe stop, and it is nowhere near normal movement', () => {
+  // MEASURED on this exact pool, weekly rebalance, 8 names:
+  //   no stop +38.3% CAGR / 55.3% maxDD   |   -5% stop +7.2% / 66.4%
+  //   -8% +8.2% / 63.3%   |   -12% +24.2% / 58.9%   |   -20% +39.9% / 55.4%
+  // A tight stop on a 60%-vol name sells at the bottom of an ordinary session and misses
+  // the bounce: five-sixths of the return gone AND a deeper drawdown. Only a level far
+  // outside normal movement was harmless.
+  ok(I.GROWTH_DISASTER_STOP >= 0.25,
+     `the catastrophe line must sit well outside the zone that did the damage, got ` +
+     `${(I.GROWTH_DISASTER_STOP * 100).toFixed(0)}% — anything at or under 20% was measured destructive`);
+  ok(I.GROWTH_DISASTER_STOP <= 0.9, 'but it must still exist');
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function growthDisasterPick'), src.indexOf('function maintainCoreHolding'));
+  ok(/for \(const sym of growthNames\(\)\)/.test(fn),
+     'it must apply to the growth sleeve ONLY — the long-term half is held through everything');
+  ok(/if \(upd && \(Date\.now\(\) - upd\) > MAX_PRICE_AGE_MS\) continue;/.test(fn),
+     'and never fire on a stale price');
+  ok(!/ATR_TRAIL|highestPnL|peak -/.test(fn),
+     'it must not be a trailing stop by another name');
+
+  const r = sleeveProbe(`
+    const g = I.growthNames()[0];
+    I.portfolio.coreHolding = {};
+    I.portfolio.coreHolding[g] = { qty: 10, avgPrice: 100, investedCash: 1000, openedAt: Date.now() };
+    const out = {};
+    for (const px of [95, 80, 70, 66, 64, 50]) {
+      I.marketData[g] = { price: px, prevClose: px, lastUpdate: Date.now(), history: [px] };
+      const p = I.growthDisasterPick();
+      out['p' + px] = p ? +p.down.toFixed(4) : null;
+    }
+    // a LONG-TERM name at the same loss must never be touched
+    I.portfolio.coreHolding.AAPL = { qty: 10, avgPrice: 100, investedCash: 1000, openedAt: Date.now() };
+    I.marketData.AAPL = { price: 50, prevClose: 50, lastUpdate: Date.now(), history: [50] };
+    out.base = I.growthDisasterPick() ? I.growthDisasterPick().sym : null;
+    console.log(JSON.stringify(out));
+  `);
+  eq(r.p95, null, 'a 5% fall must be ignored — that is a quiet day for these names');
+  eq(r.p80, null, 'so must 20%, which was measured harmless-to-helpful as a stop');
+  eq(r.p70, null, '30% must still be inside tolerance at a 35% line');
+  eq(r.p66, null, 'a 34% fall is still INSIDE a 35% line — the boundary must be exact');
+  ok(r.p64 !== null, 'but 36% must trigger');
+  near(r.p64, 0.36, 1e-9, 'and report the actual depth');
+  ok(r.p50 !== null, 'and so must 50%');
+  ok(r.base !== 'AAPL', 'a long-term holding down 50% must NOT be sold — that sleeve is held');
+});
+
+check('a catastrophe retires the name instead of repeatedly buying it back', () => {
+  // Without this the core would sell on the disaster line and top the same name straight
+  // back up on the next 60-second cycle, paying the spread each way, for ever.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/_growthRetired\.add\(dis\.sym\);/.test(src), 'the name must be retired on exit');
+  ok(/GROWTH_POOL\.filter\(x => !_growthRetired\.has\(x\)\)\.slice\(0, GROWTH_SLEEVE_NAMES\)/.test(src),
+     'and the sleeve must refill from the rest of the pool, not simply shrink');
+  // SCOPED. `rebasePeakForCoreFlow(-proceeds)` also appears in trimCoreStep, so an
+  // unscoped match stayed green while the disaster path dropped it entirely — and a core
+  // cash flow that skips the rebase is the documented way to manufacture a phantom
+  // drawdown, which then arms safe mode on an account that has lost nothing.
+  const dis = src.slice(src.indexOf('const dis = growthDisasterPick();'),
+                        src.indexOf('let pick = mostOverweightCore(tv);'));
+  ok(dis.length > 300, 'the disaster block must be findable');
+  ok(/rebasePeakForCoreFlow\(-proceeds\);/.test(dis),
+     'the cash coming back must rebase the drawdown peak like every other core flow');
+  ok(/portfolio\.cash \+= proceeds;/.test(dis), 'and the proceeds must reach the ledger');
+  ok(/delete portfolio\.coreHolding\[dis\.sym\];/.test(dis), 'and the whole lot must go, not a slice');
+  const r = sleeveProbe(`
+    const before = I.growthNames();
+    I.clearGrowthRetired();
+    console.log(JSON.stringify({ before, pool: I.GROWTH_POOL.length, n: I.GROWTH_SLEEVE_NAMES }));
+  `);
+  ok(r.pool > r.n,
+     `the pool (${r.pool}) must be larger than the sleeve (${r.n}) or a retirement cannot be refilled`);
+});
+
+check('the operator is told the odds before a dollar is committed', () => {
+  // This sleeve has a measured 39% drawdown and roughly a one-in-fifteen monthly hit rate
+  // out of sample. Shipping that quietly would be the dishonest version of doing what was
+  // asked. The boot banner states both, in the log, every time.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  ok(/GROWTH SLEEVE ON/.test(src), 'the banner must announce it');
+  ok(/max drawdown \.+ 39\.1%/.test(src), 'and state the measured drawdown');
+  ok(/6\.8% \(second half\)/.test(src), 'and the out-of-sample hit rate, not just the flattering one');
+  ok(/The second half is the honest number/.test(src), 'and say which one to believe');
+  ok(/does not predict/.test(src),
+     'and state plainly that it is not forecasting — the operator asked for prediction and ' +
+     'forty tested rules say it is not available');
 });
 
 // ════════════════════════════════════════════════════════════════════════════
