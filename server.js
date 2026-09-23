@@ -157,6 +157,13 @@ let _lastDigestDate = null;
 // So the account's own id is persisted alongside the numbers. If it changes, the state is
 // not about this account and its baselines are discarded rather than trusted.
 let _brokerAccountId = null;
+// Has the broker been asked yet, this process? loadState restores a snapshot that may be
+// hours or days stale, and rebalanceCapital() runs BEFORE syncFromBroker() in start().
+// On 2026-09-23 that ordering announced "✅ TRADING UNLOCKED — the holding side has earned
+// $2754.31" off restored numbers, and the sync re-locked it one line later. Nothing was
+// traded only because the sync happened to follow immediately; the gate had already
+// flipped, and a gate that opens on stale state is not a gate.
+let _brokerSynced = false;
 function startingCapital() {
   return (Number.isFinite(_startingCapital) && _startingCapital > 0) ? _startingCapital : START_CAPITAL;
 }
@@ -6675,6 +6682,10 @@ function tradingPhaseLocked() {
   if (!CORE_HOLD_ON) return false;          // no holding phase configured — nothing to gate behind
   const funds = tradingFundsAvailable();
   const wasUnlocked = !!capitalSystem.tradingUnlocked;
+  // NEVER OPEN ON STALE STATE. Locking on stale state is safe and stays allowed; only the
+  // transition to UNLOCKED waits for the broker, because that is the direction that can
+  // put money at risk on numbers nobody has checked.
+  if (!wasUnlocked && EXEC_BROKER_AUTH && !_brokerSynced) return true;
   if (!wasUnlocked && funds >= tradingUnlockThreshold()) {
     capitalSystem.tradingUnlocked = true;
     // NOT "steps down to CORE_HOLD_FRACTION" any more — that was the v11.52 behaviour
@@ -6882,11 +6893,55 @@ async function syncFromBroker() {
       if (accountIdentityChanged(_brokerAccountId, acct.id)) adoptNewAccount(acct);
       if (acct.id) _brokerAccountId = acct.id;
       const prev = portfolio.cash;
-      // Same reasoning as adoptBrokerCashDrift: the broker's cash balance CONTAINS the
-      // vaulted money, because vaulting never moved anything. Assigning it raw silently
-      // reversed every vault deposit on each boot while profitVault kept the credit —
-      // which is how a restart could show `vault $2700.00` and undiminished cash at once.
-      portfolio.cash = acct.cash - Math.max(0, capitalSystem.profitVault || 0);
+      // THE VAULT IS A SUBSET OF BROKER CASH. It is money sitting in the account that the
+      // trading side may not spend — so it can never exceed what the broker actually
+      // holds. v13.66.2 subtracted it without checking that invariant, and on an account
+      // carrying a PHANTOM vault (one created by the pre-v13.66 START_CAPITAL bug, whose
+      // matching debit was erased by earlier syncs) the subtraction drove ledger cash
+      // deeply negative. Observed live 2026-09-23: broker cash $945.79, vault $2,700.00,
+      // ledger cash -$1,754.21 — at which point coreTopUpQty's `Math.max(0, cash - 1)`
+      // returns zero for every name and THE HOLDING SIDE CAN NEVER BUY AGAIN.
+      //
+      // Worse, it was self-perpetuating: the negative cash was persisted, loadState's
+      // `restoredCash >= 0` test rejected it and fell back to START_CAPITAL, so the next
+      // boot restored $1,000 against a $2,700 vault, computed $2,754.31 of profit that did
+      // not exist, and announced "✅ TRADING UNLOCKED" before the broker was consulted.
+      //
+      // Reconciling is the fix, not clamping the symptom: a vault larger than the cash
+      // behind it is not a vault.
+      const vaultBefore = Math.max(0, capitalSystem.profitVault || 0);
+      // FIRST: IS THERE ANY LEGITIMATE VAULT AT ALL?
+      // The vault holds REALISED TRADING PROFIT. It cannot contain a cent before the
+      // trading side has closed its first position — and on this account the phase gate
+      // has never opened, so closedTrades is empty and every dollar in there was invented
+      // by the pre-v13.66 START_CAPITAL bug. Clamping such a vault to the broker's cash
+      // is not enough: on 2026-09-23 that would have left vault $945.79 and spendable cash
+      // $0.00, and the holding side would still have been unable to buy anything. The
+      // honest repair is to recognise it as fiction and remove it.
+      const realisedTrades = (portfolio.closedTrades || []).filter(t => !t.partial).length;
+      if (vaultBefore > 0 && realisedTrades === 0) {
+        console.warn(`[VAULT] ⚠️  Vault $${vaultBefore.toFixed(2)} on an account that has never ` +
+                     `closed a trade. The vault holds realised TRADING profit and the trading side ` +
+                     `has never opened a position, so this is residue from the pre-v13.66 ` +
+                     `START_CAPITAL bug. Clearing it — that money belongs in the market.`);
+        capitalSystem.profitVault = 0;
+        capitalSystem.lastVaultValue = 0;
+        queueSaveState();
+      }
+      // SECOND, as a backstop for the case where trades DO exist: a vault is cash sitting
+      // at the broker, so it can never exceed what the broker actually holds.
+      const vaultNow = Math.max(0, capitalSystem.profitVault || 0);
+      if (vaultNow > acct.cash) {
+        console.warn(`[VAULT] ⚠️  Vault $${vaultNow.toFixed(2)} exceeds the broker's entire ` +
+                     `cash balance of $${acct.cash.toFixed(2)} — it is not backed by anything. ` +
+                     `This is the residue of the pre-v13.66 START_CAPITAL bug, which credited the ` +
+                     `vault without a real debit. Reducing it to $${Math.max(0, acct.cash).toFixed(2)} ` +
+                     `so the holding side can deploy cash again.`);
+        capitalSystem.profitVault = Math.max(0, acct.cash);
+        queueSaveState();
+      }
+      portfolio.cash = Math.max(0, acct.cash - Math.max(0, capitalSystem.profitVault || 0));
+      _brokerSynced = true;
       // FIRST BOOT ONLY. detectStartingCapital refuses to overwrite a value restored
       // from state, so a grown account never silently redefines its own baseline.
       detectStartingCapital(Number.isFinite(acct.equity) ? acct.equity : acct.cash);
@@ -8106,7 +8161,19 @@ function loadState() {
 
   try {
     const restoredCash = state.cash;
-    portfolio.cash = (Number.isFinite(restoredCash) && restoredCash >= 0) ? restoredCash : START_CAPITAL;
+    // A NEGATIVE SAVED CASH IS CORRUPTION, NOT AN ABSENT VALUE. Falling back to
+    // START_CAPITAL here is what turned one bad write into a permanent loop: a $10,000
+    // account restored $1,000 of invented cash on every boot, which then read as profit.
+    // Absent means absent (first run); negative means the last write was wrong, and zero
+    // is the only honest answer until the broker says otherwise.
+    if (!Number.isFinite(restoredCash))    portfolio.cash = START_CAPITAL;
+    else if (restoredCash < 0) {
+      console.warn(`[LOAD] ⚠️  Saved cash was $${restoredCash.toFixed(2)} — negative cash is ` +
+                   `corruption, not a balance. Starting from $0 and letting the broker sync ` +
+                   `supply the truth rather than inventing $${START_CAPITAL}.`);
+      portfolio.cash = 0;
+    }
+    else portfolio.cash = restoredCash;
     portfolio.longPositions   = state.longPositions  ?? {};
     portfolio.shortPositions  = state.shortPositions ?? {};
     portfolio.trades          = state.trades          ?? [];
@@ -8654,6 +8721,22 @@ const MERCURY_MIN_SAMPLES = Math.max(10, parseInt(process.env.MERCURY_MIN_SAMPLE
 // the same Bonferroni logic used elsewhere in this project: a horizon must clear this
 // BSS before any of its skill counts at all.
 const MERCURY_SKILL_FLOOR = Math.max(0, parseFloat(process.env.MERCURY_SKILL_FLOOR || '0.02'));
+// A MODEL CAN BE USELESS BY CHANCE. IT CANNOT BE THIS BAD BY CHANCE.
+// A Brier skill score near zero means "no edge" and is the expected, honest outcome. A
+// score of -0.5 means the model is half again WORSE than simply predicting the base rate,
+// and hundreds of samples of noise cannot get there — something upstream is broken.
+// Observed live 2026-09-23: `30m 493 bss -3.280`, i.e. more than four times worse than the
+// base rate, which for probabilities bounded in [0,1] means the model was confidently
+// wrong almost every time. The cause was the stale-resolution bug fixed in v13.66.3:
+// forecasts scored days after their window, across weekends, producing labels that had
+// nothing to do with the 30 minutes they were predicting.
+//
+// The skill gate did its job — confidence stayed 0 and nothing traded. But the poisoned
+// weights and counters survive in the state file and would keep the horizon dead for ever,
+// so the model heals itself instead of waiting for someone to notice. It is NOT inverted:
+// a reliably anti-predictive model would be free money, which it is not — it is an
+// artifact of bad labels, and inverting an artifact yields another artifact.
+const MERCURY_BROKEN_BSS = parseFloat(process.env.MERCURY_BROKEN_BSS || '-0.5');
 // Inputs older than this are not evidence about now.
 const MERCURY_FRESH_MS = 120000;
 // How long a computed forecast may be reused. This was 2000ms against a 2000ms main
@@ -8862,6 +8945,21 @@ function createMercury() {
     if (!s || s.n < MERCURY_MIN_SAMPLES) return 0;
     if (!(s.brierBase > 0)) return 0;
     const bss = 1 - (s.brier / s.brierBase);
+    // Self-heal a horizon whose record is not merely unskilled but broken (see
+    // MERCURY_BROKEN_BSS). Requires a real sample so one unlucky stretch cannot trigger it.
+    if (s.n >= MERCURY_MIN_SAMPLES * 2 && Number.isFinite(bss) && bss < MERCURY_BROKEN_BSS) {
+      console.warn(`[MERCURY] ⚠️  ${hKey} scored a Brier skill of ${bss.toFixed(3)} over ${s.n} ` +
+                   `resolved forecasts. Noise cannot reach that — this is corrupted training ` +
+                   `data, almost certainly forecasts scored outside their window before ` +
+                   `v13.66.3. Discarding this horizon's weights and history and starting it ` +
+                   `clean; it will simply have no opinion until it has earned one again.`);
+      models[hKey].up   = new OnlineLogistic(MERCURY_DIM, { lr: 0.03, l2: 3e-3, names: MERCURY_FEATURES });
+      models[hKey].down = new OnlineLogistic(MERCURY_DIM, { lr: 0.03, l2: 3e-3, names: MERCURY_FEATURES });
+      Object.assign(s, { n: 0, brier: 0, brierBase: 0, ups: 0, downs: 0, hits: 0, calls: 0,
+                         sumAbsErr: 0, realisedSum: 0, predictedSum: 0 });
+      for (const id of Object.keys(open)) if (open[id].h === hKey) delete open[id];
+      return 0;
+    }
     if (!Number.isFinite(bss) || bss <= MERCURY_SKILL_FLOOR) return 0;
     // Cap at 0.6: a Brier skill score above that on financial direction is a bug or a
     // leak, not an edge, and capping means discovering one cannot blow up sizing.
@@ -10936,7 +11034,7 @@ module.exports = {
     evaluateAndTrade, updateSymbolMetrics, buildIntelSummary, buildStateObject,
     // ☿ v13.66 — the forecaster and the decision layer
     mercury, MERCURY_ON, MERCURY_HORIZONS, MERCURY_FEATURES, MERCURY_DIM, MERCURY_BAND,
-    MERCURY_MIN_SAMPLES, MERCURY_SKILL_FLOOR, MERCURY_PRIOR_K, MERCURY_COND_MEAN,
+    MERCURY_MIN_SAMPLES, MERCURY_SKILL_FLOOR, MERCURY_PRIOR_K, MERCURY_COND_MEAN, MERCURY_BROKEN_BSS,
     mercuryDecide, mercuryScore, mercuryBestAlternative, mercuryPeakPressure,
     mercuryExitPass, mercuryTick, mercurySkillLevel, allocationShortTarget,
     ALLOC_SHORT_TARGET, ALLOC_FULL_SKILL, MERCURY_EDGE_COST_MULT, MERCURY_RISK_AVERSION,
@@ -10953,6 +11051,8 @@ module.exports = {
     accountIdentityChanged, adoptNewAccount, logCapitalDependentConfig,
     DYNAMIC_MIN_PRICE, DYNAMIC_MAX_PRICE,
     getBrokerAccountId: () => _brokerAccountId,
+    getBrokerSynced: () => _brokerSynced,
+    setBrokerSynced: (v) => { _brokerSynced = !!v; },
     setBrokerAccountId: (v) => { _brokerAccountId = v; },
     setStartingCapital: (v) => { _startingCapital = v; },
     getRecoveredSymbols: () => _recoveredSymbols,

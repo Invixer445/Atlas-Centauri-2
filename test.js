@@ -6190,8 +6190,24 @@ check('vaulting money does not invent money, or invent a drawdown', () => {
                   .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
     ok(/const delta = brokerMirror\.cash - \(portfolio\.cash \+ Math\.max\(0, capitalSystem\.profitVault \|\| 0\)\);/.test(src),
        'drift must be measured against ledger cash PLUS the vault');
-    ok(/portfolio\.cash = acct\.cash - Math\.max\(0, capitalSystem\.profitVault \|\| 0\);/.test(src),
+    ok(/portfolio\.cash = Math\.max\(0, acct\.cash - Math\.max\(0, capitalSystem\.profitVault \|\| 0\)\);/.test(src),
        'and the boot sync must not silently reverse every vault deposit');
+    // v13.66.4: THE VAULT IS A SUBSET OF BROKER CASH. Subtracting it without checking that
+    // invariant drove ledger cash to -$1,754.21 on an account carrying a phantom vault,
+    // and coreTopUpQty's `Math.max(0, cash - 1)` then returns zero for every name — the
+    // holding side could never buy again.
+    ok(/if \(vaultNow > acct\.cash\) \{/.test(src),
+       'a vault larger than the broker cash behind it must be reconciled, not subtracted');
+    // AND THE STRONGER TEST FIRST. Clamping a phantom vault to broker cash is not enough:
+    // on 2026-09-23 that leaves vault $945.79 and spendable cash $0.00, and the holding
+    // side is still frozen. The vault holds REALISED TRADING profit, so on an account that
+    // has never closed a trade it cannot legitimately hold anything at all.
+    ok(/if \(vaultBefore > 0 && realisedTrades === 0\) \{/.test(src),
+       'a vault on an account with no closed trades must be cleared outright');
+    ok(/const realisedTrades = \(portfolio\.closedTrades \|\| \[\]\)\.filter\(t => !t\.partial\)\.length;/.test(src),
+       'and partial take-profit slices must not count as closed trades');
+    ok(/capitalSystem\.profitVault = Math\.max\(0, acct\.cash\);/.test(src),
+       'and reduced to what actually exists');
     ok(/let value = portfolio\.cash \+ Math\.max\(0, capitalSystem\.profitVault \|\| 0\);/.test(src),
        'total equity must count the vault');
 
@@ -6206,6 +6222,138 @@ check('vaulting money does not invent money, or invent a drawdown', () => {
     c.profitVault = saved.pv; p.cash = saved.cash;
     p.coreHolding = saved.core; resetBook();
   }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  v13.66.4 — THE CORRUPTION LOOP, FROM THE 2026-09-23 LOG
+// ════════════════════════════════════════════════════════════════════════════
+group('v13.66.4 — a phantom vault that froze the holding side');
+
+check('a vault bigger than the cash behind it is reconciled, not subtracted', () => {
+  // THE EXACT LIVE NUMBERS. Broker cash $945.79, restored vault $2,700.00. v13.66.2
+  // subtracted the vault from broker cash on the assumption that it represented a real
+  // prior debit. On an account carrying a PHANTOM vault — one created by the pre-v13.66
+  // START_CAPITAL bug, whose matching debit was erased by earlier syncs — the subtraction
+  // produced ledger cash of -$1,754.21. coreTopUpQty spends Math.max(0, cash - 1), so it
+  // returned zero for every name: THE HOLDING SIDE COULD NEVER BUY AGAIN.
+  const c = I.capitalSystem, p = I.portfolio;
+  const saved = { pv: c.profitVault, cash: p.cash, core: p.coreHolding };
+  try {
+    // The invariant: the vault is cash sitting at the broker, so it can never exceed it.
+    const brokerCash = 945.79, vault = 2700;
+    const reconciled = Math.min(vault, brokerCash);
+    const ledger = Math.max(0, brokerCash - reconciled);
+    eq(ledger, 0, 'reconciling must never leave negative spendable cash');
+    ok(reconciled <= brokerCash, 'and the vault must never exceed the cash behind it');
+
+    // Behavioural: negative cash freezes the core. Runs in a child with the core ON,
+    // because coreTopUpQty returns 0 at its first line when CORE_HOLD_ON is false — an
+    // in-process assertion here would pass for entirely the wrong reason.
+    const probe = coreProbe(`
+      console.log(JSON.stringify({
+        negative: I.coreTopUpQty(100, 10000, 0, -1754.21, 16, null),
+        real:     I.coreTopUpQty(100, 10000, 0,   945.79, 16, null),
+        zero:     I.coreTopUpQty(100, 10000, 0,        0, 16, null),
+      }));
+    `);
+    eq(probe.negative, 0, 'premise: with negative cash the core cannot buy a single share');
+    eq(probe.zero, 0, 'nor with none');
+    ok(probe.real > 0,
+       'but with real cash it can — that capability is exactly what the phantom vault destroyed');
+
+    const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                  .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+    ok(/portfolio\.cash = Math\.max\(0, acct\.cash - Math\.max\(0, capitalSystem\.profitVault \|\| 0\)\);/.test(src),
+       'the sync must never be able to produce negative ledger cash');
+    ok(/if \(vaultNow > acct\.cash\) \{/.test(src),
+       'and an unbacked vault must be detected');
+    ok(/if \(vaultBefore > 0 && realisedTrades === 0\) \{/.test(src),
+       'a vault with no closed trade behind it must be cleared, not merely clamped — ' +
+       'clamping leaves spendable cash at zero and the core still frozen');
+    ok(/\[VAULT\] ⚠️/.test(require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')),
+       'loudly — silent accounting repairs are how this went unnoticed for days');
+  } finally { c.profitVault = saved.pv; p.cash = saved.cash; p.coreHolding = saved.core; }
+});
+
+check('corrupt saved cash does not become invented cash', () => {
+  // THE LOOP. The negative cash above was persisted; loadState's `restoredCash >= 0` test
+  // rejected it and fell back to START_CAPITAL, so a $10,000 account restored $1,000 of
+  // invented cash on every boot — which then read as profit against the $2,700 vault and
+  // announced "✅ TRADING UNLOCKED — the holding side has earned $2754.31". One bad write
+  // became a permanent cycle: sync → negative → save → reject → invent → phantom unlock.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(!/portfolio\.cash = \(Number\.isFinite\(restoredCash\) && restoredCash >= 0\) \? restoredCash : START_CAPITAL;/.test(src),
+     'a negative saved cash must not fall through to START_CAPITAL');
+  ok(/if \(!Number\.isFinite\(restoredCash\)\)    portfolio\.cash = START_CAPITAL;/.test(src),
+     'absent means absent — that is the only case START_CAPITAL applies to');
+  ok(/portfolio\.cash = 0;/.test(src), 'negative means corrupt, and zero is the honest answer');
+  // The distinction matters: inventing $1,000 on a $10,000 account is the same class of
+  // bug v12.65 was written to remove.
+  ok(/negative cash is/.test(require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')),
+     'and it must say so in the log');
+});
+
+check('the phase gate does not open on state the broker has not confirmed', () => {
+  // rebalanceCapital() runs at step 4 of start(); syncFromBroker() runs at step 4b. So the
+  // gate was evaluated against a restored snapshot that could be hours stale, and on
+  // 2026-09-23 it announced "✅ TRADING UNLOCKED — earned $2754.31" off numbers the broker
+  // had never seen. The sync re-locked it one line later, so nothing traded — but a gate
+  // that opens on stale state is not a gate, and the ordering is not guaranteed.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/if \(!wasUnlocked && EXEC_BROKER_AUTH && !_brokerSynced\) return true;/.test(src),
+     'the transition to UNLOCKED must wait for the first broker sync');
+  ok(/_brokerSynced = true;/.test(src), 'and the sync must record that it happened');
+  // LOCKING on stale state stays allowed — only the direction that puts money at risk waits.
+  const fn = src.slice(src.indexOf('function tradingPhaseLocked'), src.indexOf('function tradingCapitalAllowed'));
+  const iGuard = fn.indexOf('!_brokerSynced');
+  const iRelock = fn.indexOf('wasUnlocked && funds < tradingUnlockThreshold()');
+  ok(iGuard > 0 && iRelock > iGuard,
+     'the guard must sit on the unlock path only, never on the re-lock path');
+
+  const prev = I.getBrokerSynced();
+  try {
+    I.setBrokerSynced(false);
+    if (I.EXEC_BROKER_AUTH) {
+      ok(I.tradingPhaseLocked(), 'with no sync yet, the gate must report LOCKED whatever the numbers say');
+    }
+  } finally { I.setBrokerSynced(prev); }
+});
+
+check('a horizon that is not merely unskilled but broken heals itself', () => {
+  // `30m 493 bss -3.280` from the live log. A Brier skill near zero means "no edge" and is
+  // the honest expected outcome. -3.28 means more than four times WORSE than predicting the
+  // base rate, which for probabilities in [0,1] means confidently wrong almost every time.
+  // Hundreds of samples of noise cannot reach that: it was the stale-resolution bug fixed
+  // in v13.66.3, scoring forecasts days after their window across weekends.
+  //
+  // The skill gate held — confidence stayed 0 and nothing traded. But the poisoned weights
+  // survive in the state file and would keep the horizon dead for ever.
+  const snap = snapMercury();
+  try {
+    ok(I.MERCURY_BROKEN_BSS < 0 && I.MERCURY_BROKEN_BSS > -1,
+       `the broken threshold must be clearly below noise but above absurd, got ${I.MERCURY_BROKEN_BSS}`);
+    const sc = I.mercury.getScore().immediate;
+    // Merely unskilled: must be left alone, not "healed".
+    sc.n = 493; sc.brierBase = 100; sc.brier = 101; sc.ups = 150; sc.downs = 150;
+    eq(I.mercury.skillOf('immediate'), 0, 'a BSS of -0.01 scores zero skill');
+    eq(I.mercury.getScore().immediate.n, 493,
+       'but an unskilled horizon must NOT be reset — no edge is the expected outcome, not a fault');
+    // Broken: must be discarded.
+    sc.brier = 428;                                     // bss = -3.28, the live number
+    near(1 - sc.brier / sc.brierBase, -3.28, 1e-9, 'premise: the live BSS');
+    eq(I.mercury.skillOf('immediate'), 0, 'it must still score zero skill');
+    eq(I.mercury.getScore().immediate.n, 0,
+       'and the horizon must be reset — noise cannot be four times worse than the base rate');
+    eq(I.mercury.getModels().immediate.up.n, 0, 'the weights must go too');
+    // A small sample must never trigger it, however ugly.
+    const sc2 = I.mercury.getScore().short;
+    sc2.n = I.MERCURY_MIN_SAMPLES; sc2.brierBase = 10; sc2.brier = 90;
+    I.mercury.skillOf('short');
+    eq(I.mercury.getScore().short.n, I.MERCURY_MIN_SAMPLES,
+       'one short ugly stretch must not wipe a horizon — it needs a real sample first');
+  } finally { restoreMercury(snap); }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
