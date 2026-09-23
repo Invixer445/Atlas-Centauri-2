@@ -91,6 +91,7 @@ share one.
 | `GROWTH_SLEEVE_FRACTION` | `0` (off) | ☢️ Puts this share of the core into high-volatility names. `0.70` is the aggressive setting. **Measured: 39% max drawdown, worst month −28%, and roughly a 1-in-15 chance of +20% in any month out of sample.** Read §8 before turning it on. |
 | `GROWTH_SLEEVE_NAMES` | `8` | How many. Breadth was measured better on BOTH tails — do not narrow it. |
 | `GROWTH_DISASTER_STOP` | `0.35` | Catastrophe exit only. Tighter was measured to cost five-sixths of the return AND deepen the drawdown. |
+| `GROWTH_BUDGET_TOLERANCE` | `1.15` | How far the sleeve may drift above its share of invested cash before top-ups stop. Without this the core buys more of whatever is falling. |
 | `ALPACA_DATA_FEED` | `iex` | `sip` needs a paid data plan. |
 | `WS_MAX_SYMBOLS` | `30` | The free IEX tier's subscription cap. Exceeding it is **all-or-nothing** — the whole stream is rejected and the bot goes dark. |
 | `ATLAS_DATA_DIR` | — | Manual override for the state directory. Only needed off Railway. |
@@ -236,3 +237,31 @@ rest of the pool.
 
 `GROWTH_SLEEVE_FRACTION=0`. The next core cycle rebalances back toward the long-term
 basket on its own; nothing is force-sold.
+
+### Three things the sleeve does NOT do
+
+**It does not keep buying as it falls.** Sizing against live equity makes it a
+rebalancing rule, and a rebalancing rule funds the faller out of trims of the winners —
+70% quietly becomes 85% exactly when that is most dangerous. Top-ups stop once the sleeve
+holds more than `GROWTH_BUDGET_TOLERANCE` × its share of *invested cost*. Cost basis, not
+market value, because market value falls precisely when the risk rises.
+
+**It does not dilute the long-term half.** Venus proposes 16 names for the durable sleeve
+and knows nothing about the growth half, so a naive union is 24 names and each long-term
+position drops to $182 on a $10,000 account. The union is capped at
+`CORE_BASKET_TARGET_NAMES`, and it is always the long-term half that gets trimmed, never
+the sleeve.
+
+**It does not trip any risk gate.** Safe mode (10%), the emergency halt (20%), the daily
+loss limit, portfolio heat and the consecutive-loss switch are all computed on
+`tradableValue()` — total equity *minus* the core. With a 97% core the trading book is a
+rounding error, so **all five will report "normal" throughout a 39% drawdown.** That is
+correct for a holding meant to be held, and it would be a terrible thing to discover
+afterwards. `riskSystem.coreDrawdown` gauges it and the log warns past 5%:
+
+```bash
+railway logs | grep "\[RISK\] Holding side"
+```
+
+Nothing halts on it. Reacting to a core drawdown is the behaviour this project has
+measured losing, repeatedly.

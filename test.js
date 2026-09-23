@@ -6543,6 +6543,95 @@ check('the operator is told the odds before a dollar is committed', () => {
      'forty tested rules say it is not available');
 });
 
+check('the sleeve does not dilute the long-term half into dust', () => {
+  // Venus proposes CORE_BASKET_TARGET_NAMES (16) for the long-term half and knows nothing
+  // about the sleeve, so a naive union is 24 names — past CORE_BASKET_MAX_NAMES, and it
+  // cuts each long-term name to 1.88% of the core: $182 on a $10,000 account. The 30%
+  // sleeve is meant to be the DURABLE half; sixteen names at $182 is not durability.
+  const r = sleeveProbe(`
+    const venus16 = ['AAPL','MSFT','PG','KO','JNJ','UNH','JPM','V','XOM','CVX','CAT','HON','GOOGL','META','AMZN','HD'];
+    const m = I.withGrowthSleeve(venus16);
+    const w = I.coreWeightMap(m);
+    const g = m.filter(x => I.isGrowthName(x)), b = m.filter(x => !I.isGrowthName(x));
+    console.log(JSON.stringify({ n: m.length, gn: g.length, bn: b.length,
+      perBase: w[b[0]], perGrowth: w[g[0]], target: I.CORE_BASKET_TARGET_NAMES,
+      max: I.CORE_BASKET_MAX_NAMES, allGrowthKept: g.length === I.growthNames().length }));
+  `);
+  eq(r.n, r.target, `the union must stay at the target size, got ${r.n}`);
+  ok(r.n <= r.max, 'and never exceed the hard maximum');
+  ok(r.allGrowthKept, 'the sleeve is never the half that gets trimmed');
+  ok(r.bn >= 6, `the long-term half must keep real breadth, got ${r.bn} names`);
+  // At $10,000 with a 97% core, each long-term name must be a real position.
+  const perBase$ = 9700 * r.perBase;
+  ok(perBase$ > 300,
+     `each long-term name is $${perBase$.toFixed(0)} — under $300 it is dust, not durability`);
+  near(r.perGrowth * r.gn, 0.70, 1e-9, 'and the 70/30 split must survive the trim');
+});
+
+check('the sleeve cannot grow by being bought as it falls', () => {
+  // Sizing as a percentage of LIVE equity makes this a rebalancing rule, and a rebalancing
+  // rule buys more of whatever is falling. On mega-caps that is mildly helpful (+22.9%
+  // quarterly vs +21.6% never). On names with a measured 52-55% drawdown it is the
+  // mechanism that turns a bad month into a far worse one: every trim of a winner funds
+  // another purchase of the faller, and 70% quietly becomes 85%.
+  ok(I.GROWTH_BUDGET_TOLERANCE >= 1 && I.GROWTH_BUDGET_TOLERANCE <= 1.5,
+     `the drift allowance must be small, got ${I.GROWTH_BUDGET_TOLERANCE}`);
+  const r = sleeveProbe(`
+    const g = I.growthNames();
+    const mk = (syms, each) => { const h = {}; for (const s of syms) h[s] = { qty: 1, avgPrice: each, investedCash: each, openedAt: 1 }; return h; };
+    const base = ['AAPL','MSFT','JNJ','KO','PG','XOM','JPM','V'];
+    const out = {};
+    // At target: 70% of invested cash in the sleeve -> must keep buying.
+    I.portfolio.coreHolding = { ...mk(g, 70/g.length*10), ...mk(base, 30/base.length*10) };
+    out.atTarget = I.growthSleeveOverBudget();
+    // Drifted to 85% of cost basis -> must stop.
+    I.portfolio.coreHolding = { ...mk(g, 85/g.length*10), ...mk(base, 15/base.length*10) };
+    out.drifted = I.growthSleeveOverBudget();
+    // And the picker must then skip every growth name.
+    for (const s of [...g, ...base]) I.marketData[s] = { price: 10, prevClose: 10, lastUpdate: Date.now(), history: [10] };
+    const pick = I.mostUnderweightCore();
+    out.picked = pick ? pick.sym : null;
+    out.pickedIsGrowth = pick ? I.isGrowthName(pick.sym) : null;
+    out.empty = I.growthSleeveOverBudget.call(null) === false || true;
+    I.portfolio.coreHolding = {};
+    out.noHoldings = I.growthSleeveOverBudget();
+    console.log(JSON.stringify(out));
+  `);
+  eq(r.atTarget, false, 'at its target share the sleeve must keep being funded');
+  eq(r.drifted, true, 'past the tolerance it must stop');
+  eq(r.pickedIsGrowth, false,
+     `over budget, the buy side must fund the long-term half instead — it picked ${r.picked}`);
+  eq(r.noHoldings, false, 'an empty book must not read as over budget');
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/if \(skipGrowth && isGrowthName\(sym\)\) continue;/.test(src),
+     'the check must be wired into the name picker, not merely defined');
+  ok(/lot && lot\.investedCash/.test(src),
+     'and measured on COST BASIS — market value falls exactly when the danger rises');
+});
+
+check('a core drawdown is visible even though nothing halts on it', () => {
+  // Every gate — safe mode 10%, emergency 20%, daily loss, heat, consecutive losses — is
+  // computed on tradableValue(), i.e. total MINUS the core. With a 97% core the trading
+  // book is a rounding error, so all five report "normal" while the money sits in a 39%
+  // hole. That is correct for a holding meant to be held, and a terrible thing for the
+  // operator to be unable to see.
+  ok('corePeak' in I.riskSystem && 'coreDrawdown' in I.riskSystem,
+     'the holding side must have its own gauge');
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/riskSystem\.corePeak = Math\.max\(riskSystem\.corePeak \|\| 0, _coreVal\);/.test(src),
+     'it must track its own high-water mark');
+  ok(/riskSystem\.coreDrawdown > 0\.05/.test(src), 'and warn once it is meaningful');
+  // It must be a GAUGE, not a trigger. Reacting to a core drawdown is the behaviour this
+  // project has measured losing over and over.
+  ok(!/coreDrawdown[^)]*\)\s*\{[\s\S]{0,200}?(emergencyStop = true|safeMode = true|closeLong|trimCoreStep)/.test(src),
+     'nothing may halt or sell on a core drawdown');
+  const warn = src.slice(src.indexOf('riskSystem.coreDrawdown > 0.05'));
+  ok(/will read "normal" throughout this/.test(warn.slice(0, 900)),
+     'and the warning must say plainly that the other gates will look fine');
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 console.log(`\n${'─'.repeat(60)}`);
 console.log(`${passed} passed, ${failed} failed`);

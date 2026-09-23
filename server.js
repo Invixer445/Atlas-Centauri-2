@@ -2429,6 +2429,16 @@ let riskSystem = {
   dailyResetDate:   null,
   peakValue:        START_CAPITAL,
   peakTotalValue:   START_CAPITAL,   // account-wide peak incl. core (see the emergency backstop)
+  // THE HOLDING SIDE'S OWN DRAWDOWN, MEASURED AND REPORTED — NOT ACTED ON.
+  // Every existing gate (safeMode 10%, emergency 20%, daily loss, heat, consecutive
+  // losses) is computed on tradableValue() — total MINUS the core. With a 97% core the
+  // trading book is a rounding error, so all five report "normal" while the money is in
+  // a 39% hole. That is the correct behaviour for a holding that is meant to be held,
+  // and it is a terrible thing for the operator to be unable to see. So it is gauged
+  // here and printed; nothing halts on it, because reacting to a core drawdown is the
+  // one behaviour this project has measured losing over and over.
+  corePeak:         0,
+  coreDrawdown:     0,
   consecutiveLosses:0,           // kill-switch counter
   maxConsecutiveLosses: 4,       // halt after 4 straight losses
   lossHaltUntil:    0            // v11.19: when that halt actually expires (see LOSS_HALT_MS)
@@ -2774,6 +2784,32 @@ const GROWTH_POOL = (process.env.GROWTH_POOL || WATCHLISTS.nasdaq.join(','))
 const GROWTH_DISASTER_STOP = Math.max(0.15, Math.min(0.9,
   parseFloat(process.env.GROWTH_DISASTER_STOP || '0.35')));
 
+// HOW FAR THE SLEEVE MAY DRIFT ABOVE ITS SHARE BEFORE TOP-UPS STOP.
+// Sizing the sleeve as a percentage of LIVE equity makes it a rebalancing rule, and a
+// rebalancing rule buys more of whatever is falling. On mega-caps that is mildly helpful
+// and measured so (+22.9% quarterly vs +21.6% never). On names with a measured 52-55%
+// drawdown it is the mechanism that turns a bad month into a much worse one: every trim
+// of a winner funds another purchase of the faller, and 70% quietly becomes 85%.
+// Cost basis, not market value, because market value falls exactly when the danger rises.
+const GROWTH_BUDGET_TOLERANCE = Math.max(1, Math.min(2,
+  parseFloat(process.env.GROWTH_BUDGET_TOLERANCE || '1.15')));
+
+// True when the sleeve has already absorbed more than its share of the money actually
+// put into the core. Consulted by the buy side only — nothing is ever force-sold.
+function growthSleeveOverBudget() {
+  if (!GROWTH_SLEEVE_ON) return false;
+  const h = portfolio.coreHolding || {};
+  let sleeve = 0, total = 0;
+  for (const [sym, lot] of Object.entries(h)) {
+    const c = Number(lot && lot.investedCash);
+    if (!Number.isFinite(c) || c <= 0) continue;
+    total += c;
+    if (isGrowthName(sym)) sleeve += c;
+  }
+  if (!(total > 0)) return false;
+  return (sleeve / total) > GROWTH_SLEEVE_FRACTION * GROWTH_BUDGET_TOLERANCE;
+}
+
 // Names the disaster stop has retired, so one is not bought straight back on the next
 // cycle — the basket is rebuilt from growthNames() every time it is needed.
 const _growthRetired = new Set();
@@ -2809,7 +2845,15 @@ function withGrowthSleeve(base) {
   if (!GROWTH_SLEEVE_ON) return [...(base || [])];
   const g = growthNames();
   const keep = (base || []).filter(x => !g.includes(x));
-  return [...new Set([...g, ...keep])];
+  // THE UNION MUST STILL BE A BASKET, NOT A PILE. Venus proposes
+  // CORE_BASKET_TARGET_NAMES (16) for the long-term half and knows nothing about the
+  // sleeve, so a naive union is 16 + 8 = 24 — past CORE_BASKET_MAX_NAMES, and it cuts
+  // each long-term name to 1.88% of the core, or $182 on a $10,000 account. The 30%
+  // sleeve is supposed to be the durable half; spreading it over sixteen names at $182
+  // each is not durability, it is dust. Keep the total at the configured target so the
+  // long-term half stays meaningful: 8 growth + 8 base.
+  const room = Math.max(1, CORE_BASKET_TARGET_NAMES - g.length);
+  return [...new Set([...g, ...keep.slice(0, room)])];
 }
 
 const CORE_HOLD_SYMBOLS = (process.env.CORE_HOLD_SYMBOLS ||
@@ -2818,10 +2862,6 @@ const CORE_HOLD_SYMBOLS = (process.env.CORE_HOLD_SYMBOLS ||
 // Fold the growth names in immediately. Without this, switching the sleeve on would do
 // nothing until Venus's next basket proposal — up to a day later, and only if the
 // 30-day minimum hold happened to have expired.
-if (GROWTH_SLEEVE_ON) {
-  const base = [...CORE_HOLD_SYMBOLS];
-  CORE_HOLD_SYMBOLS.length = 0; CORE_HOLD_SYMBOLS.push(...withGrowthSleeve(base));
-}
 const CORE_HOLD_SYMBOL   = CORE_HOLD_SYMBOLS[0];   // back-compat for single-name callers
 const CORE_HOLD_FRACTION = Math.max(0, Math.min(0.9, parseFloat(process.env.CORE_HOLD_FRACTION || '0')));
 const CORE_HOLD_ON       = CORE_HOLD_FRACTION > 0;
@@ -3045,6 +3085,16 @@ const CORE_BASKET_MAX_NAMES = Math.max(1,
 // $5 fractional minimum, so this is safe at the current account size and at any larger one.
 const CORE_BASKET_TARGET_NAMES = Math.max(1, Math.min(CORE_BASKET_MAX_NAMES,
   parseInt(process.env.CORE_BASKET_TARGET_NAMES || '16', 10)));
+
+// Fold the growth names into the starting basket. Placed HERE, after
+// CORE_BASKET_TARGET_NAMES, because withGrowthSleeve caps the union against it and a
+// const in its temporal dead zone throws rather than reading as undefined. Without this
+// fold, switching the sleeve on would do nothing until Venus's next proposal — up to a
+// day later, and only if the 30-day minimum hold had expired.
+if (GROWTH_SLEEVE_ON) {
+  const base = [...CORE_HOLD_SYMBOLS];
+  CORE_HOLD_SYMBOLS.length = 0; CORE_HOLD_SYMBOLS.push(...withGrowthSleeve(base));
+}
 
 // THE BASKET MUST BE CHOSEN FROM A QUALITY POOL, NOT THE TRADING WATCHLIST.
 // v12.63 widened the basket to 16 on a measurement run over 21 LIQUID LARGE-CAPS. The
@@ -6078,7 +6128,12 @@ function mostUnderweightCore() {
   const w = coreWeightMap();
   const n = Math.max(1, CORE_HOLD_SYMBOLS.length);
   let pick = null, worst = Infinity;
+  // If the sleeve has already absorbed more than its share of invested cash, stop feeding
+  // it. Every dollar then goes to the long-term half instead — which is the only thing
+  // standing between a 39% drawdown and a much deeper one.
+  const skipGrowth = growthSleeveOverBudget();
   for (const sym of CORE_HOLD_SYMBOLS) {
+    if (skipGrowth && isGrowthName(sym)) continue;
     const px = marketData[sym]?.price;
     if (!Number.isFinite(px) || px <= 0) continue;
     const upd = marketData[sym].lastUpdate;
@@ -7436,6 +7491,14 @@ function logPerformanceDigest() {
   const deployed = total > 0 ? (core / total) * 100 : 0;
   console.log(`[PERF] $${total.toFixed(2)}  ·  ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} ` +
               `(${pctMe >= 0 ? '+' : ''}${pctMe.toFixed(2)}%) since $${base.toFixed(0)}${bench}`);
+  if (riskSystem.coreDrawdown > 0.05) {
+    console.warn(`[RISK] Holding side is ${(riskSystem.coreDrawdown * 100).toFixed(1)}% below its high ` +
+      `of $${(riskSystem.corePeak || 0).toFixed(2)}. NOTE: safe mode, the emergency halt, the daily ` +
+      `loss limit and portfolio heat are all computed on the TRADING book, which is empty — they ` +
+      `will read "normal" throughout this. Nothing halts on a core drawdown, by design: reacting ` +
+      `to one is the behaviour this project has measured losing repeatedly.` +
+      (GROWTH_SLEEVE_ON ? ` The growth sleeve's measured drawdown is 39%.` : ''));
+  }
   console.log(`[PERF] ${deployed.toFixed(1)}% invested across ${Object.keys(portfolio.coreHolding || {}).length} names` +
               `  ·  dividends collected $${_dividendsTotal.toFixed(2)}` +
               `  ·  typical daily swing on this basket is about ±$${(total * BASKET_DAILY_SD).toFixed(2)}`);
@@ -9997,6 +10060,13 @@ function evaluateAndTrade() {
   // Account-wide backstop, including the core. Deliberately a wider threshold than the
   // trading one — a held index position is expected to swing, and reacting to that is
   // the behaviour the core exists to avoid. This catches genuine catastrophe only.
+  // Gauge the holding side against its own high-water mark.
+  const _coreVal = coreHoldingValue();
+  if (_coreVal > 0) {
+    riskSystem.corePeak = Math.max(riskSystem.corePeak || 0, _coreVal);
+    riskSystem.coreDrawdown = riskSystem.corePeak > 0
+      ? Math.max(0, (riskSystem.corePeak - _coreVal) / riskSystem.corePeak) : 0;
+  }
   const _ddTotal = computeDrawdown(riskSystem.peakTotalValue || totalValue, totalValue);
   riskSystem.peakTotalValue    = Math.max(riskSystem.peakTotalValue || 0, _ddTotal.peak, totalValue);
   riskSystem.totalDrawdown     = _ddTotal.drawdown;
@@ -11226,7 +11296,8 @@ module.exports = {
     pendingEntryTickers, committedPositionCount, dispatchFill, isInsideSessionBuffer, partialClose,
     GROWTH_SLEEVE_ON, GROWTH_SLEEVE_FRACTION, GROWTH_SLEEVE_NAMES, GROWTH_POOL,
     GROWTH_DISASTER_STOP, growthNames, isGrowthName, applySleeveSplit, withGrowthSleeve,
-    growthDisasterPick, getGrowthRetired: () => [..._growthRetired],
+    growthDisasterPick, growthSleeveOverBudget, GROWTH_BUDGET_TOLERANCE,
+    getGrowthRetired: () => [..._growthRetired],
     clearGrowthRetired: () => { _growthRetired.clear(); },
     detectOvernightGaps, MAX_OPEN_POSITIONS, MAX_SECTOR_EXPOSURE, sectorExposureFor,
     // Test-only handles for the main loop and the state writer, so a soak harness can
