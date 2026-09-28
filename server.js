@@ -3189,6 +3189,11 @@ const BROKER_MIRROR_MAX_AGE_MS = 5 * 60 * 1000;
 // floor and a tiny fraction of the account, so it stays meaningful at any size. A flat
 // $0.25 is a sensible floor on $1,000 and pure rounding noise on $1,000,000.
 const CASH_DRIFT_ABS = Math.max(0.01, parseFloat(process.env.CASH_DRIFT_MIN || '0.25'));
+// The largest broker/ledger difference that can plausibly be a dividend or a fee, as a
+// share of starting capital. 2% of $10,000 is $200 — an order of magnitude above any real
+// corporate action on this basket, and an order of magnitude below the $2,424 phantom.
+const DRIFT_SANITY_PCT = Math.max(0.001, Math.min(0.5,
+  parseFloat(process.env.DRIFT_SANITY_PCT || '0.02')));
 const CASH_DRIFT_PCT = Math.max(0, Math.min(0.01, parseFloat(process.env.CASH_DRIFT_PCT || '0.0002')));
 function cashDriftMin() {
   return Math.max(CASH_DRIFT_ABS, startingCapital() * CASH_DRIFT_PCT);
@@ -3526,7 +3531,9 @@ function subscribeCoreSymbols(symbols) {
     fetchQuote(sym).then(q => {
       if (q && q.price > 0) {
         marketData[sym] = { ...(marketData[sym] || {}), price: q.price,
-                            prevClose: q.prevClose ?? q.price, lastUpdate: Date.now() };
+                            prevClose: q.prevClose ?? q.price,
+                            dayOpen: q.dayOpen ?? marketData[sym]?.dayOpen ?? null,
+                            lastUpdate: Date.now() };
       }
     }).catch(() => {});
   }
@@ -4052,6 +4059,23 @@ async function fetchInitialPrices() {
       marketData[sym] = {
         price:         ex?.price ?? q.price,
         prevClose:     q.prevClose,
+        // COMPUTED AND THEN THROWN AWAY. snapshotToQuote has returned dayOpen (the
+        // official session open, from the daily bar) since it was written, and TWO
+        // consumers read marketData[].dayOpen — the gap detector and the volatility
+        // filter — but no construction site ever stored it. So it was always undefined
+        // and both silently fell back:
+        //   • detectOvernightGaps fell back to m1[0].o, the open of a bar up to SIXTY
+        //     MINUTES old, so an "overnight gap" was really "the move since some
+        //     arbitrary recent bar". Observed live 2026-09-24: six symbols reporting
+        //     >10% overnight gaps (BAC +10.89%, WFC +10.53%, PLTR -11.48%) on a day SPY
+        //     moved -0.40%. Mega-cap banks do not gap 10% on a quiet day; the anchor was
+        //     wrong, and every one of those spurious gaps blocked entries for 30 minutes
+        //     or halved position size.
+        //   • marketIntradayVolMedian fell back to prevClose — which is precisely the
+        //     behaviour the v11.16 fix was written to REMOVE. Its own comment says
+        //     "measured FROM THE DAY'S OPEN, not prevClose — a prevClose-based measure
+        //     double-counts the gap as volatility". That fix has never once run.
+        dayOpen:       q.dayOpen ?? null,
         high:          q.high,
         low:           q.low,
         dailyVolume:   q.volume || ex?.dailyVolume || 0,
@@ -4838,6 +4862,8 @@ async function addDynamicSymbol(sym, sig) {
   // Seed market data from the snapshot
   marketData[sym] = {
     price: q.price, prevClose: q.prevClose, high: q.high, low: q.low,
+    dayOpen: q.dayOpen ?? null,        // see fetchInitialPrices — the gap and volatility
+                                       // anchors both read this and both fell back badly
     dailyVolume: liqVolume,
     lastUpdate: Date.now(), lastTradeTime: 0, history: [q.price]
   };
@@ -5000,9 +5026,20 @@ function detectOvernightGaps() {
     // Prefer the OFFICIAL daily open from the Alpaca snapshot — stable all day and
     // correct even after a mid-day restart. Fall back to the earliest cached candle.
     const m1      = candleData[sym]?.m1;
-    const dayOpen = (md && Number.isFinite(md.dayOpen) && md.dayOpen > 0) ? md.dayOpen
-                  : (m1 && m1.length ? m1[0].o : null);
-    if (!dayOpen || dayOpen <= 0) return;
+    // THE FALLBACK WAS THE BUG. m1[0] is the oldest bar in a rolling 60-bar window, not
+    // the session open, so without a real dayOpen this measured "the move since roughly
+    // an hour ago" and called it an overnight gap. Anchoring on the wrong bar does not
+    // degrade gracefully — it invents gaps, and a gap blocks entries for 30 minutes.
+    // Better to have no opinion than a confidently wrong one.
+    const dayOpen = (md && Number.isFinite(md.dayOpen) && md.dayOpen > 0) ? md.dayOpen : null;
+    if (!dayOpen || dayOpen <= 0) {
+      if (Date.now() - (detectOvernightGaps._lastNoOpenLog || 0) > 3600000) {
+        detectOvernightGaps._lastNoOpenLog = Date.now();
+        console.log(`[GAP] No official session open for ${sym} yet — skipping gap detection ` +
+                    `rather than anchoring on a stale minute bar.`);
+      }
+      return;
+    }
 
     const gapPct = (dayOpen - prevClose) / prevClose;  // positive = gap up
     gapData[sym] = {
@@ -7336,11 +7373,25 @@ async function refreshBrokerMirror() {
       buying_power: acct.ok ? acct.buying_power : null,
       positions: pos.ok ? pos.positions : []
     };
-    // A fresh snapshot already reflects every core buy the broker has processed, so the
-    // running commitment total starts over. Without this reset it would grow without
-    // bound and eventually block the core from buying anything at all.
+    // "A fresh snapshot already reflects every core buy the broker has PROCESSED" — and
+    // that word was doing all the work. Alpaca updates the cash balance on FILL, not on
+    // acceptance, so a market order sent two seconds ago is accepted, gone from
+    // pendingOrders, settled out of _coreBuyInFlight, and still absent from this snapshot.
+    //
+    // Observed live 2026-09-24, mid-deployment, twelve core buys just sent:
+    //     [CASH] +$2423.97 adopted from the broker — dividend or credit
+    //     [PHASE] ✅ TRADING UNLOCKED — the holding side has earned $2424.69
+    //     [CASH] $-2427.03 adopted from the broker — fee or debit
+    //     [PHASE] Trading has given back most of its funding — RE-LOCKED
+    // A quarter of the account booked as a dividend, the trading gate opened on profit
+    // that did not exist, and the whole thing reversed a minute later. Had the entry scan
+    // found a setup in that window it would have sized against $2,424 of imaginary money.
+    //
+    // The counter is captured BEFORE the reset and handed to the adopter, so drift is
+    // measured against what the broker has actually seen.
+    const committedBeforeMirror = _coreCommittedSinceMirror;
     _coreCommittedSinceMirror = 0;
-    adoptBrokerCashDrift();
+    adoptBrokerCashDrift(committedBeforeMirror);
   } catch (e) { brokerMirror = { at: Date.now(), ok: false, error: e.message }; }
 }
 
@@ -7358,7 +7409,7 @@ async function refreshBrokerMirror() {
 // ledger conforms to it. Both directions are adopted, because a ledger that thinks it
 // has more cash than it does produces exactly the rejection storm RULE 3.2 exists to
 // prevent. Every adoption is logged; a silent correction is indistinguishable from a bug.
-function adoptBrokerCashDrift() {
+function adoptBrokerCashDrift(committedNotYetVisible = 0) {
   if (!EXEC_BROKER_AUTH) return 0;
   if (!brokerMirror.ok || !Number.isFinite(brokerMirror.cash)) return 0;
   // Anything in flight makes the difference a TIMING artefact, not real drift: the
@@ -7372,7 +7423,31 @@ function adoptBrokerCashDrift() {
   // built to adopt precisely that shape. It handed the $300 straight back into
   // portfolio.cash while profitVault kept its $300, inventing money out of an internal
   // transfer and booking it as a dividend in _dividendsTotal.
-  const delta = brokerMirror.cash - (portfolio.cash + Math.max(0, capitalSystem.profitVault || 0));
+  // Orders the broker has accepted but not yet reflected in its cash balance. Without
+  // this term the snapshot is stale by exactly the amount just committed, and that
+  // staleness reads as a windfall.
+  const committed = Math.max(0, Number(committedNotYetVisible) || 0);
+  const delta = brokerMirror.cash - (portfolio.cash + Math.max(0, capitalSystem.profitVault || 0) + committed);
+
+  // A DIVIDEND DOES NOT LOOK LIKE THIS. The drift that broke it was $2,424 on a $10,000
+  // account — a quarter of the balance, arriving as "dividend or credit". Real corporate
+  // actions on a sixteen-name mega-cap basket are cents to a few dollars. The committed
+  // term above removes the known cause; this refuses the unknown ones, because ignoring a
+  // genuine large credit for one cycle costs nothing and adopting a phantom one opens a
+  // trading gate on money that is not there.
+  if (Math.abs(delta) > startingCapital() * DRIFT_SANITY_PCT) {
+    if (Date.now() - (adoptBrokerCashDrift._lastSanityLog || 0) > 300000) {
+      adoptBrokerCashDrift._lastSanityLog = Date.now();
+      console.warn(`[CASH] ⚠️  Ignoring a $${delta.toFixed(2)} broker/ledger difference — ` +
+        `${(Math.abs(delta) / Math.max(1, startingCapital()) * 100).toFixed(1)}% of the account, and no ` +
+        `dividend looks like that. Almost always a snapshot taken before recent orders settled. ` +
+        `Broker $${brokerMirror.cash.toFixed(2)} vs ledger $${portfolio.cash.toFixed(2)}` +
+        (committed > 0 ? ` (+$${committed.toFixed(2)} committed, not yet visible)` : '') +
+        `. reconcileWithBroker will settle it if it is real.`);
+    }
+    _lastCashDelta = 0;
+    return 0;
+  }
   if (Math.abs(delta) < cashDriftMin()) return 0;
   // THE DRIFT MUST PERSIST ACROSS TWO SNAPSHOTS BEFORE IT IS BELIEVED.
   // The in-flight counters close the window while an order is outstanding, but they are
@@ -10378,7 +10453,16 @@ function evaluateAndTrade() {
                   priceFactorShort * 0.10 + rsiFactorShort * 0.10 + volumeFactorShort * 0.10 + sentimentFactorShort * 0.10);
     shortScore = Math.max(0, Math.min(1, shortScore + aiAdj.short));   // LUMEN adjustment
 
-    const shortReady = shortScore >= minThreshold && regime !== 'bull' && tf15mBias !== 'bullish' && gate.shortGate;
+    // LONG_ONLY BELONGS HERE, NOT ONLY AT TERRA'S RULE 3.6. Without it the scan built a
+    // full short plan every two seconds — ATR, stop, target, sizing, a round-trip cost
+    // estimate — and Terra then rejected it for COST, several rules before it got to the
+    // direction check. The live log showed the result on repeat:
+    //     [TERRA] ✗ rejected SHORT BBAI — round-trip cost 0.64% above the 0.45% ceiling
+    // which names the wrong reason. Shorts are off; the cost is irrelevant. That is
+    // wasted work on the hot path and, worse, a rejection message that would send anyone
+    // diagnosing it after a cost setting rather than a direction setting.
+    const shortReady = !LONG_ONLY && shortScore >= minThreshold && regime !== 'bull'
+                     && tf15mBias !== 'bullish' && gate.shortGate;
 
     // ── FORWARD ENTRY CHECK ──────────────────────────────────────────────
     // "Given everything currently known, would I still want to initiate this position
@@ -11294,6 +11378,7 @@ module.exports = {
     MAX_DAY_VOLUME_SHARE, intendedPositionNotional, verifyStateDir,
     desiredWsSymbols, syncWsSubscription, wsSymbolPriority, WATCHLISTS,
     pendingEntryTickers, committedPositionCount, dispatchFill, isInsideSessionBuffer, partialClose,
+    DRIFT_SANITY_PCT, gapData, isGapBlocked,
     GROWTH_SLEEVE_ON, GROWTH_SLEEVE_FRACTION, GROWTH_SLEEVE_NAMES, GROWTH_POOL,
     GROWTH_DISASTER_STOP, growthNames, isGrowthName, applySleeveSplit, withGrowthSleeve,
     growthDisasterPick, growthSleeveOverBudget, GROWTH_BUDGET_TOLERANCE,

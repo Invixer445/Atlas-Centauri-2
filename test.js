@@ -2664,8 +2664,8 @@ check('broker cash movements are adopted so dividends get reinvested', () => {
   // Comparing them raw made that permanent difference look like a repeating dividend —
   // and the stability check below is built to adopt exactly that shape, so it handed the
   // money back while profitVault kept its credit. Money from an internal transfer.
-  ok(/const delta = brokerMirror\.cash - \(portfolio\.cash \+ Math\.max\(0, capitalSystem\.profitVault \|\| 0\)\);/.test(fn),
-     'the drift must be measured against ledger cash PLUS the vault');
+  ok(/const delta = brokerMirror\.cash - \(portfolio\.cash \+ Math\.max\(0, capitalSystem\.profitVault \|\| 0\) \+ committed\);/.test(fn),
+     'the drift must be measured against ledger cash PLUS the vault PLUS what is committed');
   // Anything in flight makes the difference a TIMING artefact: the ledger is debited on
   // submission, the broker only on fill. Adopting then would double-count the spend.
   // BOTH directions. Trims credit the ledger synchronously and the broker pays on fill,
@@ -2692,8 +2692,19 @@ check('broker cash movements are adopted so dividends get reinvested', () => {
   ok(/\[CASH\]/.test(fn), 'every adoption must be logged — a silent correction hides a bug');
   // And it must actually be CALLED, from the one place that has a fresh snapshot.
   const mStart = src.indexOf('async function refreshBrokerMirror');
-  ok(/adoptBrokerCashDrift\(\);/.test(src.slice(mStart, src.indexOf('\n}', mStart))),
+  const mBody = src.slice(mStart, src.indexOf('\n}', mStart));
+  ok(/adoptBrokerCashDrift\(committedBeforeMirror\);/.test(mBody),
      'the mirror refresh must invoke it, or it never runs');
+  // v13.67.2: and it must hand over what was committed BEFORE the counter was reset.
+  // Alpaca updates cash on FILL, not on acceptance, so a snapshot taken seconds after a
+  // batch of core buys is stale by exactly that amount — and that staleness was adopted
+  // as a $2,424 "dividend" on a $10,000 account, unlocking the trading gate on money that
+  // did not exist.
+  const iCap = mBody.indexOf('const committedBeforeMirror = _coreCommittedSinceMirror;');
+  const iReset = mBody.indexOf('_coreCommittedSinceMirror = 0;');
+  const iCall = mBody.indexOf('adoptBrokerCashDrift(committedBeforeMirror);');
+  ok(iCap >= 0 && iReset > iCap && iCall > iReset,
+     'the commitment total must be captured BEFORE the reset and passed to the adopter');
 });
 
 check('the engine refuses trades too large for the stock it is trading', () => {
@@ -6198,8 +6209,8 @@ check('vaulting money does not invent money, or invent a drawdown', () => {
     // permanent repeating dividend.
     const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
                   .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
-    ok(/const delta = brokerMirror\.cash - \(portfolio\.cash \+ Math\.max\(0, capitalSystem\.profitVault \|\| 0\)\);/.test(src),
-       'drift must be measured against ledger cash PLUS the vault');
+    ok(/const delta = brokerMirror\.cash - \(portfolio\.cash \+ Math\.max\(0, capitalSystem\.profitVault \|\| 0\) \+ committed\);/.test(src),
+       'drift must be measured against ledger cash PLUS the vault PLUS what is committed');
     ok(/portfolio\.cash = Math\.max\(0, acct\.cash - Math\.max\(0, capitalSystem\.profitVault \|\| 0\)\);/.test(src),
        'and the boot sync must not silently reverse every vault deposit');
     // v13.66.4: THE VAULT IS A SUBSET OF BROKER CASH. Subtracting it without checking that
@@ -6630,6 +6641,143 @@ check('a core drawdown is visible even though nothing halts on it', () => {
   const warn = src.slice(src.indexOf('riskSystem.coreDrawdown > 0.05'));
   ok(/will read "normal" throughout this/.test(warn.slice(0, 900)),
      'and the warning must say plainly that the other gates will look fine');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  v13.67.2 — FROM THE 2026-09-24 LIVE LOG
+// ════════════════════════════════════════════════════════════════════════════
+group('v13.67.2 — a phantom dividend and a lost session open');
+
+check('a snapshot taken before fills settle is not a dividend', () => {
+  // THE LIVE FAILURE. Twelve core buys had just been sent. Alpaca updates cash on FILL,
+  // not on acceptance, so the snapshot was stale by exactly the committed amount — and
+  // every in-flight guard had already cleared (accepted orders leave pendingOrders and
+  // settle out of _coreBuyInFlight). The engine booked a quarter of the account as a
+  // dividend and opened the trading gate on it:
+  //     [CASH] +$2423.97 adopted from the broker — dividend or credit
+  //     [PHASE] ✅ TRADING UNLOCKED — the holding side has earned $2424.69
+  //     [CASH] $-2427.03 adopted from the broker — fee or debit
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/function adoptBrokerCashDrift\(committedNotYetVisible = 0\)/.test(src),
+     'the adopter must be told what the broker has not seen yet');
+  ok(/const delta = brokerMirror\.cash - \(portfolio\.cash \+ Math\.max\(0, capitalSystem\.profitVault \|\| 0\) \+ committed\);/.test(src),
+     'and subtract it, or the staleness reads as a windfall');
+  ok(I.DRIFT_SANITY_PCT > 0 && I.DRIFT_SANITY_PCT <= 0.1,
+     `there must be a magnitude sanity cap, got ${I.DRIFT_SANITY_PCT}`);
+
+  // IN A CHILD WITH LIVE_TRADING=true. adoptBrokerCashDrift returns at its FIRST LINE
+  // when EXEC_BROKER_AUTH is off, which it is by default — so an in-process assertion
+  // here passes because nothing happened, not because the right thing happened. The one
+  // case that caught it was the positive control below.
+  const probe = `
+    const I = require('${require('path').join(__dirname, 'server.js').replace(/\\/g, '/')}')._internals;
+    I.detectStartingCapital(10000, { force: true });
+    I.capitalSystem.profitVault = 0;
+    const out = {};
+    // 1. The exact live numbers, with the committed notional accounted for.
+    I.portfolio.cash = 2724.85;
+    I.setBrokerMirror({ at: Date.now(), ok: true, cash: 5148.82, buying_power: 5148.82, positions: [] });
+    I.adoptBrokerCashDrift(2423.97); I.adoptBrokerCashDrift(2423.97);
+    out.withCommitted = I.portfolio.cash;
+    // 2. Same drift with the committed figure lost — the sanity cap must still refuse it.
+    I.portfolio.cash = 2724.85;
+    I.adoptBrokerCashDrift(0); I.adoptBrokerCashDrift(0);
+    out.sanityCap = I.portfolio.cash;
+    // 3. POSITIVE CONTROL: a plausible dividend must still be adopted, or the fix has
+    //    broken the behaviour it exists to protect.
+    I.portfolio.cash = 1000;
+    I.setBrokerMirror({ at: Date.now(), ok: true, cash: 1012.40, buying_power: 1012.40, positions: [] });
+    I.adoptBrokerCashDrift(0); I.adoptBrokerCashDrift(0);
+    out.realDividend = I.portfolio.cash;
+    console.log(JSON.stringify(out));
+  `;
+  let r;
+  try {
+    const out = require('child_process').execFileSync(process.execPath, ['-e', probe], {
+      env: { ...process.env, LIVE_TRADING: 'true' }, encoding: 'utf8', timeout: 180000,
+    });
+    r = JSON.parse(out.trim().split('\n').filter(l => l.startsWith('{')).pop());
+  } catch (e) { throw new Error('probe failed: ' + (e.stdout || e.message)); }
+
+  near(r.withCommitted, 2724.85, 1e-9,
+       'with the committed notional accounted for there is no drift to adopt');
+  near(r.sanityCap, 2724.85, 1e-9,
+       'a 24%-of-account "dividend" must be refused outright — no corporate action looks like that');
+  near(r.realDividend, 1012.40, 1e-9,
+       'but a plausible $12.40 dividend must STILL be adopted and reinvested');
+});
+
+check('the session open is stored, not computed and discarded', () => {
+  // snapshotToQuote has returned dayOpen since it was written, and TWO consumers read
+  // marketData[].dayOpen — but no construction site stored it, so it was always
+  // undefined and both fell back:
+  //   • detectOvernightGaps fell back to m1[0].o, the oldest bar in a rolling 60-bar
+  //     window. An "overnight gap" was really "the move since roughly an hour ago".
+  //     Live 2026-09-24: six symbols over 10% (BAC +10.89%, WFC +10.53%, PLTR -11.48%)
+  //     on a day SPY moved -0.40%. Mega-cap banks do not gap 10% on a quiet day.
+  //   • marketIntradayVolMedian fell back to prevClose — exactly what the v11.16 fix was
+  //     written to remove. Its own comment says a prevClose measure double-counts the
+  //     gap as volatility. That fix had never once run.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const writes = (src.match(/dayOpen:\s*q\.dayOpen/g) || []).length;
+  ok(writes >= 3, `every quote-built marketData entry must store dayOpen, found ${writes}`);
+  ok(/dayOpen:   db\.o > 0 \? db\.o : null/.test(src), 'and it must come from the daily bar open');
+
+  // The gap detector must REFUSE rather than anchor on a stale bar.
+  const fn = src.slice(src.indexOf('function detectOvernightGaps'), src.indexOf('function getGapSizeAdjust'));
+  ok(!/m1\[0\]\.o/.test(fn),
+     'the minute-bar fallback must be gone — it invented gaps, and a gap blocks entries for 30 minutes');
+  ok(/const dayOpen = \(md && Number\.isFinite\(md\.dayOpen\) && md\.dayOpen > 0\) \? md\.dayOpen : null;/.test(fn),
+     'only the official open may anchor a gap');
+
+  // BEHAVIOURAL: a stored open must be used; a missing one must produce no gap at all.
+  const saved = { md: I.marketData.ZGAPX, cd: I.candleData.ZGAPX, g: I.gapData.ZGAPX };
+  try {
+    I.candleData.ZGAPX = { m1: Array.from({ length: 60 }, (_, i) => ({ t: i, o: 90, h: 91, l: 89, c: 90, v: 1000 })) };
+    // prevClose 100, real session open 99 -> a 1% gap, NOT the 10% the stale bar implies.
+    I.marketData.ZGAPX = { price: 90, prevClose: 100, dayOpen: 99, high: 100, low: 89,
+                           dailyVolume: 5e6, lastUpdate: Date.now(), history: [90] };
+    delete I.gapData.ZGAPX;
+    I.dynamicSymbols.ZGAPX = { addedAt: Date.now(), source: 'test', catalyst: 'other' };
+    I.detectOvernightGaps();
+    ok(I.gapData.ZGAPX, 'a gap must be recorded when the open is known');
+    near(I.gapData.ZGAPX.gapPct, -0.01, 1e-9,
+         'and measured from the SESSION OPEN — the stale minute bar would have said -10%');
+    // Now with no official open: no opinion, rather than a wrong one.
+    delete I.gapData.ZGAPX;
+    I.marketData.ZGAPX.dayOpen = null;
+    I.detectOvernightGaps();
+    ok(!I.gapData.ZGAPX,
+       'with no session open there must be NO gap recorded — a confidently wrong gap blocks entries');
+  } finally {
+    delete I.dynamicSymbols.ZGAPX;
+    if (saved.md) I.marketData.ZGAPX = saved.md; else delete I.marketData.ZGAPX;
+    if (saved.cd) I.candleData.ZGAPX = saved.cd; else delete I.candleData.ZGAPX;
+    if (saved.g) I.gapData.ZGAPX = saved.g; else delete I.gapData.ZGAPX;
+  }
+});
+
+check('a short is not priced when shorts are switched off', () => {
+  // The live log, every scan:
+  //     [TERRA] ✗ rejected SHORT BBAI — round-trip cost 0.64% above the 0.45% ceiling
+  // LONG_ONLY was ON. The scan built a full short plan — ATR, stop, target, sizing, a
+  // cost estimate — every two seconds, and Terra rejected it for COST several rules
+  // before reaching the direction check. Wasted work on the hot path, and a rejection
+  // that names the wrong cause: anyone diagnosing it would go after the cost ceiling.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/const shortReady = !LONG_ONLY && shortScore >= minThreshold/.test(src),
+     'the entry scan must not mark a short ready when shorts are disabled');
+  // Terra's rule stays as the backstop — the webhook reaches it without passing the scan.
+  ok(/if \(LONG_ONLY && direction === 'SHORT'\)/.test(src),
+     "Terra's direction rule must remain, since the webhook bypasses the scan");
+  if (I.LONG_ONLY) {
+    const v = I.terraValidateTrade({ ticker: 'ZZ', direction: 'SHORT', entryPrice: 10, shares: 1,
+                                     stop: { price: 11, frac: 0.05 }, rewardRisk: 2 });
+    eq(v.approved, false, 'and a short must still be refused if one reaches it');
+  }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
