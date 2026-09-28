@@ -2885,8 +2885,23 @@ const CORE_HOLD_ON       = CORE_HOLD_FRACTION > 0;
 // because the engine genuinely needs cash to function: coreBuyStep() cannot act on a
 // drifted weight without it, and a buffer that thin turns every dividend and every
 // rounding remainder into the difference between topping up and sitting still.
+// RAISED 0.97 -> 0.98 ON A DIRECT MEASUREMENT, 2026-09-28. Idle cash is the only lever
+// in this engine still sitting off its measured optimum, and it is the only change today
+// that came back positive on BOTH datasets rather than flipping sign between halves:
+//     invested    10 mega-caps / 480 sessions     16 names / 343 sessions
+//        100%        $14,861                         $14,459
+//         98%        $14,750  (-$4.87/mo)            $14,355  (-$6.35/mo)
+//         97%        $14,695  (-$7.29/mo)            $14,303  (-$9.51/mo)   <- was here
+//         95%        $14,584 (-$12.12/mo)            $14,200 (-$15.80/mo)
+// Each percentage point of idle cash costs about $2.40-$3.20 a month on $10,000. Moving
+// from 97% to 98% is worth roughly $2.50-$3.20 a month, or ~$35 a year, for nothing.
+//
+// 2% of $10,000 is $200 of working cash — twenty times coreMinSlice() — so coreBuyStep
+// still has plenty to act on a drifted weight with, which was the reason 0.97 was chosen
+// over the 0.98 ceiling in v12.64. On a smaller account affordableBasketNames already
+// narrows the basket rather than letting slices fall under the broker minimum.
 const CORE_PHASE1_FRACTION = Math.max(0, Math.min(0.98,
-  parseFloat(process.env.CORE_PHASE1_FRACTION || '0.97')));
+  parseFloat(process.env.CORE_PHASE1_FRACTION || '0.98')));
 // Only top up when meaningfully below target, so a drifting price does not generate
 // a stream of tiny orders that pay spread for nothing.
 const CORE_REBALANCE_BAND = 0.10;
@@ -5951,6 +5966,57 @@ function reseatTradingPeakAtBoot() {
 // driven below it no matter how large the allowance grows. That matches the name, and
 // it means an operator who sets 0.5 is saying "never less than half invested" rather
 // than "sell down to half the moment the gate opens".
+// ════════════════════════════════════════════════════════════════════════════
+//  THE PROFIT FLOOR — protection you can buy, at a price that is written down
+// ════════════════════════════════════════════════════════════════════════════
+//
+//  WHAT THE MEASUREMENTS SAY, BEFORE THE KNOB.
+//  Banking profit into CASH was tested fifteen ways across two datasets and four
+//  independent half-windows. It lost money in EVERY half:
+//        bank 25% of each new high      -$9 to -$11 a month on $10,000
+//        bank 50% of each new high     -$17 to -$22
+//        bank 100% of each new high    -$32 to -$42
+//        bank $50 every +$50           -$22 to -$26
+//  And it bought nothing: the share of RED DAYS was identical — 44.9% — at every setting.
+//  Banking does not reduce how often you are down. It reduces how much you own when you
+//  are up.
+//
+//  The loss is not timing and not luck, it is arithmetic. Average cash parked by each
+//  scheme, multiplied by the basket's 21.6% drift, predicts 83% of the measured shortfall
+//  on its own; the rest is the spread paid to park it. Every dollar in cash earns nothing
+//  while the thing it came out of keeps compounding.
+//
+//  Re-investing instead of holding cash was also tested — into the three calmest names,
+//  into the index, back across the basket. All of it flipped sign between halves
+//  (-$2.01 then +$6.29). There is no free way to protect a gain. "Banking profit" and
+//  "staying invested" are the same dial.
+//
+//  SO WHY DOES THIS EXIST AT ALL.
+//  Because the operator may rationally prefer a smaller, safer number to a larger,
+//  riskier one, and that is a preference, not a measurement error. The first $2,000 of
+//  profit can be worth more to someone than the next $2,000. This gives that person the
+//  lever with the price tag attached, rather than leaving them to reinvent it badly.
+//
+//  It is OFF by default, it never touches the first PROFIT_FLOOR_PCT of gain, it holds
+//  only a fraction of what is ABOVE that line, and the boot banner prints the measured
+//  cost every time it is enabled.
+const PROFIT_FLOOR_PCT = Math.max(0, Math.min(5,
+  parseFloat(process.env.PROFIT_FLOOR_PCT || '0')));
+const PROFIT_FLOOR_ON = PROFIT_FLOOR_PCT > 0;
+const PROFIT_FLOOR_KEEP = Math.max(0, Math.min(1,
+  parseFloat(process.env.PROFIT_FLOOR_KEEP || '0.5')));
+
+// Dollars the floor wants held OUT of the market right now. Zero until the account is
+// genuinely ahead by PROFIT_FLOOR_PCT; then a share of the excess above that line.
+function profitFloorCash(totalValue = getTotalValue()) {
+  if (!PROFIT_FLOOR_ON) return 0;
+  const base = startingCapital();
+  if (!(base > 0) || !(totalValue > 0)) return 0;
+  const line = base * (1 + PROFIT_FLOOR_PCT);
+  if (totalValue <= line) return 0;          // nothing to protect yet
+  return (totalValue - line) * PROFIT_FLOOR_KEEP;
+}
+
 function effectiveCoreFraction() {
   if (!CORE_HOLD_ON) return 0;
   if (PHASE_GATE_ENABLED && tradingPhaseLocked()) return Math.max(CORE_HOLD_FRACTION, CORE_PHASE1_FRACTION);
@@ -5976,8 +6042,13 @@ function effectiveCoreFraction() {
   // what makes the objective real rather than aspirational. CORE_HOLD_FRACTION still
   // wins as the floor: the operator's own minimum is never overridden by a target.
   const allocCeiling = 1 - allocationShortTarget();
+  // The profit floor enters as one more CEILING on the core, expressed as the share of
+  // the account it is willing to leave invested. Doing it here rather than with a new
+  // seller means the existing trim executes it — top-up-only stays top-up-only, and a
+  // protected dollar simply stops being bought back.
+  const floorCeiling = tv > 0 ? Math.max(0, 1 - (profitFloorCash(tv) / tv)) : 1;
   return Math.max(CORE_HOLD_FRACTION,
-                  Math.min(CORE_PHASE1_FRACTION, 1 - freed, allocCeiling));
+                  Math.min(CORE_PHASE1_FRACTION, 1 - freed, allocCeiling, floorCeiling));
 }
 
 // Total market value of the core basket.
@@ -7566,6 +7637,21 @@ function logPerformanceDigest() {
   const deployed = total > 0 ? (core / total) * 100 : 0;
   console.log(`[PERF] $${total.toFixed(2)}  ·  ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} ` +
               `(${pctMe >= 0 ? '+' : ''}${pctMe.toFixed(2)}%) since $${base.toFixed(0)}${bench}`);
+  // WHAT IS ACTUALLY BEING PROTECTED, AND WHAT IS EXPOSED. The operator asks about
+  // banking profit in terms of dollars at risk; this reports them in those terms rather
+  // than leaving the answer buried in percentages.
+  {
+    const tv = getTotalValue(), base = startingCapital();
+    const gain = tv - base;
+    const peak = Math.max(riskSystem.peakTotalValue || 0, tv);
+    const held = profitFloorCash(tv);
+    console.log(`[PROFIT] $${gain >= 0 ? '+' : ''}${gain.toFixed(2)} on $${base.toFixed(2)} ` +
+      `(${((gain / Math.max(1, base)) * 100).toFixed(2)}%) · peak $${peak.toFixed(2)} ` +
+      `· ${peak > base ? `$${(peak - tv).toFixed(2)} below that high` : 'no high yet'}` +
+      (PROFIT_FLOOR_ON
+        ? ` · floor is holding $${held.toFixed(2)} out of the market`
+        : ` · nothing held back (the floor is off — banking to cash measured -$9 to -$42/mo)`));
+  }
   if (riskSystem.coreDrawdown > 0.05) {
     console.warn(`[RISK] Holding side is ${(riskSystem.coreDrawdown * 100).toFixed(1)}% below its high ` +
       `of $${(riskSystem.corePeak || 0).toFixed(2)}. NOTE: safe mode, the emergency halt, the daily ` +
@@ -11170,6 +11256,20 @@ if (require.main === module) app.listen(PORT, async () => {
   } else {
     console.log('[MERCURY] ☿ Forecaster OFF (MERCURY_ENABLED=false) — exits revert to stop/target only');
   }
+  if (PROFIT_FLOOR_ON) {
+    const line = startingCapital() * (1 + PROFIT_FLOOR_PCT);
+    console.warn(`[FLOOR] ⚠️  PROFIT FLOOR ON — once the account is above ` +
+      `$${line.toFixed(2)} (+${(PROFIT_FLOOR_PCT * 100).toFixed(0)}%), ` +
+      `${(PROFIT_FLOOR_KEEP * 100).toFixed(0)}% of everything above that line is held OUT of the market.`);
+    console.warn(`[FLOOR]    THIS COSTS MONEY, AND HERE IS HOW MUCH. Banking profit into cash was`);
+    console.warn(`[FLOOR]    tested fifteen ways across two datasets and four half-windows. It lost in`);
+    console.warn(`[FLOOR]    EVERY one. On $10,000: banking 25% of each new high cost $9-11 a month,`);
+    console.warn(`[FLOOR]    50% cost $17-22, 100% cost $32-42. Each percentage point of idle cash is`);
+    console.warn(`[FLOOR]    worth about $2.40-$3.20 a month.`);
+    console.warn(`[FLOOR]    AND IT BUYS NO SAFETY: red days measured 44.9% at EVERY setting, identical`);
+    console.warn(`[FLOOR]    to never banking. It does not reduce how often you are down — only how`);
+    console.warn(`[FLOOR]    much you own when you are up. PROFIT_FLOOR_PCT=0 turns it off.`);
+  }
   if (GROWTH_SLEEVE_ON) {
     console.warn(`[GROWTH] ⚠️  GROWTH SLEEVE ON — ${(GROWTH_SLEEVE_FRACTION * 100).toFixed(0)}% of the core ` +
       `in ${GROWTH_SLEEVE_NAMES} high-volatility names (${growthNames().join(',')}), ` +
@@ -11379,6 +11479,7 @@ module.exports = {
     desiredWsSymbols, syncWsSubscription, wsSymbolPriority, WATCHLISTS,
     pendingEntryTickers, committedPositionCount, dispatchFill, isInsideSessionBuffer, partialClose,
     DRIFT_SANITY_PCT, gapData, isGapBlocked,
+    PROFIT_FLOOR_PCT, PROFIT_FLOOR_ON, PROFIT_FLOOR_KEEP, profitFloorCash,
     GROWTH_SLEEVE_ON, GROWTH_SLEEVE_FRACTION, GROWTH_SLEEVE_NAMES, GROWTH_POOL,
     GROWTH_DISASTER_STOP, growthNames, isGrowthName, applySleeveSplit, withGrowthSleeve,
     growthDisasterPick, growthSleeveOverBudget, GROWTH_BUDGET_TOLERANCE,

@@ -82,7 +82,9 @@ share one.
 |---|---|---|
 | `CORE_BASKET_TARGET_NAMES` | `16` | Measured: median return is flat from k=3 to k=20, median drawdown falls monotonically. Narrowing costs risk and buys nothing. |
 | `CORE_BASKET_SOURCE` | `fixed` | `venus` lets the research AI pick the basket. Default is `fixed` on purpose — a proposal is a hypothesis until it beats the control basket on data that arrived after it. |
-| `CORE_PHASE1_FRACTION` | `0.97` | Ceiling 0.98. Idle cash costs ~0.48%/yr per percentage point. |
+| `CORE_PHASE1_FRACTION` | `0.98` | Ceiling 0.98 (the engine needs working cash). Each percentage point of idle cash costs **$2.40–$3.20/month on $10,000**. |
+| `PROFIT_FLOOR_PCT` | `0` (off) | ☢️ Holds part of your gain out of the market once you are up this much. **Measured to lose $9–$42/month and to reduce red days by nothing.** See §9. |
+| `PROFIT_FLOOR_KEEP` | `0.5` | Share of the gain above the line to hold back. |
 | `TRADING_UNLOCK_PCT` | `0.10` | The phase gate: trading stays locked until the holding side banks this fraction of starting capital. |
 | `MERCURY_ENABLED` | `true` | ☿ the forecaster. `false` reverts exits to stop/target only. |
 | `MERCURY_MIN_SAMPLES` | `40` | Resolved forecasts a horizon needs before its skill counts at all. |
@@ -265,3 +267,52 @@ railway logs | grep "\[RISK\] Holding side"
 
 Nothing halts on it. Reacting to a core drawdown is the behaviour this project has
 measured losing, repeatedly.
+
+
+---
+
+## 9. Banking profit — why the floor is off
+
+`PROFIT_FLOOR_PCT` exists because protecting a gain is a reasonable *preference*. It is
+off by default because it is a measured *cost*.
+
+Banking profit into cash was tested fifteen ways, on two datasets, across four independent
+half-windows. **It lost money in every half.** On $10,000:
+
+| scheme | cost per month | per year |
+|---|---|---|
+| bank 25% of each new high | −$9 to −$11 | ~$120 |
+| bank 50% of each new high | −$17 to −$22 | ~$235 |
+| bank 100% of each new high | −$32 to −$42 | ~$450 |
+| bank $50 every +$50 | −$22 to −$26 | ~$290 |
+
+And it buys no safety. The share of **red days was identical — 44.9% — at every setting**,
+the same as never banking. It does not reduce how often you are down; it reduces how much
+you own when you are up.
+
+The loss is arithmetic, not timing. Average cash parked, times the basket's 21.6% drift,
+predicts 83% of the shortfall on its own:
+
+| scheme | avg cash idle | predicted cost | actual cost |
+|---|---|---|---|
+| bank 25% | $409 | −$7.38/mo | −$8.88/mo |
+| bank 50% | $796 | −$14.36/mo | −$17.18/mo |
+| bank 100% | $1,537 | −$27.74/mo | −$32.37/mo |
+
+Re-investing rather than holding cash was also tested — into the three calmest names, back
+across the basket. All of it flipped sign between halves (−$2.01, then +$6.29). **There is
+no free way to protect a gain.** "Banking profit" and "staying invested" are the same dial.
+
+What *does* work is already running: the **12% trim band** sells anything that runs past
+its target weight and redeploys into the laggards. That scored the best risk-adjusted
+number of anything tested (1.59 vs 1.44 for no trimming), and forcing a quarterly or
+monthly rebalance on top of it changed nothing.
+
+If you turn the floor on anyway, the boot log prints the cost every time:
+
+```bash
+railway logs | grep "\[FLOOR\]"
+```
+
+And `[PROFIT]` reports your gain, your peak and how much is being held back, on every
+digest, whether the floor is on or off.

@@ -2975,8 +2975,18 @@ check('unlocking frees only what trading may actually risk', () => {
   const fn = src.slice(src.indexOf('function effectiveCoreFraction'), src.indexOf('function coreHoldingValue'));
   ok(/const allowance = Math\.max\(0, tradingFundsAvailable\(\)\);/.test(fn),
      'the freed amount must come from the trading allowance');
-  ok(/Math\.max\(CORE_HOLD_FRACTION,\s*Math\.min\(CORE_PHASE1_FRACTION, 1 - freed, allocCeiling\)\)/.test(fn),
+  ok(/Math\.max\(CORE_HOLD_FRACTION,\s*Math\.min\(CORE_PHASE1_FRACTION, 1 - freed, allocCeiling, floorCeiling\)\)/.test(fn),
      'CORE_HOLD_FRACTION must act as a FLOOR and phase-1 as the ceiling');
+  // v13.68: the profit floor is a FOURTH ceiling inside the same min(). Like the 70/30
+  // objective it must sit inside the min and under the max — a protection preference is
+  // not permitted to push the core below the floor the operator set.
+  ok(/const floorCeiling = tv > 0 \? Math\.max\(0, 1 - \(profitFloorCash\(tv\) \/ tv\)\) : 1;/.test(fn),
+     'the profit floor must enter as a ceiling on the core');
+  const iFloor = fn.indexOf('floorCeiling', fn.indexOf('Math.min(CORE_PHASE1_FRACTION'));
+  ok(iFloor > 0, 'and be applied inside the min, not beside it');
+  eq(I.profitFloorCash(1e9), 0,
+     'with PROFIT_FLOOR_PCT unset the floor must be exactly 0 at any account value — ' +
+     'banking to cash lost money in 4 of 4 measured half-windows and must never be a default');
   // v13.66 added the 70/30 objective as a THIRD term inside the same min(). It must be
   // inside it, never outside the max(): a portfolio target is not permitted to push the
   // core below the floor the operator set, however much skill the forecaster earns.
@@ -6778,6 +6788,107 @@ check('a short is not priced when shorts are switched off', () => {
                                      stop: { price: 11, frac: 0.05 }, rewardRisk: 2 });
     eq(v.approved, false, 'and a short must still be refused if one reaches it');
   }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  v13.68 — THE ONLY LEVER LEFT, AND THE ONE THAT COSTS MONEY
+// ════════════════════════════════════════════════════════════════════════════
+group('v13.68 — idle cash and the profit floor');
+
+check('idle cash sits at its measured optimum', () => {
+  // The one lever in this engine still off its measured best, and the only change
+  // measured today that came back positive on BOTH datasets instead of flipping sign:
+  //   invested   10 mega-caps/480     16 names/343
+  //     100%       $14,861              $14,459
+  //      98%       $14,750 (-$4.87/mo)  $14,355 (-$6.35/mo)
+  //      97%       $14,695 (-$7.29/mo)  $14,303 (-$9.51/mo)
+  // Each percentage point of idle cash costs about $2.40-$3.20 a month on $10,000.
+  near(I.CORE_PHASE1_FRACTION, 0.98, 1e-9,
+       `phase-1 must hold the measured optimum, got ${I.CORE_PHASE1_FRACTION}`);
+  // But working cash must remain real. At $10,000 that is $200 — twenty slices.
+  const cash = 10000 * (1 - I.CORE_PHASE1_FRACTION);
+  ok(cash >= I.coreMinSlice() * 10,
+     `$${cash.toFixed(0)} of working cash is only ${(cash / I.coreMinSlice()).toFixed(0)} minimum ` +
+     'slices — coreBuyStep cannot act on a drifted weight without room');
+  // AND THE CLAMP ITSELF, not just today's default. Raising the ceiling to 1.00 leaves
+  // the current value untouched and quietly permits a 100%-invested configuration with
+  // no cash at all, at which point the core can never act on a drifted weight again.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/const CORE_PHASE1_FRACTION = Math\.max\(0, Math\.min\(0\.98,/.test(src),
+     'the hard ceiling must stay at 0.98 — the engine needs working cash to function');
+  // And the unlock step-down must still be executable, which this couples to.
+  ok(I.unlockStepDownIsActionable(),
+     'the gap to CORE_HOLD_FRACTION must still be wide enough for the trim to execute');
+});
+
+check('the profit floor is off, and stays off unless asked for', () => {
+  // Banking profit into cash lost money in FOUR of four independent half-windows, at
+  // every setting tested, and did not reduce red days at all (44.9% throughout). It must
+  // never arrive by default, by deploy, or by a forgotten variable.
+  eq(I.PROFIT_FLOOR_PCT, 0, 'the default must be exactly zero');
+  eq(I.PROFIT_FLOOR_ON, false, 'so the floor is off');
+  for (const tv of [0, 1, 10000, 25000, 1e9]) {
+    eq(I.profitFloorCash(tv), 0, `at $${tv} an unset floor must hold back nothing`);
+  }
+  // And with it off, effectiveCoreFraction must be untouched by it.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/const floorCeiling = tv > 0 \? Math\.max\(0, 1 - \(profitFloorCash\(tv\) \/ tv\)\) : 1;/.test(src),
+     'a zero floor must produce a ceiling of 1, which cannot bind');
+});
+
+check('when asked for, the floor protects only real gains and never the stake', () => {
+  const r = (() => {
+    const probe = `
+      const I = require('${require('path').join(__dirname, 'server.js').replace(/\\/g, '/')}')._internals;
+      I.detectStartingCapital(10000, { force: true });
+      const out = {};
+      for (const tv of [9000, 10000, 10999, 11000, 11001, 12000, 15000]) out['v'+tv] = I.profitFloorCash(tv);
+      out.pct = I.PROFIT_FLOOR_PCT; out.keep = I.PROFIT_FLOOR_KEEP;
+      console.log(JSON.stringify(out));
+    `;
+    const o = require('child_process').execFileSync(process.execPath, ['-e', probe], {
+      env: { ...process.env, PROFIT_FLOOR_PCT: '0.10', CORE_HOLD_FRACTION: '0.5' },
+      encoding: 'utf8', timeout: 180000,
+    });
+    return JSON.parse(o.trim().split('\n').filter(l => l.startsWith('{')).pop());
+  })();
+  eq(r.pct, 0.10, 'the probe must actually have the floor enabled');
+  // NOTHING is protected until the account is genuinely ahead by the configured margin.
+  eq(r.v9000, 0, 'a losing account must never have money pulled out of the market');
+  eq(r.v10000, 0, 'nor a flat one');
+  eq(r.v10999, 0, 'nor one a dollar short of the line');
+  eq(r.v11000, 0, 'nor one exactly on it');
+  // Above the line, only a share of the EXCESS is held — never the stake, never the
+  // first 10% of gain.
+  near(r.v12000, 500, 1e-9, 'at $12,000 only half of the $1,000 above the line is held');
+  near(r.v15000, 2000, 1e-9, 'at $15,000, half of the $4,000 above it');
+  ok(r.v15000 < 15000 - 10000, 'the floor can never hold back more than the gain itself');
+});
+
+check('the floor states its price every time it is switched on', () => {
+  // Shipping a measured loser quietly would be the dishonest way to do what was asked.
+  // The operator gets the lever; they also get the number, in the log, every boot.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  ok(/PROFIT FLOOR ON/.test(src), 'it must announce itself');
+  ok(/THIS COSTS MONEY, AND HERE IS HOW MUCH/.test(src), 'and lead with the cost');
+  ok(/50% cost \$17-22, 100% cost \$32-42/.test(src), 'with the measured dollar figures');
+  ok(/red days measured 44\.9% at EVERY setting/.test(src),
+     'and the fact that it buys no safety — that is the part that decides it');
+  ok(/PROFIT_FLOOR_PCT=0 turns it off/.test(src), 'and how to undo it');
+  // BEHAVIOURAL, not textual. A mutation that left the string in place and wrapped it in
+  // `if (false)` sailed past a source check — the line existed and never ran.
+  const lines = [];
+  const realLog = console.log;
+  console.log = (...a) => { lines.push(a.join(' ')); };
+  try { I.logPerformanceDigest(); } catch (e) { /* digest may bail on empty state */ }
+  finally { console.log = realLog; }
+  const profitLine = lines.find(l => l.includes('[PROFIT]'));
+  ok(profitLine, `the digest must actually PRINT the profit line, got ${lines.length} lines`);
+  ok(/peak \$/.test(profitLine), 'including the peak');
+  ok(/nothing held back \(the floor is off/.test(profitLine),
+     'and say plainly that nothing is being protected when the floor is off');
 });
 
 // ════════════════════════════════════════════════════════════════════════════
