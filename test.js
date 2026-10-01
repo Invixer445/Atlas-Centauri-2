@@ -3465,8 +3465,16 @@ check('the reconciler can see the core book, not just the trading book', () => {
      'drift must name which book the position lives in, or the report cannot be acted on');
   // Float tolerance: a holding split across two books is a SUM, and ~1 in 4 six-decimal
   // pairs is not exactly representable. Exact equality invents drift from IEEE rounding.
-  ok(/Math\.abs\(atlasQty - brokerQty\) > 1e-6/.test(fn),
+  ok(/Math\.abs\(atlasQty - brokerQty\) > 1e-5/.test(fn),
      'quantities must compare with a tolerance, not exact float equality');
+  // v13.68.1: AND THE TOLERANCE MUST SIT ABOVE THE PRECISION, NOT ON IT. computeSize
+  // floors fractional quantities to exactly six decimals, so 1e-6 is the quantisation
+  // step itself — a one-ulp difference is the rounding, not a break. Live 2026-09-30:
+  //   { symbol: 'PG', atlasQty: 4.077062, brokerQty: 4.077061, diff: 1e-6 }
+  // A warning that fires on $0.00015 teaches the operator to ignore the warning, and the
+  // next one may be real.
+  ok(!/> 1e-6/.test(fn),
+     'the threshold must not equal the six-decimal quantisation step itself');
   ok(!/if \(atlasQty !== brokerQty\)/.test(fn), 'exact equality must be gone');
 
   // BEHAVIOURAL: a core-only holding that matches the broker must NOT be reported.
@@ -6378,12 +6386,28 @@ check('a horizon that is not merely unskilled but broken heals itself', () => {
     eq(I.mercury.getScore().immediate.n, 0,
        'and the horizon must be reset — noise cannot be four times worse than the base rate');
     eq(I.mercury.getModels().immediate.up.n, 0, 'the weights must go too');
-    // A small sample must never trigger it, however ugly.
+    // TWO BARS, BECAUSE "BROKEN" COMES IN DEGREES.
+    // Mildly bad on a small sample is bad luck and must be left alone...
     const sc2 = I.mercury.getScore().short;
-    sc2.n = I.MERCURY_MIN_SAMPLES; sc2.brierBase = 10; sc2.brier = 90;
+    sc2.n = I.MERCURY_MIN_SAMPLES; sc2.brierBase = 100; sc2.brier = 160;   // bss -0.60
+    near(1 - sc2.brier / sc2.brierBase, -0.60, 1e-9, 'premise: mildly broken');
     I.mercury.skillOf('short');
     eq(I.mercury.getScore().short.n, I.MERCURY_MIN_SAMPLES,
-       'one short ugly stretch must not wipe a horizon — it needs a real sample first');
+       'one short mildly-ugly stretch must not wipe a horizon — it needs a real sample first');
+    // ...but CATASTROPHICALLY bad does not wait. Live 2026-09-30: `1w 64 bss -2.200` sat
+    // un-healed for days because 64 fell short of the 80 a single gate demanded, so the
+    // horizon stayed dead while the counter crawled.
+    sc2.brier = 300;                                                        // bss -2.00
+    near(1 - sc2.brier / sc2.brierBase, -2.00, 1e-9, 'premise: catastrophically broken');
+    I.mercury.skillOf('short');
+    eq(I.mercury.getScore().short.n, 0,
+       'a BSS of -2 cannot be luck at any sample size — it must heal without waiting');
+    // And the double-sample gate must still work for the milder case.
+    const sc3 = I.mercury.getScore().medium;
+    sc3.n = I.MERCURY_MIN_SAMPLES * 2; sc3.brierBase = 100; sc3.brier = 160;
+    I.mercury.skillOf('medium');
+    eq(I.mercury.getScore().medium.n, 0,
+       'mildly broken WITH a real sample must still heal');
   } finally { restoreMercury(snap); }
 });
 
@@ -6889,6 +6913,116 @@ check('the floor states its price every time it is switched on', () => {
   ok(/peak \$/.test(profitLine), 'including the peak');
   ok(/nothing held back \(the floor is off/.test(profitLine),
      'and say plainly that nothing is being protected when the floor is off');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  v13.68.1 — TELLING SIGNAL FROM NOISE
+// ════════════════════════════════════════════════════════════════════════════
+group('v13.68.1 — is what you are looking at actually anything');
+
+check('an ordinary move is reported as nothing, a real one is not', () => {
+  // Measured on the live basket: expected drift +$3.78/day on $10,000 against ±$71.22 of
+  // daily noise — the swing is NINETEEN TIMES the gain. The cumulative gain does not
+  // clear one standard deviation until ~355 trading days. Everything before that is
+  // mostly randomness, and acting on it has cost this account real money twice: an
+  // emergency stop on a 0.4-sigma day and a deleted account on a -0.65% week.
+  const saved = { a: I.getSignalAnchor(), cash: I.portfolio.cash, core: I.portfolio.coreHolding,
+                  sc: I.startingCapital() };
+  try {
+    I.detectStartingCapital(10000, { force: true });
+    I.portfolio.coreHolding = {};
+    const DAY = 86400000;
+    const run = (days, value) => {
+      I.setSignalAnchor(Date.now() - days * DAY);
+      I.portfolio.cash = value;
+      return I.signalCheck();
+    };
+    // The operator's own history — every one of these must read as noise.
+    for (const [days, val, label] of [[2, 10022.61, '+$22 after 2 days'],
+                                      [7, 10014.44, '+$14 after 7 days'],
+                                      [10, 9934.65, '-$65 after 10 days']]) {
+      const r = run(days, val);
+      ok(Math.abs(r.sigma) < 1,
+         `${label} must read as noise, got ${r.sigma.toFixed(2)} sigma`);
+    }
+    // A genuinely large move must NOT be dismissed.
+    const big = run(30, 9100);
+    ok(Math.abs(big.sigma) > 2,
+       `a -$900 month must not read as noise, got ${big.sigma.toFixed(2)} sigma`);
+    // Direction must be signed correctly.
+    ok(run(10, 11000).sigma > 0 && run(10, 9000).sigma < 0, 'the sign must follow the move');
+    // The noise term must grow as the square root of time, not linearly — that is the
+    // whole reason a long horizon is survivable and a short one is not.
+    const a = run(10, 10000), b = run(40, 10000);
+    near(b.noise / a.noise, 2, 0.05,
+         'four times the days must be twice the noise, not four times');
+
+    // SIGMA IS MEASURED AGAINST THE EXPECTED DRIFT, NOT AGAINST ZERO. Over ten days the
+    // drift is only ~$38 and dropping it changes no verdict — which is exactly why a
+    // mutation that compared the raw move survived. Over a YEAR the expected gain is
+    // ~$950, and an account sitting exactly flat has genuinely underperformed by that
+    // much. "Flat" is not "fine" on a long horizon, and the report must say so.
+    const flatYear = run(365, 10000);
+    ok(flatYear.expected > 500,
+       `premise: a year should have earned real drift, got $${flatYear.expected.toFixed(0)}`);
+    ok(flatYear.sigma < -0.4,
+       `dead flat after a year must read NEGATIVE — it missed $${flatYear.expected.toFixed(0)} ` +
+       `of expected drift — got ${flatYear.sigma.toFixed(2)} sigma`);
+    const onTrack = run(365, 10000 + flatYear.expected);
+    near(onTrack.sigma, 0, 0.05,
+         'and an account exactly on the expected path must read as zero sigma, not positive');
+  } finally {
+    I.setSignalAnchor(saved.a); I.portfolio.cash = saved.cash;
+    I.portfolio.coreHolding = saved.core;
+    I.detectStartingCapital(saved.sc, { force: true });
+  }
+});
+
+check('more risk does not make the answer arrive sooner', () => {
+  // The intuitive next move after a flat month is "take more risk so something happens".
+  // Scaling volatility scales the drift AND the noise by the same factor, so the ratio
+  // never moves and the time to a readable answer is identical. The growth sleeve makes
+  // the numbers bigger in both directions; it does not make them clearer. Only a better
+  // return per unit of risk shortens this.
+  const n = I.sessionsToSignal();
+  ok(n > 100 && n < 2000, `the horizon must be a real number of days, got ${n}`);
+  // The formula must depend on the RATIO only — scale both and it must not move.
+  const ratio = I.SIGNAL_DAILY_SD / ((1 + I.SIGNAL_ANNUAL_DRIFT) ** (1 / 252) - 1);
+  near(n, ratio ** 2, 1e-6, 'the horizon is (noise/drift) squared and nothing else');
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/return \(SIGNAL_DAILY_SD \/ driftPerDay\) \*\* 2;/.test(src),
+     'and must contain no account-size or leverage term — it is scale-invariant');
+  ok(/Taking more \\nrisk does NOT shorten this|Taking more ` \+\s*`risk does NOT shorten this/.test(src)
+     || /does NOT shorten this/.test(src),
+     'and the log must say so, because the opposite is the natural assumption');
+});
+
+check('the inception clock survives a restart and resets on a new account', () => {
+  // Without persistence a deploy resets "days since inception" to zero and the sigma
+  // calculation divides by sqrt(~0), turning every ordinary move into an infinite-sigma
+  // alarm — the exact opposite of what this is for.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  ok(/signalAnchorAt: _signalAnchorAt,/.test(src), 'the clock must be persisted');
+  ok(/_signalAnchorAt = state\.signalAnchorAt;/.test(src), 'and restored');
+  const adopt = src.slice(src.indexOf('function adoptNewAccount'), src.indexOf('async function syncFromBroker'));
+  ok(/_signalAnchorAt = Date\.now\(\);/.test(adopt),
+     "a different account's clock is not this one's — it must restart");
+  // And a zero-age account must not produce an absurd sigma.
+  const saved = { a: I.getSignalAnchor(), cash: I.portfolio.cash, sc: I.startingCapital() };
+  try {
+    I.detectStartingCapital(10000, { force: true });
+    I.setSignalAnchor(Date.now());
+    I.portfolio.cash = 10050;
+    const r = I.signalCheck();
+    ok(Number.isFinite(r.sigma) && Math.abs(r.sigma) < 50,
+       `a brand-new account must not report an absurd sigma, got ${r.sigma}`);
+    ok(r.sessions >= 1, 'the horizon must floor at one session, never zero');
+  } finally {
+    I.setSignalAnchor(saved.a); I.portfolio.cash = saved.cash;
+    I.detectStartingCapital(saved.sc, { force: true });
+  }
 });
 
 // ════════════════════════════════════════════════════════════════════════════

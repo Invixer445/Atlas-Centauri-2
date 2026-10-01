@@ -174,6 +174,7 @@ function detectStartingCapital(equity, { force = false } = {}) {
   if (!force && Number.isFinite(_startingCapital) && _startingCapital > 0) return _startingCapital;
   if (!Number.isFinite(equity) || equity <= 0) return startingCapital();
   _startingCapital = equity;
+  _signalAnchorAt = _signalAnchorAt || Date.now();   // when "since inception" starts counting
   // Anchor the benchmark at the same instant. If SPY has no price yet it stays null and
   // the digest simply omits the comparison rather than inventing a baseline.
   if (_benchmarkStart == null && Number.isFinite(spyData.price) && spyData.price > 0) {
@@ -7226,6 +7227,7 @@ function adoptNewAccount(acct) {
   // behaves was right or wrong about AAPL, and which account was watching does not
   // enter into it — the same reasoning that keeps the closed-trade history.
   _mercuryPeakEquity = 0;
+  _signalAnchorAt = Date.now();     // a different account's clock is not this one's
 }
 
 // Boot sync: adopt the broker's cash as the ledger's cash, and adopt any broker
@@ -7618,6 +7620,85 @@ function noteDailyRejection(reason) {
 // is ordinary: at 0.88% a genuinely notable -0.94-sigma day reads as a routine 0.74.
 const BASKET_DAILY_SD = Math.max(0.001, parseFloat(process.env.BASKET_DAILY_SD || '0.0068'));
 
+// ════════════════════════════════════════════════════════════════════════════
+//  IS WHAT YOU ARE LOOKING AT ACTUALLY ANYTHING?
+// ════════════════════════════════════════════════════════════════════════════
+//
+//  THE MEASUREMENT THAT PROMPTED THIS, on the live 16-name basket:
+//      expected drift   +$3.78 a day on $10,000
+//      actual noise      ±$71.22 a day
+//      the daily swing is NINETEEN TIMES the daily gain
+//
+//  Which means the cumulative gain does not clear even one standard deviation of noise
+//  until about 355 trading days — roughly a year and a half. Before that, essentially
+//  everything visible on the dashboard is randomness. And because a rising asset spends
+//  most of its life below its own high-water mark, this basket is below a previous peak
+//  on 73.5% of days: on four days out of five the account is worth less than it was at
+//  some earlier moment, which is not the strategy failing, it is what every rising asset
+//  looks like from close up.
+//
+//  That gap between the timescale of the strategy and the timescale of looking at it is
+//  the single most expensive thing in this project. It is what produced an emergency stop
+//  on a 0.4-sigma day and a deleted account on a -0.65% week — and each of those costs
+//  real money: the spread to rebuild sixteen positions, and the unlock clock back to zero.
+//
+//  So the engine now does the arithmetic the operator cannot do by eye. It reports the
+//  move, the drift that was expected over the same span, the noise that was expected, and
+//  the resulting sigma — and says plainly when a number means nothing. It changes no
+//  position and places no order. It exists so that a decision to intervene is made
+//  against a measurement instead of against a feeling.
+const SIGNAL_DAILY_SD = Math.max(0.0005, parseFloat(process.env.SIGNAL_DAILY_SD || '0.0071'));
+const SIGNAL_ANNUAL_DRIFT = Math.max(0, parseFloat(process.env.SIGNAL_ANNUAL_DRIFT || '0.10'));
+
+function signalCheck(now = Date.now()) {
+  const base = startingCapital();
+  const tv = getTotalValue();
+  if (!(base > 0) || !(tv > 0)) return null;
+  const since = _signalAnchorAt || now;
+  // Calendar days -> trading days, which is what the volatility is quoted in.
+  const sessions = Math.max(1, (now - since) / 86400000 * (252 / 365));
+  const move = tv - base;
+  const driftPerDay = base * ((1 + SIGNAL_ANNUAL_DRIFT) ** (1 / 252) - 1);
+  const expected = driftPerDay * sessions;
+  const noise = base * SIGNAL_DAILY_SD * Math.sqrt(sessions);
+  const sigma = noise > 0 ? (move - expected) / noise : 0;
+  return { move, expected, noise, sigma, sessions, tv, base };
+}
+
+// How long until the gain is bigger than the noise. Pure arithmetic on the two numbers
+// above; it does not depend on anything the account has actually done.
+function sessionsToSignal() {
+  const driftPerDay = (1 + SIGNAL_ANNUAL_DRIFT) ** (1 / 252) - 1;
+  if (!(driftPerDay > 0)) return Infinity;
+  return (SIGNAL_DAILY_SD / driftPerDay) ** 2;
+}
+
+let _signalAnchorAt = null;
+
+function logSignalCheck() {
+  const r = signalCheck();
+  if (!r) return;
+  const d = Math.abs(r.sigma);
+  // A verdict in words, because the number is the part nobody internalises.
+  const verdict =
+    d < 1 ? 'NOISE. This is an ordinary wobble and carries no information at all.'
+  : d < 2 ? 'still within normal variation — unusual, but not evidence of anything.'
+  : d < 3 ? 'genuinely unusual. Worth watching; not yet worth acting on.'
+          : 'outside what this basket normally does. Worth investigating the engine, not the market.';
+  console.log(`[SIGNAL] ${r.move >= 0 ? '+' : ''}$${r.move.toFixed(2)} over ${r.sessions.toFixed(1)} ` +
+    `trading day(s). Expected drift ${r.expected >= 0 ? '+' : ''}$${r.expected.toFixed(2)}, ` +
+    `normal noise ±$${r.noise.toFixed(2)} → ${r.sigma >= 0 ? '+' : ''}${r.sigma.toFixed(2)} sigma.`);
+  console.log(`[SIGNAL] ${verdict}`);
+  const need = sessionsToSignal();
+  if (r.sessions < need) {
+    console.log(`[SIGNAL] This basket's daily swing is ${(SIGNAL_DAILY_SD * r.base / Math.max(1e-9, ` +
+      `(1 + SIGNAL_ANNUAL_DRIFT) ** (1 / 252) - 1) / r.base).toFixed(0)}x its daily gain, so the ` +
+      `gain does not clear one standard deviation of noise until about ${need.toFixed(0)} trading ` +
+      `days (~${(need / 252).toFixed(1)} years). ${(need - r.sessions).toFixed(0)} to go. Taking more ` +
+      `risk does NOT shorten this — it scales the gain and the noise equally.`);
+  }
+}
+
 function logPerformanceDigest() {
   const total = getTotalValue();
   const base  = startingCapital();
@@ -7652,6 +7733,7 @@ function logPerformanceDigest() {
         ? ` · floor is holding $${held.toFixed(2)} out of the market`
         : ` · nothing held back (the floor is off — banking to cash measured -$9 to -$42/mo)`));
   }
+  try { logSignalCheck(); } catch (e) { /* reporting must never break the digest */ }
   if (riskSystem.coreDrawdown > 0.05) {
     console.warn(`[RISK] Holding side is ${(riskSystem.coreDrawdown * 100).toFixed(1)}% below its high ` +
       `of $${(riskSystem.corePeak || 0).toFixed(2)}. NOTE: safe mode, the emergency halt, the daily ` +
@@ -8426,6 +8508,9 @@ function buildStateObject() {
     // the peak, and every gain the bot has already made stops being something it knows
     // it is protecting — which is the failure this whole layer was added to stop.
     mercuryPeak:    _mercuryPeakEquity,
+    // Without this a restart resets "days since inception" to zero, and the sigma check
+    // divides by sqrt(~0) — turning every ordinary move into an infinite-sigma alarm.
+    signalAnchorAt: _signalAnchorAt,
     closedTrades:   portfolio.closedTrades.slice(-500),
     marketTransition: marketTransitionData,
     capitalSystem,
@@ -8615,6 +8700,9 @@ function loadState() {
     }
     if (Number.isFinite(state.mercuryPeak) && state.mercuryPeak > 0) {
       _mercuryPeakEquity = state.mercuryPeak;
+    }
+    if (Number.isFinite(state.signalAnchorAt) && state.signalAnchorAt > 0) {
+      _signalAnchorAt = state.signalAnchorAt;
     }
     if (Number.isFinite(state.startingCapital) && state.startingCapital > 0) {
       _startingCapital = state.startingCapital;
@@ -9354,7 +9442,14 @@ function createMercury() {
     const bss = 1 - (s.brier / s.brierBase);
     // Self-heal a horizon whose record is not merely unskilled but broken (see
     // MERCURY_BROKEN_BSS). Requires a real sample so one unlucky stretch cannot trigger it.
-    if (s.n >= MERCURY_MIN_SAMPLES * 2 && Number.isFinite(bss) && bss < MERCURY_BROKEN_BSS) {
+    // TWO BARS, BECAUSE "BROKEN" COMES IN DEGREES. A mildly negative score needs a real
+    // sample before it is called corruption rather than bad luck. A catastrophic one does
+    // not: observed live 2026-09-30, `1w 64 bss -2.200` — more than three times worse than
+    // the base rate — sat un-healed for days because 64 samples fell short of the 80 the
+    // single gate demanded, so the horizon stayed dead while the counter crawled.
+    const brokenEnough = (s.n >= MERCURY_MIN_SAMPLES * 2 && bss < MERCURY_BROKEN_BSS)
+                      || (s.n >= MERCURY_MIN_SAMPLES     && bss < -1.0);
+    if (Number.isFinite(bss) && brokenEnough) {
       console.warn(`[MERCURY] ⚠️  ${hKey} scored a Brier skill of ${bss.toFixed(3)} over ${s.n} ` +
                    `resolved forecasts. Noise cannot reach that — this is corrupted training ` +
                    `data, almost certainly forecasts scored outside their window before ` +
@@ -11022,7 +11117,16 @@ async function reconcileWithBroker() {
     // comparison invents drift out of IEEE rounding roughly one time in four. The error
     // is ~1e-15; 1e-6 is the precision orders are actually placed at, so a genuine
     // difference is always orders of magnitude above the tolerance.
-    if (Math.abs(atlasQty - brokerQty) > 1e-6) {
+    // 1e-6 IS THE QUANTITY PRECISION ITSELF, NOT A TOLERANCE. computeSize floors
+    // fractional quantities to exactly six decimals (Math.floor(size * 1e6) / 1e6), so a
+    // one-unit-in-the-last-place difference is the rounding, not a real break. Observed
+    // live 2026-09-30:
+    //     [RECONCILE] 1 position(s) differ from broker
+    //       { symbol: 'PG', atlasQty: 4.077062, brokerQty: 4.077061, diff: 1e-6 }
+    // A warning that fires on a difference worth $0.00015 trains the operator to ignore
+    // the warning — and the next one may be real. The threshold has to sit above the
+    // precision floor, not on it.
+    if (Math.abs(atlasQty - brokerQty) > 1e-5) {
       drift.push({ symbol: sym, atlasQty, brokerQty, diff: atlasQty - brokerQty, book: bookOf[sym] || 'none' });
     }
   });
@@ -11480,6 +11584,8 @@ module.exports = {
     pendingEntryTickers, committedPositionCount, dispatchFill, isInsideSessionBuffer, partialClose,
     DRIFT_SANITY_PCT, gapData, isGapBlocked,
     PROFIT_FLOOR_PCT, PROFIT_FLOOR_ON, PROFIT_FLOOR_KEEP, profitFloorCash,
+    signalCheck, sessionsToSignal, logSignalCheck, SIGNAL_DAILY_SD, SIGNAL_ANNUAL_DRIFT,
+    getSignalAnchor: () => _signalAnchorAt, setSignalAnchor: (v) => { _signalAnchorAt = v; },
     GROWTH_SLEEVE_ON, GROWTH_SLEEVE_FRACTION, GROWTH_SLEEVE_NAMES, GROWTH_POOL,
     GROWTH_DISASTER_STOP, growthNames, isGrowthName, applySleeveSplit, withGrowthSleeve,
     growthDisasterPick, growthSleeveOverBudget, GROWTH_BUDGET_TOLERANCE,
