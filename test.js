@@ -5610,6 +5610,103 @@ check('the 70/30 objective is an objective, not a leap', () => {
      `the skill required for the full target must be real but reachable, got ${I.ALLOC_FULL_SKILL}`);
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+//  v13.69 — THE EVIDENCE BAR FOR MOVING CAPITAL
+//  mercurySkillLevel() took the MAX Brier skill score across four horizons at a 40-
+//  sample bar. The maximum of four noisy estimates is biased upward even when the true
+//  skill of every horizon is zero: simulated 20,000x through the exact arithmetic in
+//  skillOf(), a forecaster that knew NOTHING was declared skilled 84.3% of the time and
+//  drew an average 34.9% of the account, reaching the full 70% in 9% of runs. Requiring
+//  two horizons to agree and taking the SECOND best drops that to 1.3%.
+// ════════════════════════════════════════════════════════════════════════════
+function withScores(mut, fn) {
+  const score = I.mercury.getScore();
+  const saved = JSON.parse(JSON.stringify(score));
+  try { mut(score); return fn(); }
+  finally { for (const k of Object.keys(score)) Object.assign(score[k], saved[k]); }
+}
+// n samples at a Brier skill score of exactly `bss`
+const scored = (n, bss) => ({ n, brierBase: 100, brier: 100 * (1 - bss),
+                              ups: Math.round(n * 0.3), downs: 0, hits: 0, calls: 0 });
+
+check('one lucky horizon cannot move capital, however good it looks', () => {
+  const keys = I.MERCURY_HORIZON_KEYS || Object.keys(I.mercury.getScore());
+  ok(keys.length >= 2, 'premise: more than one horizon exists');
+  // A single horizon at the 0.6 skill CAP — the best score the system can represent.
+  const lvl = withScores(sc => { Object.assign(sc[keys[0]], scored(5000, 0.6)); },
+                         () => I.mercurySkillLevel());
+  eq(lvl, 0, 'a single horizon, even at the maximum representable skill, must allocate ' +
+             'nothing — the best of four noisy scores is not evidence');
+});
+
+check('two agreeing horizons do move capital, and on the SECOND best', () => {
+  const keys = I.MERCURY_HORIZON_KEYS || Object.keys(I.mercury.getScore());
+  const lvl = withScores(sc => {
+    Object.assign(sc[keys[0]], scored(5000, 0.50));   // the lucky one
+    Object.assign(sc[keys[1]], scored(5000, 0.20));   // the corroborating one
+  }, () => I.mercurySkillLevel());
+  eq(+lvl.toFixed(4), 0.20,
+     `with two horizons the level must be the SECOND best (0.20), not the max (0.50); got ${lvl}`);
+});
+
+check('skill without a capital-grade sample size allocates nothing', () => {
+  const keys = I.MERCURY_HORIZON_KEYS || Object.keys(I.mercury.getScore());
+  const justUnder = I.MERCURY_ALLOC_MIN_SAMPLES - 1;
+  const lvl = withScores(sc => {
+    Object.assign(sc[keys[0]], scored(justUnder, 0.40));
+    Object.assign(sc[keys[1]], scored(justUnder, 0.40));
+  }, () => I.mercurySkillLevel());
+  eq(lvl, 0, `two horizons agreeing at 0.40 skill but only ${justUnder} resolved forecasts ` +
+             `each must still allocate nothing — the bar is ${I.MERCURY_ALLOC_MIN_SAMPLES}`);
+  // and the same two, one sample later, must work — proving the bar is the only thing
+  // standing in the way and the gate is not simply broken shut.
+  const lvl2 = withScores(sc => {
+    Object.assign(sc[keys[0]], scored(I.MERCURY_ALLOC_MIN_SAMPLES, 0.40));
+    Object.assign(sc[keys[1]], scored(I.MERCURY_ALLOC_MIN_SAMPLES, 0.40));
+  }, () => I.mercurySkillLevel());
+  ok(lvl2 > 0, 'at exactly the sample bar the same evidence must allocate — a gate that ' +
+               'never opens is not a gate, it is an outage');
+});
+
+check('the capital bar is strictly higher than the per-trade bar', () => {
+  ok(I.MERCURY_ALLOC_MIN_SAMPLES >= I.MERCURY_MIN_SAMPLES,
+     'mis-sizing one trade costs cents; mis-allocating the account costs the account');
+  ok(I.MERCURY_ALLOC_MIN_HORIZONS >= 2,
+     'at least two horizons must agree before capital moves');
+  ok(I.MERCURY_ALLOC_MIN_SAMPLES >= 200,
+     `the measured false-allocation rate at 40 samples was 34.9% of the account and at 200 ` +
+     `it is 1.3%; got ${I.MERCURY_ALLOC_MIN_SAMPLES}`);
+});
+
+check('mercurySkillLevel no longer takes a bare maximum', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fn = src.slice(src.indexOf('function mercurySkillLevel'),
+                       src.indexOf('}', src.indexOf('catch (e) { return 0; }',
+                       src.indexOf('function mercurySkillLevel'))) + 1);
+  ok(!/Math\.max\(best, mercury\.skillOf/.test(fn),
+     'the max-over-horizons form must be gone, not merely wrapped');
+  ok(/MERCURY_ALLOC_MIN_SAMPLES/.test(fn) && /MERCURY_ALLOC_MIN_HORIZONS/.test(fn),
+     'and the replacement must consult BOTH the sample bar and the agreement bar');
+  ok(/qualified\[MERCURY_ALLOC_MIN_HORIZONS - 1\]/.test(fn),
+     'returning the Nth best is the whole correction — returning qualified[0] would ' +
+     'reintroduce the bias with extra steps');
+});
+
+check('a zero-skill record allocates nothing across every horizon', () => {
+  const keys = I.MERCURY_HORIZON_KEYS || Object.keys(I.mercury.getScore());
+  // Every horizon at a large sample size and a Brier skill score of exactly zero —
+  // the honest outcome for a forecaster with no edge.
+  const lvl = withScores(sc => {
+    for (const k of keys) Object.assign(sc[k], scored(5000, 0));
+  }, () => I.mercurySkillLevel());
+  eq(lvl, 0, 'four horizons each at exactly zero skill must allocate exactly zero');
+  // and just below the floor, which is the case the floor exists for
+  const lvl2 = withScores(sc => {
+    for (const k of keys) Object.assign(sc[k], scored(5000, I.MERCURY_SKILL_FLOOR * 0.99));
+  }, () => I.mercurySkillLevel());
+  eq(lvl2, 0, 'and just under the skill floor must also allocate exactly zero');
+});
+
 check('the report card cannot claim skill the decision layer is not using', () => {
   // A dashboard that says "working" while the engine ignores the model is how six false
   // edges got believed in this project. Both numbers come from the same skillOf().

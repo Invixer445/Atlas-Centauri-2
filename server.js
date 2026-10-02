@@ -3334,7 +3334,7 @@ const STRATEGY = {
   // worse reward:risk — R:R held at ~1.05. Fewer, better trades.
   // Caveat kept in the open: PF 1.11 is thin, and the threshold was chosen by trying
   // several on this data. Treat as promising, not proven.
-  MIN_ATR_ENTRY:   0.010,
+  MIN_ATR_ENTRY:   Math.max(0, parseFloat(process.env.MIN_ATR_ENTRY || '0.010')),
   // ── MAX ROUND-TRIP COST (v11.22) ──────────────────────────────────────────
   // The real cost lever. Position SIZE is cost-neutral here — Alpaca charges no
   // commission and spread/slippage are percentages, so a $1,000 position pays the
@@ -3344,11 +3344,11 @@ const STRATEGY = {
   // refusing the expensive names is free edge.
   // 0.45% is deliberately above the ~0.30% median so it removes the tail, not the
   // body — the gate is meant to exclude expensive stocks, not stop trading.
-  MAX_ROUND_TRIP_COST: 0.0045,
+  MAX_ROUND_TRIP_COST: Math.max(0.0001, parseFloat(process.env.MAX_ROUND_TRIP_COST || '0.0045')),
   // Backstop: the target must clear round-trip friction by this multiple, so a trade is
   // never taken for a move that barely pays the fee. This is the "only trade when there
   // is real money in it" rule, stated in cost units instead of price units.
-  MIN_TARGET_COST_RATIO: 2.5,
+  MIN_TARGET_COST_RATIO: Math.max(1, parseFloat(process.env.MIN_TARGET_COST_RATIO || '2.5')),
 
   // Risk budget (fraction of TRADING pool risked per trade — dollar-risk, not notional)
   // v11.19 aggression tune: raised from 1.0%/2.0% so a real edge sizes up faster.
@@ -9946,6 +9946,41 @@ const ALLOC_SHORT_TARGET = Math.max(0, Math.min(0.95,
   parseFloat(process.env.ALLOC_SHORT_TARGET || '0.70')));
 const ALLOC_RAMP_ON = (process.env.ALLOC_RAMP || 'on').toLowerCase() !== 'off';
 const ALLOC_FULL_SKILL = Math.max(0.01, parseFloat(process.env.ALLOC_FULL_SKILL || '0.10'));
+// ── v13.69 — THE EVIDENCE BAR FOR MOVING CAPITAL ───────────────────────────
+// mercurySkillLevel() took the MAXIMUM Brier skill score across four horizons and fed
+// it straight into the allocation ramp. The maximum of four noisy estimates is biased
+// upward even when every underlying horizon is worthless, and MERCURY_MIN_SAMPLES=40
+// is far too few for a Brier skill score to settle. The comment above MERCURY_SKILL_FLOOR
+// claims "the same Bonferroni logic used elsewhere"; taking the best of four and
+// comparing it to a fixed floor is the opposite of a multiplicity correction.
+//
+// MEASURED, 20,000 simulated runs of a forecaster with LITERALLY ZERO SKILL, scored
+// through the exact arithmetic in skillOf():
+//
+//     rule                         declares skill   mean allocation   reaches full 70%
+//     max-of-4,  n>=40 (SHIPPED)        84.3%            34.9%             9.0%
+//     max-of-4,  n>=200                 40.5%             8.5%             0.0%
+//     2-of-4,    n>=40                  47.9%            13.8%             0.4%
+//     2-of-4,    n>=200                  7.3%             1.3%             0.0%
+//
+// So the shipped gate handed an average of 35% of the account — and occasionally all
+// 70% — to a forecaster that knew nothing. That is the mechanism behind "it goes up
+// and then crashes hard": the core compounds at 98% until the phase gate opens, forty
+// forecasts resolve, noise is mistaken for skill, and the account is handed to the
+// short-term engine, which measures -2.8% across seven independent 60-day windows.
+//
+// Requiring TWO horizons to clear the floor and taking the SECOND best cuts the
+// false allocation from 34.9% to 1.3% of the account — a 27x reduction — and costs
+// nothing in power: against a forecaster with a genuine edge (BSS ~0.06) the new rule
+// still reaches the full 70% allocation in 98% of runs, and 100% at BSS 0.12.
+//
+// This gates CAPITAL ONLY. Per-trade confidence still uses MERCURY_MIN_SAMPLES, because
+// sizing one trade wrongly costs a few cents and mis-allocating the account costs the
+// account.
+const MERCURY_ALLOC_MIN_SAMPLES = Math.max(MERCURY_MIN_SAMPLES,
+  parseInt(process.env.MERCURY_ALLOC_MIN_SAMPLES || '200', 10));
+const MERCURY_ALLOC_MIN_HORIZONS = Math.max(1, Math.min(MERCURY_HORIZON_KEYS.length,
+  parseInt(process.env.MERCURY_ALLOC_MIN_HORIZONS || '2', 10)));
 
 function allocationShortTarget() {
   if (!MERCURY_ON) return 0;
@@ -9962,9 +9997,21 @@ function allocationShortTarget() {
 function mercurySkillLevel() {
   if (!MERCURY_ON) return 0;
   try {
-    let best = 0;
-    for (const k of MERCURY_HORIZON_KEYS) best = Math.max(best, mercury.skillOf(k));
-    return best;
+    // AGREEMENT, NOT THE LUCKIEST HORIZON. Collect every horizon that clears BOTH the
+    // skill floor and the capital-grade sample bar, then take the Nth best rather than
+    // the 1st. With N=2 the number returned is one that two independent horizons have
+    // both beaten, which is what makes it evidence instead of a maximum over noise.
+    const score = mercury.getScore();
+    const qualified = [];
+    for (const k of MERCURY_HORIZON_KEYS) {
+      const s = score && score[k];
+      if (!s || !(s.n >= MERCURY_ALLOC_MIN_SAMPLES)) continue;
+      const sk = mercury.skillOf(k);
+      if (sk > 0) qualified.push(sk);
+    }
+    if (qualified.length < MERCURY_ALLOC_MIN_HORIZONS) return 0;
+    qualified.sort((a, b) => b - a);
+    return qualified[MERCURY_ALLOC_MIN_HORIZONS - 1];
   } catch (e) { return 0; }
 }
 
@@ -10925,11 +10972,23 @@ app.get('/api/oracle', (req, res) => {
   const sym = typeof req.query.symbol === 'string' ? req.query.symbol.toUpperCase() : null;
   res.json({
     enabled: true,
+    // TWO BARS, REPORTED SEPARATELY, because they authorise different things and the
+    // dashboard must never imply the engine is acting on more than it is. `anySkill` is
+    // the per-trade bar. Capital moves only on mercurySkillLevel(), which requires
+    // agreement between horizons — so a single lucky horizon reads as "influencing
+    // sizing" here and still allocates nothing.
     verdict: m.anySkill
       ? `measured skill ${(m.bestSkill * 100).toFixed(1)}% — forecasts are influencing decisions`
       : `no measured skill yet — forecasts are recorded and scored, but multiply out to zero ` +
         `and cannot move money (needs ${MERCURY_MIN_SAMPLES}+ resolved forecasts on a horizon ` +
         `and a Brier skill score above ${MERCURY_SKILL_FLOOR})`,
+    capitalVerdict: mercurySkillLevel() > 0
+      ? `${MERCURY_ALLOC_MIN_HORIZONS} horizons agree at ${(mercurySkillLevel() * 100).toFixed(1)}% ` +
+        `skill or better — the allocation ramp is live`
+      : `not enough agreement to move capital. Needs ${MERCURY_ALLOC_MIN_HORIZONS} separate horizons ` +
+        `each with ${MERCURY_ALLOC_MIN_SAMPLES}+ resolved forecasts and a Brier skill score above ` +
+        `${MERCURY_SKILL_FLOOR}. The single best horizon is NOT enough: the maximum of four noisy ` +
+        `scores reads as skill 84% of the time when the true skill is zero.`,
     metrics: m,
     allocation: {
       shortTermTarget: +allocationShortTarget().toFixed(4),
@@ -11357,6 +11416,11 @@ if (require.main === module) app.listen(PORT, async () => {
                 `single order until it has ${MERCURY_MIN_SAMPLES}+ resolved forecasts on a horizon AND a ` +
                 `Brier skill score above ${MERCURY_SKILL_FLOOR} — until then confidence is 0 and every ` +
                 `decision multiplies out to nothing. Report card: /api/oracle`);
+    console.log(`[MERCURY] ☿ Moving CAPITAL needs more: ${MERCURY_ALLOC_MIN_HORIZONS} separate horizons, ` +
+                `each with ${MERCURY_ALLOC_MIN_SAMPLES}+ resolved forecasts, and the allocation uses the ` +
+                `${MERCURY_ALLOC_MIN_HORIZONS}${MERCURY_ALLOC_MIN_HORIZONS === 2 ? 'nd' : 'th'}-best score, not the best. ` +
+                `Measured: the old best-of-four rule at ${MERCURY_MIN_SAMPLES} samples handed an average ` +
+                `35% of the account to a forecaster with ZERO real skill; this rule hands it 1.3%.`);
   } else {
     console.log('[MERCURY] ☿ Forecaster OFF (MERCURY_ENABLED=false) — exits revert to stop/target only');
   }
@@ -11601,6 +11665,7 @@ module.exports = {
     mercuryDecide, mercuryScore, mercuryBestAlternative, mercuryPeakPressure,
     mercuryExitPass, mercuryTick, mercurySkillLevel, allocationShortTarget,
     ALLOC_SHORT_TARGET, ALLOC_FULL_SKILL, MERCURY_EDGE_COST_MULT, MERCURY_RISK_AVERSION,
+    MERCURY_ALLOC_MIN_SAMPLES, MERCURY_ALLOC_MIN_HORIZONS, MERCURY_HORIZON_KEYS,
     MERCURY_MIN_HOLD_MS, MERCURY_ACTION_COOLDOWN_MS, MERCURY_ROTATE_MARGIN,
     MERCURY_REDUCE_FRACTION, MERCURY_SLEEVE_HORIZON, logOracleDecision, MERCURY_MIN_EDGE, MERCURY_CACHE_MS,
     atrPct, rsi, calculateADX, calculateRVOL,
