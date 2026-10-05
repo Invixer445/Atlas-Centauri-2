@@ -9982,6 +9982,100 @@ const MERCURY_ALLOC_MIN_SAMPLES = Math.max(MERCURY_MIN_SAMPLES,
 const MERCURY_ALLOC_MIN_HORIZONS = Math.max(1, Math.min(MERCURY_HORIZON_KEYS.length,
   parseInt(process.env.MERCURY_ALLOC_MIN_HORIZONS || '2', 10)));
 
+// ════════════════════════════════════════════════════════════════════════════
+//  v13.70 — THE AUDIT THE ENGINE NEVER RAN
+// ════════════════════════════════════════════════════════════════════════════
+//  The allocation ramp asks ONE question: can Mercury forecast direction? It has
+//  never asked the question that actually decides whether money is made: does the
+//  trading layer, after costs and execution, come out ahead?
+//
+//  Those are different questions and they have different answers. Replayed through
+//  the real decision functions across seven independent 60-day windows (~330 trades):
+//
+//      -5.1%  +11.0%  -4.5%  -16.7%  +1.1%  +14.8%  -3.4%   =  -2.8% pooled
+//
+//  With costs off the same windows are positive (+18.6/+9.4/+0.8%). The direction
+//  calls are mildly real; the round trip eats them. Gross edge $0.80/trade against
+//  $0.73/trade of cost. Mercury can be forecasting perfectly well and this layer can
+//  still lose money every month, because forecasting is not the binding constraint.
+//
+//  And the exit geometry cannot be tuned out of it. Walk-forward optimisation — 36
+//  configurations, parameters chosen on prior blocks only, scored on the next block
+//  untouched — was profitable in 1 of 4 forward blocks on BOTH windows tested, pooling
+//  -$44.57 and -$88.96. Tightening MIN_ATR_ENTRY to 1.5% won 3 of 3 windows it was
+//  tuned on and then lost 3 of 4 held out. Every knob has now been tried.
+//
+//  So the sleeve must earn its capital with its OWN PROFIT AND LOSS, not with a
+//  forecast score. This is an audit, not a prediction: it reads closed trades that
+//  already happened.
+//
+//  WHY A t-STATISTIC AND NOT "is expectancy positive". Because a positive average
+//  over a handful of trades is the single most common way a losing system looks like
+//  a winning one. The measured net expectancy of this layer is about +$0.07/trade
+//  against a per-trade spread of roughly $12, which is a t of about 0.08 over 178
+//  trades — indistinguishable from zero. A bare "expectancy > 0" test would have
+//  passed it roughly half the time.
+//
+//  NO DEADLOCK. The sleeve does not need this gate to open in order to trade: the
+//  phase gate hands it tradingFundsAvailable() — the account's winnings — regardless,
+//  and that is what builds the record. This governs only how far the sleeve may
+//  EXPAND beyond that allowance.
+const TRADING_RECORD_GATE_ON = (process.env.TRADING_RECORD_GATE || 'on').toLowerCase() !== 'off';
+// Below this many completed round trips there is no record worth reading, so the
+// sleeve gets a probe allocation: enough to generate evidence, small enough that being
+// wrong about it is cheap.
+const TRADING_RECORD_MIN_TRADES = Math.max(5,
+  parseInt(process.env.TRADING_RECORD_MIN_TRADES || '30', 10));
+const TRADING_RECORD_PROBE = Math.max(0, Math.min(1,
+  parseFloat(process.env.TRADING_RECORD_PROBE || '0.15')));
+// t at which the sleeve may draw its FULL target. 2.0 is roughly a 97.5% one-sided
+// confidence that the true expectancy is above zero.
+const TRADING_RECORD_FULL_T = Math.max(0.5,
+  parseFloat(process.env.TRADING_RECORD_FULL_T || '2.0'));
+
+// What the trading layer has actually done, in dollars, from its own closed trades.
+function tradingTrackRecord() {
+  const all = Array.isArray(portfolio.closedTrades) ? portfolio.closedTrades : [];
+  // ONLY COMPLETED ROUND TRIPS COUNT. A partial-rung exit is a fragment of a trade
+  // that will be counted again when the rest closes; including them inflates n, and
+  // the t-statistic scales with sqrt(n), so it would let the same evidence buy more
+  // capital simply by being reported in more pieces.
+  const pnls = [];
+  let net = 0;
+  for (const t of all) {
+    if (!t || t.partial) continue;
+    // STRICT, NOT COERCED. Number(null) is 0 and Number('') is 0, so a malformed
+    // record with a missing P&L would be counted as a real $0.00 trade: it adds to n
+    // without moving the mean, and t scales with sqrt(n). Bad data would literally buy
+    // the sleeve capital. A record that cannot state what it earned does not count.
+    const p = t.pnl;
+    if (typeof p !== 'number' || !Number.isFinite(p)) continue;
+    pnls.push(p); net += p;
+  }
+  const n = pnls.length;
+  if (!n) return { n: 0, net: 0, expectancy: 0, t: 0, sd: 0 };
+  const expectancy = net / n;
+  let v = 0;
+  for (const p of pnls) v += (p - expectancy) ** 2;
+  const sd = n > 1 ? Math.sqrt(v / (n - 1)) : 0;
+  // sd of exactly zero means every trade returned the identical amount. It cannot
+  // happen with real prices, but dividing by it silently yields 0 — which would read
+  // as "no evidence" for a record that is in fact perfectly consistent. State it.
+  const t = (n > 1 && sd > 0) ? expectancy / (sd / Math.sqrt(n))
+          : (expectancy > 0 ? Infinity : 0);
+  return { n, net, expectancy, t, sd };
+}
+
+// 0 = the sleeve may not expand at all. 1 = it may draw its full target.
+function tradingRecordMultiplier() {
+  if (!TRADING_RECORD_GATE_ON) return 1;
+  const r = tradingTrackRecord();
+  if (r.n < TRADING_RECORD_MIN_TRADES) return TRADING_RECORD_PROBE;
+  if (!(r.t > 0)) return 0;
+  if (r.t === Infinity) return 1;
+  return Math.max(0, Math.min(1, r.t / TRADING_RECORD_FULL_T));
+}
+
 function allocationShortTarget() {
   if (!MERCURY_ON) return 0;
   if (!ALLOC_RAMP_ON) return ALLOC_SHORT_TARGET;
@@ -9989,7 +10083,11 @@ function allocationShortTarget() {
   // gate cannot be acted on, and an open gate without skill is the thing that lost money.
   if (PHASE_GATE_ENABLED && tradingPhaseLocked()) return 0;
   const earned = Math.max(0, Math.min(1, mercurySkillLevel() / ALLOC_FULL_SKILL));
-  return ALLOC_SHORT_TARGET * earned;
+  // TWO INDEPENDENT PERMISSIONS, MULTIPLIED. `earned` says the forecaster can predict
+  // direction; tradingRecordMultiplier() says the layer that acts on it actually keeps
+  // money after costs. Either one at zero allocates nothing, which is correct: a
+  // perfect forecast executed at a loss is still a loss.
+  return ALLOC_SHORT_TARGET * earned * tradingRecordMultiplier();
 }
 // Deliberately NOT mercury.metrics().bestSkill. metrics() allocates a report object and
 // sorts every model's weights, and this is read from effectiveCoreFraction — which runs
@@ -10990,6 +11088,28 @@ app.get('/api/oracle', (req, res) => {
         `${MERCURY_SKILL_FLOOR}. The single best horizon is NOT enough: the maximum of four noisy ` +
         `scores reads as skill 84% of the time when the true skill is zero.`,
     metrics: m,
+    // The forecast score and the cash register are different instruments. A reader
+    // who sees only the first will conclude the sleeve is being starved by a shy
+    // model when it is in fact being held back by its own losses.
+    trackRecord: (() => {
+      const r = tradingTrackRecord();
+      return {
+        completedRoundTrips: r.n,
+        netDollars: +r.net.toFixed(2),
+        expectancyPerTrade: +r.expectancy.toFixed(4),
+        tStatistic: Number.isFinite(r.t) ? +r.t.toFixed(3) : null,
+        multiplier: +tradingRecordMultiplier().toFixed(4),
+        verdict: r.n < TRADING_RECORD_MIN_TRADES
+          ? `only ${r.n} completed round trips — too few to read. The sleeve draws a ` +
+            `${(TRADING_RECORD_PROBE * 100).toFixed(0)}% probe allocation until it has ` +
+            `${TRADING_RECORD_MIN_TRADES}.`
+          : (r.t > 0
+              ? `net $${r.net.toFixed(2)} over ${r.n} trades, t=${Number.isFinite(r.t) ? r.t.toFixed(2) : '∞'} ` +
+                `— drawing ${(tradingRecordMultiplier() * 100).toFixed(0)}% of target (full at t=${TRADING_RECORD_FULL_T})`
+              : `net $${r.net.toFixed(2)} over ${r.n} trades — this layer is not making money, ` +
+                `so it gets no capital beyond the phase-gate allowance, whatever the forecast says`)
+      };
+    })(),
     allocation: {
       shortTermTarget: +allocationShortTarget().toFixed(4),
       objective: ALLOC_SHORT_TARGET,
@@ -11424,6 +11544,18 @@ if (require.main === module) app.listen(PORT, async () => {
   } else {
     console.log('[MERCURY] ☿ Forecaster OFF (MERCURY_ENABLED=false) — exits revert to stop/target only');
   }
+  if (TRADING_RECORD_GATE_ON) {
+    const r = tradingTrackRecord();
+    console.log(`[AUDIT] 📒 The trading sleeve must pay for its own capital. It expands beyond the ` +
+                `phase-gate allowance only as its OWN closed trades show profit: t=${TRADING_RECORD_FULL_T} ` +
+                `for the full target, nothing at or below zero, a ${(TRADING_RECORD_PROBE * 100).toFixed(0)}% ` +
+                `probe under ${TRADING_RECORD_MIN_TRADES} round trips. Right now: ${r.n} trades, ` +
+                `net $${r.net.toFixed(2)}, drawing ${(tradingRecordMultiplier() * 100).toFixed(0)}% of target.`);
+    console.log(`[AUDIT] 📒 Why: replayed across seven independent 60-day windows this layer pooled ` +
+                `-2.8%, and walk-forward optimisation of its exit geometry was profitable in 1 of 4 ` +
+                `forward blocks. Its direction calls are mildly real; the round trip eats them ` +
+                `($0.80 gross edge per trade against $0.73 of cost). Set TRADING_RECORD_GATE=off to disable.`);
+  }
   if (PROFIT_FLOOR_ON) {
     const line = startingCapital() * (1 + PROFIT_FLOOR_PCT);
     console.warn(`[FLOOR] ⚠️  PROFIT FLOOR ON — once the account is above ` +
@@ -11666,6 +11798,8 @@ module.exports = {
     mercuryExitPass, mercuryTick, mercurySkillLevel, allocationShortTarget,
     ALLOC_SHORT_TARGET, ALLOC_FULL_SKILL, MERCURY_EDGE_COST_MULT, MERCURY_RISK_AVERSION,
     MERCURY_ALLOC_MIN_SAMPLES, MERCURY_ALLOC_MIN_HORIZONS, MERCURY_HORIZON_KEYS,
+    tradingTrackRecord, tradingRecordMultiplier, TRADING_RECORD_MIN_TRADES,
+    TRADING_RECORD_PROBE, TRADING_RECORD_FULL_T, TRADING_RECORD_GATE_ON,
     MERCURY_MIN_HOLD_MS, MERCURY_ACTION_COOLDOWN_MS, MERCURY_ROTATE_MARGIN,
     MERCURY_REDUCE_FRACTION, MERCURY_SLEEVE_HORIZON, logOracleDecision, MERCURY_MIN_EDGE, MERCURY_CACHE_MS,
     atrPct, rsi, calculateADX, calculateRVOL,

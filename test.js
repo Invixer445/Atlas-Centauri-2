@@ -5692,6 +5692,129 @@ check('mercurySkillLevel no longer takes a bare maximum', () => {
      'reintroduce the bias with extra steps');
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+//  v13.70 — THE TRADING SLEEVE MUST PAY FOR ITS OWN CAPITAL
+//  The ramp asked only "can Mercury forecast?" and never "does this layer keep money
+//  after costs?". Measured: -2.8% pooled across seven independent 60-day windows,
+//  and walk-forward optimisation of the exit geometry profitable in 1 of 4 forward
+//  blocks. Forecast skill and profitability are different things.
+// ════════════════════════════════════════════════════════════════════════════
+function withTrades(list, fn) {
+  const P = I.portfolio;
+  const saved = P.closedTrades.slice();
+  try {
+    P.closedTrades.length = 0;
+    for (const t of list) P.closedTrades.push(t);
+    return fn();
+  } finally { P.closedTrades.length = 0; for (const t of saved) P.closedTrades.push(t); }
+}
+const tr = (pnl, partial) => ({ ticker: 'TEST', direction: 'LONG', pnl, realizedPnL: pnl,
+                                closedAt: new Date().toISOString(), market: 'test',
+                                ...(partial ? { partial } : {}) });
+
+check('a losing trading record buys no capital, whatever the forecast says', () => {
+  const mult = withTrades(Array.from({ length: 40 }, () => tr(-1)),
+                          () => I.tradingRecordMultiplier());
+  eq(mult, 0, '40 consecutive losses must multiply the allocation to exactly zero');
+  // and the whole ramp must go to zero with it, even with perfect forecast skill
+  const keys = I.MERCURY_HORIZON_KEYS;
+  const sc = I.mercury.getScore();
+  const savedScore = JSON.parse(JSON.stringify(sc));
+  try {
+    for (const k of keys) Object.assign(sc[k], { n: 5000, brierBase: 100, brier: 40,
+                                                 ups: 1500, downs: 0, hits: 0, calls: 0 });
+    const target = withTrades(Array.from({ length: 40 }, () => tr(-1)),
+                              () => I.allocationShortTarget());
+    eq(target, 0, 'a flawless forecast executed at a loss must still allocate nothing — ' +
+                  'the two permissions multiply, they do not average');
+  } finally { for (const k of Object.keys(sc)) Object.assign(sc[k], savedScore[k]); }
+});
+
+check('the measured real-world record draws almost nothing', () => {
+  // The shape actually measured: 178 trades, +$0.07 net expectancy, ~$12 spread.
+  const list = Array.from({ length: 178 }, (_, i) => tr(i % 2 ? 12.07 : -11.93));
+  const r = withTrades(list, () => I.tradingTrackRecord());
+  ok(r.expectancy > 0, `premise: this record has a POSITIVE average (${r.expectancy.toFixed(3)}) — ` +
+                       'a bare "expectancy > 0" test would wave it through');
+  ok(Math.abs(r.t) < 0.5, `but its t-statistic is ${r.t.toFixed(3)}, indistinguishable from zero`);
+  const mult = withTrades(list, () => I.tradingRecordMultiplier());
+  ok(mult < 0.10, `so it must draw under 10% of target, got ${(mult * 100).toFixed(1)}%`);
+});
+
+check('capital scales with CERTAINTY, not merely with average profit', () => {
+  // The property no "expectancy > 0" rule can have. Two records with the SAME average
+  // profit per trade and the same count, differing only in how consistent they are,
+  // must NOT receive the same capital. This is the whole argument for a t-statistic:
+  // the measured sleeve had a positive average and was still indistinguishable from
+  // noise, because its spread dwarfed its edge.
+  const steady  = Array.from({ length: 60 }, (_, i) => tr(i % 2 ?  3 :  1));   // mean +2, tight
+  const erratic = Array.from({ length: 60 }, (_, i) => tr(i % 2 ? 62 : -58));  // mean +2, wild
+  const mS = withTrades(steady,  () => I.tradingTrackRecord());
+  const mE = withTrades(erratic, () => I.tradingTrackRecord());
+  eq(+mS.expectancy.toFixed(6), +mE.expectancy.toFixed(6),
+     'premise: identical average profit per trade');
+  const aS = withTrades(steady,  () => I.tradingRecordMultiplier());
+  const aE = withTrades(erratic, () => I.tradingRecordMultiplier());
+  ok(aS > aE, `the consistent record must draw MORE capital than the erratic one with the ` +
+              `same average (${(aS * 100).toFixed(1)}% vs ${(aE * 100).toFixed(1)}%)`);
+  eq(aS, 1, 'a tight, clearly profitable record earns the full target');
+  ok(aE < 0.35, `and the erratic one — same average, no statistical weight — must be held ` +
+                `well back, got ${(aE * 100).toFixed(1)}%`);
+});
+
+check('a genuinely profitable record does get the full target', () => {
+  const mult = withTrades(Array.from({ length: 60 }, (_, i) => tr(i % 3 ? 10 : -8)),
+                          () => I.tradingRecordMultiplier());
+  eq(mult, 1, 'a gate that never opens is not a gate — a real edge must reach full size');
+});
+
+check('partial exits cannot inflate the evidence', () => {
+  // t scales with sqrt(n), so reporting one trade in twenty pieces would buy more
+  // capital for the same evidence. Only completed round trips may count.
+  const list = [...Array.from({ length: 10 }, () => tr(5)),
+                ...Array.from({ length: 200 }, () => tr(5, 'rung1'))];
+  const r = withTrades(list, () => I.tradingTrackRecord());
+  eq(r.n, 10, `only the 10 completed round trips may count, got ${r.n}`);
+  const mult = withTrades(list, () => I.tradingRecordMultiplier());
+  eq(mult, I.TRADING_RECORD_PROBE,
+     'and with 10 round trips it must still be on the probe, not the full target');
+});
+
+check('an empty record probes rather than guessing either way', () => {
+  const mult = withTrades([], () => I.tradingRecordMultiplier());
+  eq(mult, I.TRADING_RECORD_PROBE,
+     'with no evidence the sleeve gets a small probe — enough to generate a record, ' +
+     'cheap enough to be wrong about');
+  ok(I.TRADING_RECORD_PROBE > 0 && I.TRADING_RECORD_PROBE <= 0.25,
+     `the probe must be real but small, got ${I.TRADING_RECORD_PROBE}`);
+  ok(I.TRADING_RECORD_FULL_T >= 1.5,
+     `full size must require real significance, got t=${I.TRADING_RECORD_FULL_T}`);
+});
+
+check('the audit survives hostile and malformed trade records', () => {
+  const junk = [null, undefined, {}, tr(NaN), tr(Infinity), tr(-Infinity),
+                { pnl: 'cheese' }, { pnl: null }, tr(5), tr(-5)];
+  const r = withTrades(junk, () => I.tradingTrackRecord());
+  eq(r.n, 2, 'only the two finite, non-partial records may count');
+  ok(Number.isFinite(r.net) && Number.isFinite(r.expectancy),
+     'and the totals must stay finite — a NaN here would silently zero the allocation');
+  const mult = withTrades(junk, () => I.tradingRecordMultiplier());
+  ok(Number.isFinite(mult) && mult >= 0 && mult <= 1,
+     `the multiplier must stay a sane fraction, got ${mult}`);
+});
+
+check('the ramp multiplies both permissions rather than taking either alone', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+                .split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const fn = src.slice(src.indexOf('function allocationShortTarget'),
+                       src.indexOf('function tradingTrackRecord') > src.indexOf('function allocationShortTarget')
+                         ? src.indexOf('function tradingTrackRecord')
+                         : src.indexOf('function mercurySkillLevel'));
+  ok(/ALLOC_SHORT_TARGET \* earned \* tradingRecordMultiplier\(\)/.test(fn),
+     'the realised-P&L audit must multiply the forecast ramp, so either one at zero ' +
+     'allocates zero');
+});
+
 check('a zero-skill record allocates nothing across every horizon', () => {
   const keys = I.MERCURY_HORIZON_KEYS || Object.keys(I.mercury.getScore());
   // Every horizon at a large sample size and a Brier skill score of exactly zero —
