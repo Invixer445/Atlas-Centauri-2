@@ -5693,6 +5693,125 @@ check('mercurySkillLevel no longer takes a bare maximum', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+//  v13.71 — THE REGIME SHIELD
+//  Every measurement in this project before now was taken on a 339-session window
+//  whose worst drawdown was 8.4%. Across 24 years of daily data the same structure
+//  draws down 55-60% in a real bear market, and detectMarketRegime() cannot see it
+//  coming because every one of its inputs is intraday.
+// ════════════════════════════════════════════════════════════════════════════
+const SRV = require('path').join(__dirname, 'server.js').replace(/\\/g, '/');
+function shieldProbe(env, body) {
+  const probe = `const I = require('${SRV}')._internals;\n${body}`;
+  try {
+    const out = require('child_process').execFileSync(process.execPath, ['-e', probe], {
+      env: { ...process.env, ...env }, encoding: 'utf8', timeout: 180000 });
+    return JSON.parse(out.trim().split('\n').filter(l => l.startsWith('{')).pop());
+  } catch (e) { throw new Error('probe failed: ' + (e.stdout || e.message)); }
+}
+
+check('the shield is off by default and changes nothing', () => {
+  eq(I.REGIME_SHIELD_ON, false, 'a measured lever with a real price ships off');
+  eq(I.regimeShieldCeiling(), 1, 'and imposes no ceiling at all while off');
+  eq(I.regimeShieldStatus().riskOff, false, 'and never reports risk-off');
+});
+
+check('switched on, a price below the average steps the core down', () => {
+  const r = shieldProbe({ REGIME_SHIELD: 'on', REGIME_SHIELD_FLOOR: '0.30' }, `
+    I._regimeShieldPoke({ price: 90, ma: 100, asOf: Date.now(), bars: 300 });
+    const off = I.regimeShieldStatus();
+    const ceilOff = I.regimeShieldCeiling();
+    I._regimeShieldPoke({ price: 110, ma: 100, asOf: Date.now(), bars: 300 });
+    const on = I.regimeShieldStatus();
+    const ceilOn = I.regimeShieldCeiling();
+    console.log(JSON.stringify({ below: off.riskOff, ceilOff, above: on.riskOff, ceilOn }));`);
+  eq(r.below, true,  'below its average must read risk-off');
+  eq(r.ceilOff, 0.30, 'and cap the core at the configured floor');
+  eq(r.above, false, 'above its average must read risk-on');
+  eq(r.ceilOn, 1,    'and impose no cap');
+});
+
+check('STALE data never de-risks — the asymmetry that matters most', () => {
+  // A missed de-risk costs drawdown in a bear market. A FALSE de-risk on a failed
+  // fetch sells the entire book at whatever the tape is, pays the spread on every
+  // name, and buys back later. The second is far worse, so every uncertain path
+  // must resolve to staying invested.
+  const r = shieldProbe({ REGIME_SHIELD: 'on' }, `
+    const old = Date.now() - 1000 * 3600 * 24 * 30;   // a month-old reading
+    I._regimeShieldPoke({ price: 50, ma: 100, asOf: old, bars: 300 });
+    const st = I.regimeShieldStatus();
+    console.log(JSON.stringify({ riskOff: st.riskOff, stale: st.stale, ceil: I.regimeShieldCeiling() }));`);
+  eq(r.riskOff, false, 'a stale reading must NOT de-risk, however bearish it looks');
+  eq(r.stale, true,    'but it must say out loud that it is stale');
+  eq(r.ceil, 1,        'and impose no ceiling');
+});
+
+check('no reading at all never de-risks either', () => {
+  const r = shieldProbe({ REGIME_SHIELD: 'on' }, `
+    const st = I.regimeShieldStatus();
+    console.log(JSON.stringify({ riskOff: st.riskOff, ceil: I.regimeShieldCeiling(), reason: st.reason }));`);
+  eq(r.riskOff, false, 'an unread shield must stay fully invested');
+  eq(r.ceil, 1, 'with no ceiling');
+});
+
+check('the shield applies on the PHASE-LOCKED path, which is the live one', () => {
+  // The account is phase-locked today, so effectiveCoreFraction() returns from its
+  // early branch. A shield wired only into the expression at the bottom of that
+  // function would do nothing in production and pass every test that unlocks the gate.
+  const r = shieldProbe({ REGIME_SHIELD: 'on', REGIME_SHIELD_FLOOR: '0.30',
+                          CORE_HOLD_FRACTION: '0.5', PHASE_GATE: 'on' }, `
+    const locked = I.tradingPhaseLocked();
+    I._regimeShieldPoke({ price: 110, ma: 100, asOf: Date.now(), bars: 300 });
+    const normal = I.effectiveCoreFraction();
+    I._regimeShieldPoke({ price: 90, ma: 100, asOf: Date.now(), bars: 300 });
+    const shielded = I.effectiveCoreFraction();
+    console.log(JSON.stringify({ locked, normal, shielded }));`);
+  eq(r.locked, true, 'premise: the gate is shut, so the early return is the live path');
+  ok(r.normal > 0.9, `risk-on must leave the core high, got ${r.normal}`);
+  eq(r.shielded, 0.30, `risk-off must step the core down even while phase-locked, got ${r.shielded}`);
+});
+
+check('the shield may cross CORE_HOLD_FRACTION, and only the shield may', () => {
+  // CORE_HOLD_FRACTION is the operator's minimum in NORMAL conditions. The shield
+  // floor is their minimum in a BEAR MARKET. With CORE_HOLD_FRACTION=0.5 a shield
+  // that could not cross it would cap protection at a 34.9% drawdown rather than 26.0%.
+  const r = shieldProbe({ REGIME_SHIELD: 'on', REGIME_SHIELD_FLOOR: '0.20',
+                          CORE_HOLD_FRACTION: '0.5' }, `
+    I._regimeShieldPoke({ price: 80, ma: 100, asOf: Date.now(), bars: 300 });
+    console.log(JSON.stringify({ frac: I.effectiveCoreFraction(), hold: I.CORE_HOLD_FRACTION }));`);
+  eq(r.hold, 0.5, 'premise: the operator floor is 50%');
+  eq(r.frac, 0.20, `the shield must reach its own floor (20%) through it, got ${r.frac}`);
+});
+
+check('the shield floor and lookback are sane and clamped', () => {
+  ok(I.REGIME_SHIELD_DAYS >= 20 && I.REGIME_SHIELD_DAYS <= 400,
+     `lookback must be a real window, got ${I.REGIME_SHIELD_DAYS}`);
+  ok(I.REGIME_SHIELD_FLOOR >= 0 && I.REGIME_SHIELD_FLOOR <= 1,
+     `the floor must be a fraction, got ${I.REGIME_SHIELD_FLOOR}`);
+  ok(I.REGIME_SHIELD_MAX_AGE_MS >= 3600000,
+     'a staleness window under an hour would de-risk on a single slow fetch');
+  const r = shieldProbe({ REGIME_SHIELD: 'on', REGIME_SHIELD_DAYS: '99999',
+                          REGIME_SHIELD_FLOOR: '-5' }, `
+    console.log(JSON.stringify({ d: I.REGIME_SHIELD_DAYS, f: I.REGIME_SHIELD_FLOOR }));`);
+  ok(r.d <= 400, `an absurd lookback must clamp, got ${r.d}`);
+  ok(r.f >= 0,   `a negative floor must clamp, got ${r.f}`);
+});
+
+check('a short bar history refuses to de-risk', () => {
+  // Fewer bars than the lookback means the average is computed over the wrong window.
+  // refreshRegimeShield must refuse rather than publish a number computed from 40 days
+  // and call it a 200-day average.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fn = src.slice(src.indexOf('async function refreshRegimeShield'),
+                       src.indexOf('function regimeShieldStatus'));
+  ok(/closes\.length < REGIME_SHIELD_DAYS/.test(fn),
+     'the bar count must be checked against the lookback before any average is published');
+  ok(/return false/.test(fn), 'and must bail out rather than publish a short-window average');
+  ok(/\* 1\.5[0-9]?\)/.test(fn) || /1\.55/.test(fn),
+     'the request window must be widened for weekends — asking for N calendar days ' +
+     'returns about 0.69N trading bars and silently averages the wrong window');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 //  v13.70 — THE TRADING SLEEVE MUST PAY FOR ITS OWN CAPITAL
 //  The ramp asked only "can Mercury forecast?" and never "does this layer keep money
 //  after costs?". Measured: -2.8% pooled across seven independent 60-day windows,
