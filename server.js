@@ -3303,6 +3303,177 @@ function recordBasketProposal(prop) {
   } catch (e) { console.warn(`[VENUS] could not record basket proposal: ${e.message}`); }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+//  THE BASKET CHALLENGER (v13.73) — stocks may take the account, but they must win it
+// ════════════════════════════════════════════════════════════════════════════
+//  edge-register.json has carried this claim since 2026-08-28, unscored:
+//
+//    "venus-basket-beats-fixed": a basket Venus screens beats a fixed liquidity-picked
+//    basket of the same size ... Money stays on the control until this says otherwise.
+//
+//  The proposals were being logged with timestamps the whole time and nothing ever read
+//  them back. This closes that loop. Venus's basket is the CHALLENGER; whatever the core
+//  actually holds is the INCUMBENT. The challenger is scored on bars that did not exist
+//  when it was proposed, so its picks cannot be tuned to the outcome, and it takes
+//  capital only if it genuinely wins.
+//
+//  WHY IT IS NOT SIMPLY SWITCHED ON. Measured over 23.4 years, equal-weight stock
+//  picking returned 11.1%/yr with a 59.9% drawdown against 13.0% and 25.1% for a
+//  trend-shielded 70/30 QQQ/SPY. Out of sample 2014-2026 it was 10.4% against 15.2%.
+//  The index won on both return AND drawdown. But that used an equal-weight index as a
+//  proxy for Venus's actual picks, which is not the same thing — so the honest answer is
+//  not "stocks lose", it is "stocks have not been measured here yet". This measures them.
+//
+//  THE BAR IS A t-STATISTIC ON DAILY DIFFERENCES, not a cumulative return, because over
+//  60 sessions the two baskets differ by several percent on noise alone. The switch also
+//  costs real money — the spread on every name in and out — so a coin-flip margin is not
+//  worth paying for.
+const BASKET_CHALLENGER_ON = (process.env.BASKET_CHALLENGER || 'on').toLowerCase() !== 'off';
+const CHALLENGER_MIN_DAYS = Math.max(20, parseInt(process.env.CHALLENGER_MIN_DAYS || '60', 10));
+const CHALLENGER_MIN_T    = Math.max(1, parseFloat(process.env.CHALLENGER_MIN_T || '2.0'));
+// Reporting is free and always on. ACTING on it is opt-in, because switching the basket
+// sells everything held and buys sixteen new names — an expensive, visible action that
+// an operator should choose rather than discover.
+const CHALLENGER_AUTO_SWITCH = (process.env.BASKET_CHALLENGER_AUTO || 'off').toLowerCase() === 'on';
+
+let _challengerVerdict = null;
+
+// THE ONE LINE THAT DECIDES WHETHER STOCKS TAKE THE ACCOUNT. Pulled out as a pure
+// function on purpose: as an expression buried inside the evaluator it could only be
+// checked by matching source text, and the same text appears in the message built
+// beside it — so a mutation that swapped the real test for `mean > 0` passed the suite.
+// A rule this consequential gets its own testable surface.
+function challengerWins(t, sessions) {
+  if (!Number.isFinite(t) || !Number.isFinite(sessions)) return false;
+  return sessions >= CHALLENGER_MIN_DAYS && t >= CHALLENGER_MIN_T;
+}
+
+// Equal-weight daily return series for a list of symbols, from a map of symbol -> bars.
+// Returns null when too few names have usable history to call it a basket.
+function basketDailyReturns(names, barsBySym, weights = null) {
+  const series = [];
+  for (const sym of names) {
+    const b = barsBySym[sym];
+    if (!Array.isArray(b) || b.length < 2) continue;
+    series.push({ sym, closes: b.map(x => x.c).filter(c => Number.isFinite(c) && c > 0) });
+  }
+  if (!series.length) return null;
+  // Every member must span the same number of sessions or the comparison silently
+  // weights whoever happens to have the longest history.
+  // n is the MINIMUM length, so every series already satisfies `length >= n` — an
+  // explicit filter on that was a no-op dressed as a safety check. What actually
+  // matters is COVERAGE: how many of the names asked for came back with usable
+  // history at all. Three names of which one has data is not a basket.
+  const n = Math.min(...series.map(x => x.closes.length));
+  if (!(n >= 2)) return null;
+  if (series.length < Math.ceil(names.length * 0.6)) return null;   // too thin to trust
+  const out = [];
+  for (let i = 1; i < n; i++) {
+    let r = 0, wsum = 0;
+    for (const x of series) {
+      const a = x.closes[x.closes.length - n + i - 1], c = x.closes[x.closes.length - n + i];
+      if (!(a > 0) || !(c > 0)) continue;
+      const w = weights && Number.isFinite(weights[x.sym]) ? weights[x.sym] : 1;
+      r += w * (c / a - 1); wsum += w;
+    }
+    out.push(wsum > 0 ? r / wsum : 0);
+  }
+  return out.length ? out : null;
+}
+
+// Score the OLDEST logged proposal — the longest genuinely out-of-sample record, and
+// the one choice that involves no selection at all.
+async function evaluateBasketChallenger() {
+  if (!BASKET_CHALLENGER_ON) return null;
+  try {
+    let log = [];
+    try { log = JSON.parse(fs.readFileSync(BASKET_LOG, 'utf8')); } catch {}
+    if (!Array.isArray(log) || !log.length) return null;
+    const first = log.find(e => e && Array.isArray(e.basket) && e.basket.length
+                              && Array.isArray(e.control) && e.control.length);
+    if (!first) return null;
+    const since = Date.parse(first.at);
+    if (!Number.isFinite(since)) return null;
+    const sessions = Math.round((Date.now() - since) / 86400000 * (252 / 365));
+    if (sessions < CHALLENGER_MIN_DAYS) {
+      _challengerVerdict = { ready: false, sessions, need: CHALLENGER_MIN_DAYS,
+        reason: `${sessions} of ${CHALLENGER_MIN_DAYS} sessions since the first proposal ` +
+                `(${first.at.slice(0, 10)}) — too early to read` };
+      return _challengerVerdict;
+    }
+    const challenger = [...new Set(first.basket.map(x => String(x || '').toUpperCase()))];
+    const incumbent  = [...new Set(CORE_HOLD_SYMBOLS)];
+    const all = [...new Set([...challenger, ...incumbent])];
+    const bars = await fetchBars(all, '1Day', new Date(since).toISOString(), sessions + 10);
+    const cR = basketDailyReturns(challenger, bars || {});
+    const iR = basketDailyReturns(incumbent,  bars || {}, coreWeightMap());
+    if (!cR || !iR) {
+      _challengerVerdict = { ready: false, sessions,
+        reason: 'not enough daily history for one of the baskets' };
+      return _challengerVerdict;
+    }
+    const n = Math.min(cR.length, iR.length);
+    if (n < CHALLENGER_MIN_DAYS) {
+      _challengerVerdict = { ready: false, sessions: n, need: CHALLENGER_MIN_DAYS,
+        reason: `only ${n} comparable sessions` };
+      return _challengerVerdict;
+    }
+    const d = [];
+    for (let i = 0; i < n; i++) d.push(cR[cR.length - n + i] - iR[iR.length - n + i]);
+    const mean = d.reduce((a, b) => a + b, 0) / n;
+    let v = 0; for (const x of d) v += (x - mean) ** 2;
+    const sd = n > 1 ? Math.sqrt(v / (n - 1)) : 0;
+    const t = (sd > 0) ? mean / (sd / Math.sqrt(n)) : 0;
+    const compound = (a) => a.reduce((acc, r) => acc * (1 + r), 1) - 1;
+    _challengerVerdict = {
+      ready: true, sessions: n, since: first.at.slice(0, 10),
+      challenger, incumbent,
+      challengerReturn: compound(cR.slice(-n)),
+      incumbentReturn:  compound(iR.slice(-n)),
+      dailyEdge: mean, t,
+      wins: challengerWins(t, n),
+      reason: challengerWins(t, n)
+        ? `Venus's stock basket is beating the index core by ${(mean * 25200).toFixed(1)}%/yr ` +
+          `equivalent over ${n} sessions, t=${t.toFixed(2)} — that clears the ${CHALLENGER_MIN_T} bar`
+        : `Venus's stock basket is ${mean >= 0 ? 'ahead' : 'behind'} by ` +
+          `${(mean * 25200).toFixed(1)}%/yr equivalent over ${n} sessions, but t=${t.toFixed(2)} ` +
+          `is inside the noise (needs ${CHALLENGER_MIN_T}). Money stays on the index.`
+    };
+    return _challengerVerdict;
+  } catch (e) {
+    console.warn(`[CHALLENGER] evaluation failed: ${e.message}`);
+    return null;
+  }
+}
+
+function challengerVerdict() { return _challengerVerdict; }
+
+// Run the comparison, say what it found, and switch only if asked to AND it won.
+async function basketChallengerTick() {
+  const v = await evaluateBasketChallenger();
+  if (!v) return null;
+  console.log(`[CHALLENGER] 🥊 ${v.reason}`);
+  if (v.ready && v.wins) {
+    console.log(`[CHALLENGER] 🥊 Over ${v.sessions} sessions: stocks ` +
+                `${(v.challengerReturn * 100).toFixed(2)}% vs index ` +
+                `${(v.incumbentReturn * 100).toFixed(2)}%.`);
+    if (!CHALLENGER_AUTO_SWITCH) {
+      console.log(`[CHALLENGER] 🥊 NOT switching — set BASKET_CHALLENGER_AUTO=on to let the ` +
+                  `engine act on this by itself. Switching sells every ETF held and buys ` +
+                  `${v.challenger.length} stocks, paying the spread on both legs.`);
+    } else {
+      console.log(`[CHALLENGER] 🥊 SWITCHING the core to Venus's basket: ${v.challenger.join(',')}. ` +
+                  `It earned this on ${v.sessions} sessions of out-of-sample data.`);
+      CORE_HOLD_SYMBOLS.length = 0;
+      CORE_HOLD_SYMBOLS.push(...withGrowthSleeve(v.challenger));
+      _lastBasketSwapAt = Date.now();
+      subscribeCoreSymbols(v.challenger);
+      queueSaveState();
+    }
+  }
+  return v;
+}
+
 // How old a broker snapshot may be before the funding gate stops trusting it. The
 // mirror refreshes every 60s; 5 minutes tolerates a couple of missed refreshes without
 // letting genuinely stale cash figures veto trading.
@@ -11350,6 +11521,18 @@ app.get('/api/jupiter',   (req, res) => res.json({ ...jupiter.getState(), dynami
 // so the dashboard cannot say "working" while the engine is ignoring the model.
 // 🛡 THE REGIME SHIELD'S READING. Read-only and unauthenticated for the same reason
 // as /api/oracle: the whole value of the thing is that the number is checkable.
+// 🥊 Has Venus's stock basket actually beaten the index core? Read-only.
+app.get('/api/challenger', (req, res) => {
+  const v = challengerVerdict();
+  res.json({
+    enabled: BASKET_CHALLENGER_ON, autoSwitch: CHALLENGER_AUTO_SWITCH,
+    minSessions: CHALLENGER_MIN_DAYS, minT: CHALLENGER_MIN_T, verdict: v,
+    note: v && v.ready
+      ? 'Scored on bars dated AFTER each proposal, so the picks cannot be tuned to the outcome.'
+      : 'No verdict yet — the comparison needs a real out-of-sample sample before it means anything.'
+  });
+});
+
 app.get('/api/shield', (req, res) => {
   const st = regimeShieldStatus();
   res.json({
@@ -11844,6 +12027,17 @@ if (require.main === module) app.listen(PORT, async () => {
   } else {
     console.log('[MERCURY] ☿ Forecaster OFF (MERCURY_ENABLED=false) — exits revert to stop/target only');
   }
+  if (BASKET_CHALLENGER_ON) {
+    console.log(`[CHALLENGER] 🥊 Venus's stock basket is being scored against the index core on ` +
+                `bars that did not exist when it was proposed. It needs ${CHALLENGER_MIN_DAYS}+ ` +
+                `sessions and t>=${CHALLENGER_MIN_T} before the result means anything, and ` +
+                `${CHALLENGER_AUTO_SWITCH ? 'WILL take the account if it wins' : 'will report but NOT act'}` +
+                ` (BASKET_CHALLENGER_AUTO=${CHALLENGER_AUTO_SWITCH ? 'on' : 'off'}). ` +
+                `Context: over 23.4 years equal-weight stock picking returned 11.1%/yr at a 59.9% ` +
+                `drawdown against 13.0% and 25.1% for the shielded index — but that used an index ` +
+                `as a stand-in for Venus's actual picks, which is what this finally measures. ` +
+                `Verdict: /api/challenger`);
+  }
   if (CORE_WEIGHTS_ON) {
     const w = Object.entries(CORE_WEIGHT_OVERRIDE)
       .sort((a, b) => b[1] - a[1])
@@ -11939,6 +12133,14 @@ if (require.main === module) app.listen(PORT, async () => {
   if (REGIME_SHIELD_ON) {
     await refreshRegimeShield();
     setInterval(refreshRegimeShield, 12 * 3600 * 1000);
+  }
+
+  // 3d. Score Venus's stock basket against whatever the core actually holds. Daily,
+  //     because it reads daily bars and the answer cannot change faster than that.
+  if (BASKET_CHALLENGER_ON) {
+    basketChallengerTick().catch(e => console.warn(`[CHALLENGER] ${e.message}`));
+    setInterval(() => basketChallengerTick().catch(e => console.warn(`[CHALLENGER] ${e.message}`)),
+                24 * 3600 * 1000);
   }
 
   // 4. Capital split
@@ -12135,6 +12337,9 @@ module.exports = {
     REGIME_SHIELD_ON, REGIME_SHIELD_SYMBOL, REGIME_SHIELD_DAYS, REGIME_SHIELD_FLOOR,
     REGIME_SHIELD_MAX_AGE_MS, _regimeShieldPoke: (v) => { _regimeShield = { ..._regimeShield, ...v }; },
     CORE_WEIGHT_OVERRIDE, CORE_WEIGHTS_ON, unpriceableCoreNames, reportUnpriceableCoreNames,
+    basketDailyReturns, evaluateBasketChallenger, challengerVerdict, basketChallengerTick,
+    challengerWins,
+    BASKET_CHALLENGER_ON, CHALLENGER_MIN_DAYS, CHALLENGER_MIN_T, CHALLENGER_AUTO_SWITCH,
     tradingTrackRecord, tradingRecordMultiplier, TRADING_RECORD_MIN_TRADES,
     TRADING_RECORD_PROBE, TRADING_RECORD_FULL_T, TRADING_RECORD_GATE_ON,
     MERCURY_MIN_HOLD_MS, MERCURY_ACTION_COOLDOWN_MS, MERCURY_ROTATE_MARGIN,

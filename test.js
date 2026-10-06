@@ -5698,6 +5698,90 @@ check('mercurySkillLevel no longer takes a bare maximum', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+//  v13.73 — THE BASKET CHALLENGER
+//  edge-register.json has carried the claim "venus-basket-beats-fixed ... Money stays
+//  on the control until this says otherwise" since 2026-08-28, with results: []. The
+//  proposals were logged with timestamps the whole time and nothing read them back.
+// ════════════════════════════════════════════════════════════════════════════
+check('the challenger reports by default and does NOT act', () => {
+  eq(I.BASKET_CHALLENGER_ON, true, 'scoring is free, so it is always on');
+  eq(I.CHALLENGER_AUTO_SWITCH, false,
+     'but switching sells every holding and buys a new basket — that is an operator decision');
+  ok(I.CHALLENGER_MIN_DAYS >= 20, `a verdict needs a real sample, got ${I.CHALLENGER_MIN_DAYS}`);
+  ok(I.CHALLENGER_MIN_T >= 1, `and a real margin, got t=${I.CHALLENGER_MIN_T}`);
+});
+
+check('basket returns are equal-weight unless weights are given', () => {
+  // A rises 10% a day, B is flat, so the two weightings MUST differ — a test where both
+  // names move identically would pass against a function that ignored weights entirely.
+  const bars = { A: [{ c: 100 }, { c: 110 }, { c: 121 }], B: [{ c: 50 }, { c: 50 }, { c: 50 }] };
+  const eqw = I.basketDailyReturns(['A', 'B'], bars);
+  eq(+eqw[0].toFixed(4), 0.05, 'equal weight averages the two');
+  const w = I.basketDailyReturns(['A', 'B'], bars, { A: 0.7, B: 0.3 });
+  eq(+w[0].toFixed(4), 0.07, '70/30 leans toward A');
+  ok(eqw[0] !== w[0], 'and the two must actually differ');
+});
+
+check('a basket with too little coverage returns nothing rather than a guess', () => {
+  const bars = { A: [{ c: 100 }, { c: 110 }] };
+  eq(I.basketDailyReturns(['A', 'X', 'Y'], bars), null,
+     'one name of three is not a basket — scoring it would compare a single stock to an index');
+  eq(I.basketDailyReturns([], {}), null, 'and an empty list is not a basket either');
+});
+
+check('ragged histories align to the shortest, not the longest', () => {
+  // Otherwise whichever member happens to have more history silently dominates the
+  // comparison, and the "edge" is really a different measurement window.
+  const bars = { A: [{ c: 90 }, { c: 100 }, { c: 110 }, { c: 121 }],
+                 B: [{ c: 50 }, { c: 50 }, { c: 50 }] };
+  const r = I.basketDailyReturns(['A', 'B'], bars);
+  eq(r.length, 2, `both must be truncated to the shorter span, got ${r.length}`);
+  eq(+r[0].toFixed(4), 0.05, 'and the overlap must be the one that is scored');
+});
+
+check('hostile bar data cannot produce a number', () => {
+  const junk = { A: [{ c: NaN }, { c: 110 }], B: [{ c: 0 }, { c: -5 }] };
+  const r = I.basketDailyReturns(['A', 'B'], junk);
+  ok(r === null || r.every(x => Number.isFinite(x)),
+     'non-finite or non-positive closes must be dropped, never propagated');
+  eq(I.basketDailyReturns(['A'], { A: [{ c: 100 }] }), null,
+     'a single bar yields no return and must not be read as zero');
+});
+
+check('the win rule itself requires BOTH the sample and the margin', () => {
+  const T = I.CHALLENGER_MIN_T, D = I.CHALLENGER_MIN_DAYS;
+  eq(I.challengerWins(T, D), true, 'exactly at both bars it wins');
+  eq(I.challengerWins(T - 0.01, D), false, 'a hair under the margin does not');
+  eq(I.challengerWins(T, D - 1), false, 'nor a session short of the sample');
+  eq(I.challengerWins(0.5, 10000), false,
+     'and no amount of history rescues a weak margin — this is the mutation that ' +
+     'survived a source-text check: swapping the t-test for "is the average positive" ' +
+     'left every string in place');
+  eq(I.challengerWins(50, D), true, 'a crushing margin with the sample does win');
+  eq(I.challengerWins(NaN, D), false, 'and nothing non-finite may ever win');
+  eq(I.challengerWins(T, NaN), false, '');
+});
+
+check('the verdict requires a real sample AND a real margin', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fn = src.slice(src.indexOf('async function evaluateBasketChallenger'),
+                       src.indexOf('function challengerVerdict'));
+  ok(/sessions < CHALLENGER_MIN_DAYS/.test(fn),
+     'it must refuse to call a winner before it has the sessions');
+  ok(/challengerWins\(t, n\)/.test(fn),
+     'the verdict must go through the single win rule, not re-derive it inline — over ' +
+     '60 sessions two baskets differ by several percent on noise alone, and an inline ' +
+     'copy is what let a mutation swap the t-test for "is the average positive"');
+  ok(/log\.find\(/.test(fn),
+     'and it must score the OLDEST proposal: picking which one to score is the one ' +
+     'place selection bias could re-enter');
+  const tick = src.slice(src.indexOf('async function basketChallengerTick'),
+                         src.indexOf('// How old a broker snapshot'));
+  ok(/if \(!CHALLENGER_AUTO_SWITCH\)/.test(tick),
+     'and acting on a win must be opt-in');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 //  v13.73 — SPY WAS THE BENCHMARK AND COULD NEVER BE HELD
 //  The websocket trade handler and the snapshot loader both diverted SPY into
 //  spyData and `continue`d, so marketData.SPY never existed. mostUnderweightCore()
