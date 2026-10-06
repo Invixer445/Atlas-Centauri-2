@@ -2954,7 +2954,11 @@ const CORE_PHASE1_FRACTION = Math.max(0, Math.min(0.98,
 //  without needing the engine to hold a bond ETF.
 //
 //  OFF BY DEFAULT, like every other measured lever here. REGIME_SHIELD=on turns it on.
-const REGIME_SHIELD_ON     = (process.env.REGIME_SHIELD || 'off').toLowerCase() === 'on';
+// DEFAULT ON as of v13.72. It shipped off in v13.71 because changing behaviour under a
+// running account is how you break one. Measured against 24 years including the
+// financial crisis, COVID and 2022, leaving it off means accepting a 55% drawdown that
+// the engine cannot even see coming. REGIME_SHIELD=off restores the old behaviour.
+const REGIME_SHIELD_ON     = (process.env.REGIME_SHIELD || 'on').toLowerCase() === 'on';
 const REGIME_SHIELD_SYMBOL = String(process.env.REGIME_SHIELD_SYMBOL || 'SPY').toUpperCase().trim();
 const REGIME_SHIELD_DAYS   = Math.max(20, Math.min(400,
   parseInt(process.env.REGIME_SHIELD_DAYS || '200', 10)));
@@ -3072,6 +3076,46 @@ const CORE_TILT_MAX_SHARE = Math.max(0.1, Math.min(0.5, parseFloat(process.env.C
 
 // sym -> 0..1 conviction from Venus. Empty means equal weight, which is the default
 // state and the state after any restart until Venus proposes again.
+// ════════════════════════════════════════════════════════════════════════════
+//  EXPLICIT CORE WEIGHTS (v13.72) — CORE_WEIGHTS=QQQ:0.70,SPY:0.30
+// ════════════════════════════════════════════════════════════════════════════
+//  The conviction tilt cannot express this. coreWeightMap() caps any single name at
+//  max(CORE_TILT_MAX_SHARE, 1/n), which for a two-name basket is 50% — so a 70/30
+//  split is unreachable through conviction no matter what is fed to it. That cap is
+//  right for a MODEL's opinion, where the measurement said a wrong tilt stays cheap
+//  only inside a bounded range. It is wrong for an operator's deliberate allocation,
+//  which is a decision rather than a forecast, so an explicit map bypasses it.
+//
+//  Unlisted basket members split whatever share is left, equally. An empty or
+//  malformed value is ignored entirely and the engine falls back to conviction
+//  weighting, because a half-parsed allocation is worse than none.
+const CORE_WEIGHT_OVERRIDE = (() => {
+  const raw = String(process.env.CORE_WEIGHTS || '').trim();
+  if (!raw) return null;
+  const out = {};
+  let total = 0;
+  for (const part of raw.split(',')) {
+    const [symRaw, wRaw] = part.split(':');
+    const sym = String(symRaw || '').toUpperCase().trim();
+    const w = parseFloat(wRaw);
+    if (!/^[A-Z.]{1,6}$/.test(sym) || !Number.isFinite(w) || w < 0) {
+      console.warn(`[CORE] ⚠️  CORE_WEIGHTS entry "${part}" is not a SYMBOL:weight pair — ` +
+                   `ignoring the WHOLE override rather than applying half an allocation.`);
+      return null;
+    }
+    out[sym] = w; total += w;
+  }
+  if (!(total > 0)) return null;
+  // DELIBERATELY NOT NORMALISED HERE. Dividing through at parse time destroys the one
+  // fact coreWeightMap() needs: whether the operator allocated the WHOLE core or only
+  // part of it. "CORE_WEIGHTS=QQQ:0.60" on a three-name basket means QQQ takes 60% and
+  // the other two share 40%; normalising here would turn it into QQQ taking everything.
+  // The scale-invariance that makes 7:3 and 70:30 agree is applied at the point of use,
+  // where the basket is known.
+  return out;
+})();
+const CORE_WEIGHTS_ON = !!CORE_WEIGHT_OVERRIDE;
+
 let CORE_CONVICTION = {};
 
 // ── PHASE GATE (v11.39) ─────────────────────────────────────────────────────
@@ -6266,6 +6310,35 @@ function coreWeightMap(symbols = CORE_HOLD_SYMBOLS, conv = CORE_CONVICTION) {
   const n = Math.max(1, list.length);
   const eq = 1 / n;
   const out = {};
+  // AN EXPLICIT ALLOCATION WINS OVER EVERY MODEL VIEW. Checked first so no conviction
+  // value, tilt setting or share cap can move a weight the operator wrote down.
+  if (CORE_WEIGHTS_ON) {
+    let named = 0; const unnamed = [];
+    for (const sym of list) {
+      const w = CORE_WEIGHT_OVERRIDE[sym];
+      if (Number.isFinite(w)) { out[sym] = w; named += w; } else unnamed.push(sym);
+    }
+    if (unnamed.length && named < 1) {
+      // PART of the core was allocated. The written weights are absolute shares and
+      // the unlisted names split the rest: "QQQ:0.60" on QQQ/SPY/IWM is 60/20/20.
+      const left = 1 - named;
+      for (const sym of unnamed) out[sym] = left / unnamed.length;
+    } else {
+      // The whole core was allocated (or over-allocated, as "7:3" is). The written
+      // numbers are RATIOS between the names held; the rescale below turns them into
+      // shares, which is what makes 7:3 and 70:30 mean the same thing. Anything
+      // unlisted gets nothing, because there is nothing left to give it.
+      for (const sym of unnamed) out[sym] = 0;
+    }
+    // ONE RESCALE SERVES BOTH BRANCHES. An explicit divide-by-`named` in the branch
+    // above was redundant with this and no mutation could kill it — the arithmetic is
+    // identical, so it was dead code pretending to be a step. This also catches weights
+    // written for names the basket does not hold, which otherwise leave the held shares
+    // summing to under 1 and quietly undersize every position.
+    const tot = Object.values(out).reduce((a, b) => a + b, 0);
+    if (tot > 0 && Math.abs(tot - 1) > 1e-9) for (const k of Object.keys(out)) out[k] /= tot;
+    return applySleeveSplit(out, list);
+  }
   if (!CORE_TILT_ON || !conv || typeof conv !== 'object') {
     for (const s of list) out[s] = eq;
     return applySleeveSplit(out, list);
@@ -11712,6 +11785,14 @@ if (require.main === module) app.listen(PORT, async () => {
   } else {
     console.log('[MERCURY] ☿ Forecaster OFF (MERCURY_ENABLED=false) — exits revert to stop/target only');
   }
+  if (CORE_WEIGHTS_ON) {
+    const w = Object.entries(CORE_WEIGHT_OVERRIDE)
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, v]) => `${k} ${(v * 100).toFixed(0)}%`).join(' · ');
+    console.log(`[CORE] ⚖️  Explicit weights in force: ${w}. These override conviction, the tilt ` +
+                `and the per-name share cap — an operator's allocation is a decision, not a forecast. ` +
+                `Basket members not listed here split whatever is left, equally.`);
+  }
   if (REGIME_SHIELD_ON) {
     const st = regimeShieldStatus();
     console.log(`[SHIELD] 🛡  Regime shield ON — while ${REGIME_SHIELD_SYMBOL} sits below its ` +
@@ -11994,6 +12075,7 @@ module.exports = {
     regimeShieldStatus, regimeShieldCeiling, refreshRegimeShield,
     REGIME_SHIELD_ON, REGIME_SHIELD_SYMBOL, REGIME_SHIELD_DAYS, REGIME_SHIELD_FLOOR,
     REGIME_SHIELD_MAX_AGE_MS, _regimeShieldPoke: (v) => { _regimeShield = { ..._regimeShield, ...v }; },
+    CORE_WEIGHT_OVERRIDE, CORE_WEIGHTS_ON,
     tradingTrackRecord, tradingRecordMultiplier, TRADING_RECORD_MIN_TRADES,
     TRADING_RECORD_PROBE, TRADING_RECORD_FULL_T, TRADING_RECORD_GATE_ON,
     MERCURY_MIN_HOLD_MS, MERCURY_ACTION_COOLDOWN_MS, MERCURY_ROTATE_MARGIN,

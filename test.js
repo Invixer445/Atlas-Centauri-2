@@ -5693,13 +5693,101 @@ check('mercurySkillLevel no longer takes a bare maximum', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+//  v13.72 — EXPLICIT CORE WEIGHTS
+//  coreWeightMap() caps any single name at max(CORE_TILT_MAX_SHARE, 1/n), which on a
+//  two-name basket is 50%. A 70/30 index core is therefore UNREACHABLE through
+//  conviction, whatever is fed to it. That cap is correct for a model's opinion and
+//  wrong for an operator's deliberate allocation.
+// ════════════════════════════════════════════════════════════════════════════
+// Declared HERE, in the first block that uses it: `const` is not hoisted, and this
+// block sits above the shield block in the file. Declaring it there and reading it
+// here is a temporal-dead-zone error that only shows up at run time.
+const SRV = require('path').join(__dirname, 'server.js').replace(/\\/g, '/');
+function weightProbe(env, body) {
+  const probe = `const I = require('${SRV}')._internals;\n${body}`;
+  try {
+    const out = require('child_process').execFileSync(process.execPath, ['-e', probe], {
+      env: { ...process.env, ...env }, encoding: 'utf8', timeout: 180000 });
+    return JSON.parse(out.trim().split('\n').filter(l => l.startsWith('{')).pop());
+  } catch (e) { throw new Error('probe failed: ' + (e.stdout || e.message)); }
+}
+
+check('with no CORE_WEIGHTS nothing about weighting changes', () => {
+  eq(I.CORE_WEIGHTS_ON, false, 'the override is absent unless asked for');
+  eq(I.CORE_WEIGHT_OVERRIDE, null, 'and carries no map');
+  const w = I.coreWeightMap(['AAA', 'BBB', 'CCC']);
+  const vals = Object.values(w);
+  ok(vals.every(v => Math.abs(v - 1 / 3) < 1e-9),
+     `an unweighted basket must stay equal-weight, got ${JSON.stringify(w)}`);
+});
+
+check('an explicit 70/30 is reachable, which conviction alone cannot do', () => {
+  const r = weightProbe({ CORE_WEIGHTS: 'QQQ:0.70,SPY:0.30' },
+    `console.log(JSON.stringify(I.coreWeightMap(['QQQ','SPY'])));`);
+  eq(+r.QQQ.toFixed(6), 0.70, `QQQ must land on 70%, got ${r.QQQ}`);
+  eq(+r.SPY.toFixed(6), 0.30, `SPY must land on 30%, got ${r.SPY}`);
+  // the control: the same split via conviction is capped at 50/50, which is the whole
+  // reason this feature exists
+  const c = weightProbe({ CORE_TILT: 'on' }, `
+    I.setCoreConviction({ QQQ: 1.0, SPY: 0.0 });
+    console.log(JSON.stringify(I.coreWeightMap(['QQQ','SPY'])));`);
+  ok(c.QQQ <= 0.5 + 1e-9,
+     `premise: conviction alone cannot exceed 50% on a two-name basket, got ${c.QQQ}`);
+});
+
+check('weights are normalised, so 7:3 and 70:30 mean the same thing', () => {
+  const r = weightProbe({ CORE_WEIGHTS: 'QQQ:7,SPY:3' },
+    `console.log(JSON.stringify(I.coreWeightMap(['QQQ','SPY'])));`);
+  eq(+r.QQQ.toFixed(6), 0.70, 'ratios must normalise rather than being read as percents');
+  eq(+r.SPY.toFixed(6), 0.30, '');
+});
+
+check('a malformed entry voids the WHOLE override, not just that entry', () => {
+  // Half an allocation is worse than none: it would silently leave one name weighted
+  // and the rest sharing a remainder nobody chose.
+  for (const bad of ['QQQ:0.7,SPY:banana', 'QQQ:0.7,:0.3', 'QQQ:-1,SPY:2', 'nonsense']) {
+    const r = weightProbe({ CORE_WEIGHTS: bad },
+      `console.log(JSON.stringify({ on: I.CORE_WEIGHTS_ON, map: I.CORE_WEIGHT_OVERRIDE }));`);
+    eq(r.on, false, `"${bad}" must void the override entirely`);
+    eq(r.map, null, `"${bad}" must leave no partial map`);
+  }
+});
+
+check('unlisted basket members split what is left, equally', () => {
+  const r = weightProbe({ CORE_WEIGHTS: 'QQQ:0.60' },
+    `console.log(JSON.stringify(I.coreWeightMap(['QQQ','SPY','IWM'])));`);
+  eq(+r.QQQ.toFixed(6), 0.60, 'the written weight stands');
+  eq(+r.SPY.toFixed(6), 0.20, 'and the remainder splits evenly');
+  eq(+r.IWM.toFixed(6), 0.20, '');
+});
+
+check('weights for names NOT in the basket renormalise rather than shrinking it', () => {
+  // Writing QQQ:0.5,SPY:0.3,GLD:0.2 and then holding only QQQ and SPY must not leave
+  // 20% of the core unallocated and every position quietly undersized.
+  const r = weightProbe({ CORE_WEIGHTS: 'QQQ:0.5,SPY:0.3,GLD:0.2' },
+    `const w = I.coreWeightMap(['QQQ','SPY']);
+     console.log(JSON.stringify({ ...w, sum: Object.values(w).reduce((a,b)=>a+b,0) }));`);
+  eq(+r.sum.toFixed(6), 1, `the basket's weights must still sum to 1, got ${r.sum}`);
+  eq(+r.QQQ.toFixed(4), 0.625, 'and keep the written RATIO (5:3) between the names held');
+  eq(+r.SPY.toFixed(4), 0.375, '');
+});
+
+check('the shield now defaults ON', () => {
+  eq(I.REGIME_SHIELD_ON, true,
+     'a new account should be protected without having to know the flag exists');
+  const r = weightProbe({ REGIME_SHIELD: 'off' },
+    `console.log(JSON.stringify({ on: I.REGIME_SHIELD_ON, ceil: I.regimeShieldCeiling() }));`);
+  eq(r.on, false, 'and REGIME_SHIELD=off must still turn it off');
+  eq(r.ceil, 1, 'imposing no ceiling when off');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 //  v13.71 — THE REGIME SHIELD
 //  Every measurement in this project before now was taken on a 339-session window
 //  whose worst drawdown was 8.4%. Across 24 years of daily data the same structure
 //  draws down 55-60% in a real bear market, and detectMarketRegime() cannot see it
 //  coming because every one of its inputs is intraday.
 // ════════════════════════════════════════════════════════════════════════════
-const SRV = require('path').join(__dirname, 'server.js').replace(/\\/g, '/');
 function shieldProbe(env, body) {
   const probe = `const I = require('${SRV}')._internals;\n${body}`;
   try {
@@ -5709,10 +5797,15 @@ function shieldProbe(env, body) {
   } catch (e) { throw new Error('probe failed: ' + (e.stdout || e.message)); }
 }
 
-check('the shield is off by default and changes nothing', () => {
-  eq(I.REGIME_SHIELD_ON, false, 'a measured lever with a real price ships off');
-  eq(I.regimeShieldCeiling(), 1, 'and imposes no ceiling at all while off');
-  eq(I.regimeShieldStatus().riskOff, false, 'and never reports risk-off');
+check('the shield imposes no ceiling until it has actually read something', () => {
+  // v13.72 flipped the DEFAULT to on. What must stay true is that merely being enabled
+  // changes nothing: the ceiling only appears once there is a fresh reading below the
+  // average. A shield that de-risked on boot, before any data, would sell the book
+  // every restart.
+  eq(I.regimeShieldCeiling(), 1, 'no reading yet means no ceiling');
+  eq(I.regimeShieldStatus().riskOff, false, 'and no risk-off call');
+  ok(/no reading yet|shield off/.test(I.regimeShieldStatus().reason),
+     `and it must say which of the two it is, got "${I.regimeShieldStatus().reason}"`);
 });
 
 check('switched on, a price below the average steps the core down', () => {
