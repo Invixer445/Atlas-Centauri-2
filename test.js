@@ -18,6 +18,11 @@
 
 const engine = require('./server.js');
 const I = engine._internals;
+// Declared beside `I`, at the top, ON PURPOSE. Child-process probes need this path and
+// `const` is not hoisted, so declaring it inside whichever test block happened to come
+// first meant every block inserted ABOVE it later died with a temporal-dead-zone error
+// at run time. That has now happened twice. It lives here so it cannot happen a third.
+const SRV = require('path').join(__dirname, 'server.js').replace(/\\/g, '/');
 
 const MARGIN_RATE = 0.5;   // mirrors server.js (not exported; asserted via relationships)
 
@@ -5693,16 +5698,91 @@ check('mercurySkillLevel no longer takes a bare maximum', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+//  v13.73 — SPY WAS THE BENCHMARK AND COULD NEVER BE HELD
+//  The websocket trade handler and the snapshot loader both diverted SPY into
+//  spyData and `continue`d, so marketData.SPY never existed. mostUnderweightCore()
+//  skips any symbol without a fresh marketData price — correctly, never buy on a
+//  stale price — which is indistinguishable from "already at target". Live on
+//  2026-10-06 the core bought its 70% of QQQ, never bought SPY at all, and sat 31%
+//  in cash. The only hint anywhere was "1/2 names" inside a SUCCESS message.
+// ════════════════════════════════════════════════════════════════════════════
+check('a core name with no price is reported, not silently skipped', () => {
+  const r = weightProbe({ CORE_HOLD_SYMBOLS: 'QQQ,SPY', CORE_HOLD_FRACTION: '0.9',
+                          CORE_BASKET_SOURCE: 'fixed', CORE_WEIGHTS: 'QQQ:0.7,SPY:0.3' }, `
+    I.marketData.QQQ = { price: 760, prevClose: 758, lastUpdate: Date.now() };
+    const missing = I.unpriceableCoreNames();
+    I.marketData.SPY = { price: 774, prevClose: 772, lastUpdate: Date.now() - 300000 };
+    const stale = I.unpriceableCoreNames();
+    I.marketData.SPY = { price: 774, prevClose: 772, lastUpdate: Date.now() };
+    const fine = I.unpriceableCoreNames();
+    console.log(JSON.stringify({ missing, stale, fine }));`);
+  eq(r.missing.length, 1, 'a basket member absent from marketData must be reported');
+  eq(r.missing[0].sym, 'SPY', '');
+  eq(r.stale.length, 1, 'and so must one whose price has gone stale');
+  ok(/old/.test(r.stale[0].why), `the reason must say so, got "${r.stale[0].why}"`);
+  eq(r.fine.length, 0, 'a fresh, priced basket is silent');
+});
+
+check('SPY reaches marketData when it is HELD, and only then', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  // the websocket trade tick
+  const ws = src.slice(src.indexOf("if (symbol === 'SPY') {"),
+                       src.indexOf("if (symbol === 'SPY') {") + 600);
+  ok(/spyData\.price = price;/.test(ws), 'the benchmark must still be updated');
+  ok(/CORE_HOLD_ON && CORE_HOLD_SYMBOLS\.includes\('SPY'\)/.test(ws),
+     'and the bail-out must be CONDITIONAL on SPY not being a core holding');
+  ok(/continue;/.test(ws), 'with the original skip preserved for the not-held case');
+  // the snapshot loader
+  const snap = src.slice(src.indexOf("if (sym === 'SPY') {"),
+                         src.indexOf("if (sym === 'SPY') {") + 600);
+  ok(/CORE_HOLD_ON && CORE_HOLD_SYMBOLS\.includes\('SPY'\)/.test(snap),
+     'the snapshot path needs the same condition — fixing only the stream would leave ' +
+     'the core unable to price SPY until the first tick arrived');
+});
+
+check('a two-ETF core actually fills BOTH legs', () => {
+  // The end-to-end regression: run the real buy loop and require it to reach 2/2.
+  const r = weightProbe({ CORE_HOLD_SYMBOLS: 'QQQ,SPY', CORE_HOLD_FRACTION: '0.9',
+                          CORE_BASKET_SOURCE: 'fixed', CORE_WEIGHTS: 'QQQ:0.7,SPY:0.3',
+                          PHASE_GATE: 'on' }, `
+    I.detectStartingCapital(10000);
+    const now = Date.now();
+    I.marketData.QQQ = { price: 760.38, prevClose: 758, lastUpdate: now };
+    I.marketData.SPY = { price: 774.97, prevClose: 773, lastUpdate: now };
+    I.portfolio.cash = 10000; I.portfolio.coreHolding = {};
+    I.setBrokerMirror({ at: now, ok: true, cash: 10000, buying_power: 10000, positions: [] });
+    for (let i = 0; i < 4; i++) if (!I.coreBuyStep()) break;
+    const h = I.portfolio.coreHolding || {};
+    const val = s => (h[s] && h[s].qty > 0) ? h[s].qty * I.marketData[s].price : 0;
+    console.log(JSON.stringify({ names: Object.keys(h).length, qqq: val('QQQ'),
+                                 spy: val('SPY'), cash: I.portfolio.cash,
+                                 core: I.coreHoldingValue() }));`);
+  eq(r.names, 2, `both legs must be bought, got ${r.names}/2 — this is the live bug`);
+  ok(Math.abs(r.qqq / (r.qqq + r.spy) - 0.70) < 0.01,
+     `QQQ must land near 70% of the core, got ${(r.qqq / (r.qqq + r.spy) * 100).toFixed(1)}%`);
+  ok(r.cash < 400, `and cash must not be left stranded, got $${r.cash.toFixed(2)}`);
+});
+
+check('a basket WITHOUT SPY is unaffected by the fix', () => {
+  // The whole point of gating on membership: every existing deployment must behave
+  // exactly as before, with SPY still a pure benchmark.
+  const r = weightProbe({ CORE_HOLD_SYMBOLS: 'QQQ,AAPL', CORE_HOLD_FRACTION: '0.9',
+                          CORE_BASKET_SOURCE: 'fixed' }, `
+    I.marketData.QQQ  = { price: 760, prevClose: 758, lastUpdate: Date.now() };
+    I.marketData.AAPL = { price: 333, prevClose: 332, lastUpdate: Date.now() };
+    console.log(JSON.stringify({ bad: I.unpriceableCoreNames(),
+                                 spyInMarketData: !!I.marketData.SPY }));`);
+  eq(r.bad.length, 0, 'a fully priced non-SPY basket reports nothing');
+  eq(r.spyInMarketData, false, 'and SPY stays out of marketData entirely');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 //  v13.72 — EXPLICIT CORE WEIGHTS
 //  coreWeightMap() caps any single name at max(CORE_TILT_MAX_SHARE, 1/n), which on a
 //  two-name basket is 50%. A 70/30 index core is therefore UNREACHABLE through
 //  conviction, whatever is fed to it. That cap is correct for a model's opinion and
 //  wrong for an operator's deliberate allocation.
 // ════════════════════════════════════════════════════════════════════════════
-// Declared HERE, in the first block that uses it: `const` is not hoisted, and this
-// block sits above the shield block in the file. Declaring it there and reading it
-// here is a temporal-dead-zone error that only shows up at run time.
-const SRV = require('path').join(__dirname, 'server.js').replace(/\\/g, '/');
 function weightProbe(env, body) {
   const probe = `const I = require('${SRV}')._internals;\n${body}`;
   try {

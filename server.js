@@ -4001,7 +4001,20 @@ function connectWebSocket() {
         const ts     = m.t ? new Date(m.t).getTime() : Date.now();   // RFC3339 → ms
         if (!symbol || !Number.isFinite(price) || price <= 0) continue;
 
-        if (symbol === 'SPY') { spyData.price = price; continue; }
+        // SPY IS THE BENCHMARK **AND**, SINCE v13.72, A HOLDABLE CORE NAME.
+        // This line used to `continue` unconditionally, so SPY's ticks updated the
+        // benchmark and never reached marketData. Nothing noticed for months because
+        // SPY had only ever been the yardstick. The moment it was put in the basket,
+        // mostUnderweightCore() — which skips any symbol without a fresh marketData
+        // price — skipped it on every pass, forever. Live on 2026-10-06: the core
+        // bought its 70% of QQQ, never bought SPY at all, and sat 31% in cash reading
+        // "1/2 names" with no error anywhere.
+        if (symbol === 'SPY') {
+          spyData.price = price;
+          // Only when it is actually held, so a configuration that does not hold SPY
+          // behaves exactly as it did before.
+          if (!(CORE_HOLD_ON && CORE_HOLD_SYMBOLS.includes('SPY'))) continue;
+        }
 
         const ex = marketData[symbol];
         if (!ex) {
@@ -4179,7 +4192,12 @@ async function fetchInitialPrices() {
     symbols.forEach(sym => {
       const q = snapshotToQuote(map[sym]);
       if (!q) return;
-      if (sym === 'SPY') { spyData = { price: q.price, prevClose: q.prevClose }; loaded++; return; }
+      if (sym === 'SPY') {
+        spyData = { price: q.price, prevClose: q.prevClose };
+        // Same reason as the trade tick above: the benchmark still gets its own copy,
+        // but a HELD SPY must also land in marketData or the core can never price it.
+        if (!(CORE_HOLD_ON && CORE_HOLD_SYMBOLS.includes('SPY'))) { loaded++; return; }
+      }
       const ex = marketData[sym];
       marketData[sym] = {
         price:         ex?.price ?? q.price,
@@ -6456,6 +6474,38 @@ function coreTopUpQty(price, totalValue, currentNameValue, cash, nameCount = COR
 // underweight name each cycle walks the basket toward balance without ever selling —
 // the measured rebalance-frequency table showed frequent rebalancing earns nothing
 // back, so drift is tolerated and only NEW money is directed.
+// Which basket members the core CANNOT buy because they have no usable price, and why.
+// Pure except for the throttle, so the condition is testable without a feed.
+function unpriceableCoreNames(now = Date.now()) {
+  if (!CORE_HOLD_ON) return [];
+  const out = [];
+  for (const sym of CORE_HOLD_SYMBOLS) {
+    const d = marketData[sym];
+    const px = d?.price;
+    if (!Number.isFinite(px) || px <= 0) { out.push({ sym, why: 'no price in marketData' }); continue; }
+    const upd = d.lastUpdate;
+    if (upd && (now - upd) > MAX_PRICE_AGE_MS) {
+      out.push({ sym, why: `price is ${Math.round((now - upd) / 1000)}s old (limit ${Math.round(MAX_PRICE_AGE_MS / 1000)}s)` });
+    }
+  }
+  return out;
+}
+
+let _unpriceableWarnedAt = {};
+function reportUnpriceableCoreNames(now = Date.now()) {
+  const bad = unpriceableCoreNames(now);
+  for (const { sym, why } of bad) {
+    if (now - (_unpriceableWarnedAt[sym] || 0) < 3600000) continue;
+    _unpriceableWarnedAt[sym] = now;
+    const w = coreWeightMap()[sym];
+    console.warn(`[CORE] ⚠️  ${sym} is in the basket but CANNOT BE BOUGHT — ${why}. Its ` +
+                 `${Number.isFinite(w) ? (w * 100).toFixed(0) + '%' : 'share'} of the core will sit in ` +
+                 `cash indefinitely and no other message will say so. Check it is in the price feed ` +
+                 `and that the websocket is not dropping it at the ${WS_MAX_SYMBOLS}-symbol cap.`);
+  }
+  return bad;
+}
+
 function mostUnderweightCore() {
   const h = portfolio.coreHolding || {};
   const total = coreHoldingValue();
@@ -6777,6 +6827,15 @@ function maintainCoreHolding() {
   for (let step = 0; step < CORE_BUYS_PER_CYCLE; step++) {
     if (!coreBuyStep()) break;
   }
+  // A BASKET MEMBER THAT CAN NEVER BE PRICED IS NEVER BOUGHT, AND SAYS NOTHING.
+  // mostUnderweightCore() `continue`s past any symbol without a fresh marketData price.
+  // That is correct — never buy on a stale price — but it is also indistinguishable
+  // from "already at target", so a name the feed simply never delivers drops out of the
+  // basket in total silence. Live on 2026-10-06: SPY's ticks were being routed to the
+  // benchmark instead of marketData, the core bought its 70% of QQQ, never bought SPY,
+  // and sat 31% in cash. The only hint anywhere was "1/2 names" inside a success
+  // message. Say it out loud instead, once per symbol per hour.
+  reportUnpriceableCoreNames();
   queueSaveState();
 }
 
@@ -12075,7 +12134,7 @@ module.exports = {
     regimeShieldStatus, regimeShieldCeiling, refreshRegimeShield,
     REGIME_SHIELD_ON, REGIME_SHIELD_SYMBOL, REGIME_SHIELD_DAYS, REGIME_SHIELD_FLOOR,
     REGIME_SHIELD_MAX_AGE_MS, _regimeShieldPoke: (v) => { _regimeShield = { ..._regimeShield, ...v }; },
-    CORE_WEIGHT_OVERRIDE, CORE_WEIGHTS_ON,
+    CORE_WEIGHT_OVERRIDE, CORE_WEIGHTS_ON, unpriceableCoreNames, reportUnpriceableCoreNames,
     tradingTrackRecord, tradingRecordMultiplier, TRADING_RECORD_MIN_TRADES,
     TRADING_RECORD_PROBE, TRADING_RECORD_FULL_T, TRADING_RECORD_GATE_ON,
     MERCURY_MIN_HOLD_MS, MERCURY_ACTION_COOLDOWN_MS, MERCURY_ROTATE_MARGIN,
