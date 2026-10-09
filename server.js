@@ -8120,6 +8120,31 @@ function signalCheck(now = Date.now()) {
   return { move, expected, noise, sigma, sessions, tv, base };
 }
 
+// IS THIS NUMBER ANYTHING? The one question this account generates over and over.
+// Pure, so it can answer on demand instead of once a day inside the digest.
+//
+// THE BANDS ARE NOT ARBITRARY. |sigma| < 1 means the move is smaller than one ordinary
+// wobble of this basket over the time it has been held — there is no information in it
+// whatsoever, up OR down. The honest reading of a +1 sigma day and a -1 sigma day is
+// identical: nothing happened. That symmetry is the whole point, because celebrating
+// +0.74 sigma and panicking at -0.49 sigma is the same mistake, and the second one has
+// already cost this project an entire account.
+function signalVerdict(sigma) {
+  if (!Number.isFinite(sigma)) return { band: 'unknown', text: 'not enough information yet' };
+  const a = Math.abs(sigma);
+  if (a < 1) return { band: 'noise',
+    text: 'NOISE. This is an ordinary wobble and carries no information at all.' };
+  if (a < 2) return { band: 'weak',
+    text: `${sigma > 0 ? 'Mildly ahead' : 'Mildly behind'}, but still inside what chance produces ` +
+          `routinely. Not yet worth acting on.` };
+  if (a < 3) return { band: 'notable',
+    text: `${sigma > 0 ? 'Ahead' : 'Behind'} by more than chance usually manages. Worth looking at, ` +
+          `not yet worth reacting to.` };
+  return { band: 'investigate',
+    text: `${sigma > 0 ? 'Far ahead' : 'Far behind'} what this basket's own volatility explains. ` +
+          `Something other than noise is probably happening — check execution and holdings.` };
+}
+
 // How long until the gain is bigger than the noise. Pure arithmetic on the two numbers
 // above; it does not depend on anything the account has actually done.
 function sessionsToSignal() {
@@ -8133,13 +8158,11 @@ let _signalAnchorAt = null;
 function logSignalCheck() {
   const r = signalCheck();
   if (!r) return;
-  const d = Math.abs(r.sigma);
-  // A verdict in words, because the number is the part nobody internalises.
-  const verdict =
-    d < 1 ? 'NOISE. This is an ordinary wobble and carries no information at all.'
-  : d < 2 ? 'still within normal variation — unusual, but not evidence of anything.'
-  : d < 3 ? 'genuinely unusual. Worth watching; not yet worth acting on.'
-          : 'outside what this basket normally does. Worth investigating the engine, not the market.';
+  // ONE verdict, shared with /api/signal. This was an inline ternary with its own
+  // wording, so the log and the endpoint could disagree about the same number — and
+  // the inline copy was direction-blind, describing a +2.5 sigma run and a -2.5 sigma
+  // slide in identical words.
+  const verdict = signalVerdict(r.sigma).text;
   console.log(`[SIGNAL] ${r.move >= 0 ? '+' : ''}$${r.move.toFixed(2)} over ${r.sessions.toFixed(1)} ` +
     `trading day(s). Expected drift ${r.expected >= 0 ? '+' : ''}$${r.expected.toFixed(2)}, ` +
     `normal noise ±$${r.noise.toFixed(2)} → ${r.sigma >= 0 ? '+' : ''}${r.sigma.toFixed(2)} sigma.`);
@@ -11521,6 +11544,30 @@ app.get('/api/jupiter',   (req, res) => res.json({ ...jupiter.getState(), dynami
 // so the dashboard cannot say "working" while the engine is ignoring the model.
 // 🛡 THE REGIME SHIELD'S READING. Read-only and unauthenticated for the same reason
 // as /api/oracle: the whole value of the thing is that the number is checkable.
+// 📏 IS THIS MOVE ANYTHING? Read-only, unauthenticated, and the reason it exists is
+// that the same question has been asked of this account on five separate days, each
+// time about a move inside one standard deviation. The daily digest already prints
+// this once after the close; this makes it answerable at any moment instead.
+app.get('/api/signal', (req, res) => {
+  const r = signalCheck();
+  if (!r) return res.json({ ready: false, reason: 'no starting capital or value yet' });
+  const v = signalVerdict(r.sigma);
+  const toSignal = sessionsToSignal();
+  res.json({
+    ready: true,
+    move: +r.move.toFixed(2),
+    sessionsHeld: +r.sessions.toFixed(1),
+    expectedDrift: +r.expected.toFixed(2),
+    normalNoise: +r.noise.toFixed(2),
+    sigma: +r.sigma.toFixed(2),
+    band: v.band,
+    verdict: v.text,
+    sessionsToReadableAnswer: Number.isFinite(toSignal) ? Math.round(toSignal) : null,
+    note: 'sigma is the move measured in units of this basket\'s own normal swing over the ' +
+          'time it has been held. Under 1 is nothing, in either direction.'
+  });
+});
+
 // 🥊 Has Venus's stock basket actually beaten the index core? Read-only.
 app.get('/api/challenger', (req, res) => {
   const v = challengerVerdict();
@@ -12315,7 +12362,7 @@ module.exports = {
     pendingEntryTickers, committedPositionCount, dispatchFill, isInsideSessionBuffer, partialClose,
     DRIFT_SANITY_PCT, gapData, isGapBlocked,
     PROFIT_FLOOR_PCT, PROFIT_FLOOR_ON, PROFIT_FLOOR_KEEP, profitFloorCash,
-    signalCheck, sessionsToSignal, logSignalCheck, SIGNAL_DAILY_SD, SIGNAL_ANNUAL_DRIFT,
+    signalCheck, sessionsToSignal, logSignalCheck, signalVerdict, SIGNAL_DAILY_SD, SIGNAL_ANNUAL_DRIFT,
     getSignalAnchor: () => _signalAnchorAt, setSignalAnchor: (v) => { _signalAnchorAt = v; },
     GROWTH_SLEEVE_ON, GROWTH_SLEEVE_FRACTION, GROWTH_SLEEVE_NAMES, GROWTH_POOL,
     GROWTH_DISASTER_STOP, growthNames, isGrowthName, applySleeveSplit, withGrowthSleeve,

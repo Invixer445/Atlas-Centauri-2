@@ -5698,6 +5698,43 @@ check('mercurySkillLevel no longer takes a bare maximum', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+//  v13.74 — "IS THIS ANYTHING?" ON DEMAND
+//  The same question has been asked of this account on five separate days, every time
+//  about a move inside one standard deviation. The arithmetic already existed but ran
+//  once a day inside the digest, and the log's verdict was a second, direction-blind
+//  copy of the endpoint's.
+// ════════════════════════════════════════════════════════════════════════════
+check('a move under one sigma is NOISE in both directions', () => {
+  // The symmetry is the entire point: celebrating +0.74 and panicking at -0.49 is the
+  // same mistake, and the second one has already cost this project an account.
+  eq(I.signalVerdict(-0.51).band, 'noise', 'the live -0.51 sigma move is noise');
+  eq(I.signalVerdict(0.74).band,  'noise', 'and so was the +0.74 sigma day celebrated earlier');
+  eq(I.signalVerdict(-0.51).text, I.signalVerdict(0.51).text,
+     'the wording must be IDENTICAL for an equal move up or down');
+  eq(I.signalVerdict(0).band, 'noise', '');
+});
+
+check('the bands escalate and stay finite', () => {
+  eq(I.signalVerdict(1.4).band, 'weak',        '');
+  eq(I.signalVerdict(2.3).band, 'notable',     '');
+  eq(I.signalVerdict(3.5).band, 'investigate', '');
+  eq(I.signalVerdict(-3.5).band, 'investigate', 'and severity is on the MAGNITUDE, not the sign');
+  ok(/behind/i.test(I.signalVerdict(-3.5).text), 'though the direction must still be stated');
+  ok(/ahead/i.test(I.signalVerdict(3.5).text), '');
+  eq(I.signalVerdict(NaN).band, 'unknown', 'and nothing non-finite may be given a verdict');
+  eq(I.signalVerdict(Infinity).band, 'unknown', '');
+  eq(I.signalVerdict(undefined).band, 'unknown', '');
+});
+
+check('the daily log and the endpoint cannot disagree', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fn = src.slice(src.indexOf('function logSignalCheck'), src.indexOf('function logPerformanceDigest'));
+  ok(/signalVerdict\(r\.sigma\)/.test(fn),
+     'the log must call the shared verdict, not keep a second copy that can drift');
+  ok(!/d < 1 \?/.test(fn), 'and the old inline ternary must be gone');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 //  v13.73 — THE BASKET CHALLENGER
 //  edge-register.json has carried the claim "venus-basket-beats-fixed ... Money stays
 //  on the control until this says otherwise" since 2026-08-28, with results: []. The
