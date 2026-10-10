@@ -5728,6 +5728,26 @@ check('per-minute volatility is converted from the decision bar, not assumed', (
      `volatility scales with the square root of time, so the ratio must be sqrt(60)=7.75, got ${ratio.toFixed(3)}`);
 });
 
+check('the bar-minutes constant mirrors the fetch branch, including its else', () => {
+  // fetchCandles tests ONE thing: DECISION_TIMEFRAME === '1Hour'. Hourly bars go in
+  // .m1; every other value puts ONE-MINUTE bars there. A mapping that invents a 5Min
+  // or 15Min case would divide already-per-minute ATR and understate the spread again.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fetch1 = src.indexOf("if (DECISION_TIMEFRAME === '1Hour') {");
+  const branch = src.slice(fetch1, fetch1 + 900);
+  ok(/candleData\[sym\]\.m1 = c1h/.test(branch), 'premise: 1Hour routes HOURLY bars into .m1');
+  ok(/} else {[\s\S]*candleData\[sym\]\.m1 = c1m/.test(branch),
+     'premise: every other timeframe routes ONE-MINUTE bars into .m1');
+  const decl = src.slice(src.indexOf('const DECISION_BAR_MINUTES'), src.indexOf('function atrPctPerMinute'));
+  ok(!/'5Min'|'15Min'/.test(decl),
+     'so the constant must NOT invent 5Min/15Min cases the fetcher cannot produce');
+  ok(/'1Hour' \? 60 : 1/.test(decl), 'it is binary, exactly like the branch it mirrors');
+  // behavioural: under a non-1Hour timeframe the conversion must be a no-op
+  const r = weightProbe({ DECISION_TIMEFRAME: '5Min' }, `
+    console.log(JSON.stringify({ m: I.DECISION_BAR_MINUTES }));`);
+  eq(r.m, 1, 'a 5Min timeframe still puts MINUTE bars in .m1, so no conversion applies');
+});
+
 check('a liquid name is no longer charged a thin-market spread', () => {
   const now = Date.now();
   for (const [sym, px] of [['ZQQQ', 751], ['ZSPY', 778], ['ZAPL', 333]]) {

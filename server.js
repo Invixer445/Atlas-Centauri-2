@@ -1721,6 +1721,14 @@ function createJupiter(config = {}) {
       clip(dir * R.momRaw * 20, -1, 1),                 // momAlign
       clip((R.sessionRaw - 0.5) * 2, -1, 1),            // session
       clip(dir * R.regimeRaw, -1, 1),                   // regimeAlign
+      // CENTRED ON 10bp, which is where modelled spreads sat BEFORE v13.75 corrected
+      // them to ~3.5bp for liquid names. The feature therefore now reads about -0.32
+      // for most of the basket instead of spanning its range. It still separates liquid
+      // from thin (a thin name carries a +15bp penalty and reads about +0.4), which is
+      // the job, so this is a loss of resolution rather than a fault. Deliberately NOT
+      // recentred: Jupiter's weights are learned against this scaling, and rescaling a
+      // live model's input for cosmetics is an unforced change with no measurement
+      // behind it. Recorded here so it is a known trade-off and not a surprise.
       clip((R.spreadRaw - 0.001) / 0.002, -1, 1)        // spread
     ];
     for (let i = 0; i < f.length; i++) if (!Number.isFinite(f[i])) f[i] = 0;  // NaN-proof
@@ -5583,10 +5591,16 @@ function hasReliableVolatility(symbol) { return atrQuality(symbol) === 'candle';
 // the stop geometry, the R:R and the entry floor are all defined on it — so atrPct()
 // is right as it stands. Only the spread model wanted per-minute volatility, and it
 // is the one place that must convert.
-const DECISION_BAR_MINUTES = DECISION_TIMEFRAME === '1Hour' ? 60
-                           : DECISION_TIMEFRAME === '15Min' ? 15
-                           : DECISION_TIMEFRAME === '5Min'  ? 5
-                           : 1;
+// MIRRORS THE FETCH BRANCH EXACTLY, AND MUST KEEP DOING SO. fetchCandles has one
+// binary test: DECISION_TIMEFRAME === '1Hour' puts HOURLY bars in .m1, and EVERY other
+// value puts ONE-MINUTE bars there (there is no 5-minute or 15-minute path into .m1 —
+// .m5 is a separate field that calculateATR never reads).
+//
+// The first version of this line mapped '5Min' to 5 and '15Min' to 15, inventing cases
+// the fetcher cannot produce. Setting DECISION_TIMEFRAME=5Min would then have divided
+// already-per-minute ATR by sqrt(5) and understated the spread by 2.2x — the same class
+// of unit error this constant exists to fix, reintroduced one function away from it.
+const DECISION_BAR_MINUTES = DECISION_TIMEFRAME === '1Hour' ? 60 : 1;
 
 // Volatility scales with the square root of time, so a bar spanning N minutes carries
 // sqrt(N) times the per-minute move.
@@ -5671,11 +5685,18 @@ function calculateRVOL(symbol) {
     return vol > VOLATILITY_FILTERS.MIN_VOLUME_THRESHOLD * FEED_VOLUME_FACTOR ? 1.0 : 0.5;
   }
 
-  // Sum of the most recent 5 bars = current 5-min volume
+  // BARS, NOT MINUTES. These said "5-min volume" and "~50 min lookback", which is true
+  // only when .m1 holds minute bars — under the default DECISION_TIMEFRAME=1Hour they
+  // are 5 HOURS and 50 HOURS. The ARITHMETIC is unaffected, because RVOL is a ratio of
+  // like-sized windows and the units cancel; the comments were simply false. They are
+  // corrected rather than deleted because a comment asserting the wrong timeframe is
+  // precisely what let estimateDynamicSpread charge hourly volatility as per-minute for
+  // months (see v13.75).
+  // Most recent 5 decision bars = the current window's volume.
   const recent5 = candles.slice(-5);
   const currentVol = recent5.reduce((s, c) => s + (c.v || 0), 0);
 
-  // Average 5-bar volume over the prior 10 windows (50 bars = ~50 min lookback)
+  // The prior 10 windows of the same size, for the baseline.
   const prior50 = candles.slice(-55, -5);
   if (prior50.length < 5) return 1.0;
   // Chunk into 5-bar windows and average
@@ -9876,19 +9897,22 @@ function createMercury() {
   function sigmaFor(sym, minutes) {
     const state = vol[sym];
     let perMin = (state && state.v != null && state.bars >= 10) ? Math.sqrt(state.v) : null;
-    // UNITS. atrPct() is computed from ONE-MINUTE candles (calculateATR reads
-    // candleData[].m1), so it is already a per-minute figure — the first version of this
-    // line divided it by sqrt(390) on the belief that it was daily, which understated
-    // volatility by a factor of twenty. Every expected return is linear in sigma, so a
-    // 20x error there made every forecast twenty times too small to clear a round trip
-    // and Mercury would have sat inert for ever while reporting healthy-looking
-    // probabilities. ATR is roughly 1.25 standard deviations for a normal, hence /1.25.
     if (perMin == null || !(perMin > 0)) perMin = historyVol(sym);
-    // SAME UNIT TRAP as estimateDynamicSpread, and the comment above still describes
-    // the pre-1Hour world: .m1 holds HOURLY bars in production, so atrPct() is not a
-    // per-minute figure at all. This is only the third fallback — the EWMA state and
-    // historyVol are tried first — but when it does run it was overstating sigma by
-    // sqrt(60), which inflates every expected return built on it.
+    // UNITS, GOT WRONG TWICE — THE WHOLE HISTORY, BECAUSE THE WRONG VERSION OF THIS
+    // COMMENT IS WHAT PROPAGATED THE BUG.
+    //   v1 divided atrPct() by sqrt(390) believing it a DAILY figure. A twentyfold
+    //      understatement; every expected return is linear in sigma, so Mercury would
+    //      have sat inert for ever while reporting healthy-looking probabilities.
+    //   v2 "fixed" it by asserting atrPct() was already PER-MINUTE, and said so in a
+    //      comment right here. That was also wrong, and being written down made it
+    //      survive: calculateATR reads candleData[].m1, a field NAMED m1 that holds
+    //      HOURLY bars whenever DECISION_TIMEFRAME=1Hour — the production default. The
+    //      test written to lock v2 in demanded a per-minute sigma of 0.012, which is
+    //      23.7% DAILY and 376% ANNUAL volatility. Not a US equity; not any asset.
+    //   v3 (here) converts explicitly: atrPct() is PER DECISION BAR, so divide by
+    //      sqrt(DECISION_BAR_MINUTES) to reach per-minute. ATR is about 1.25 standard
+    //      deviations for a normal, hence the further /1.25.
+    // Third fallback only — the EWMA state and historyVol are tried first.
     const atrFallback = fin(atrPctPerMinute(sym), 0.02 / Math.sqrt(DECISION_BAR_MINUTES)) / 1.25;
     if (perMin == null || !(perMin > 0)) perMin = atrFallback;
     const s = perMin * Math.sqrt(Math.max(1, minutes));
