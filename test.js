@@ -5160,12 +5160,19 @@ check('a marginal edge across eight simultaneous tests is not an edge', () => {
 });
 
 check('a symbol with no candle history still gets an honest volatility', () => {
-  // THE UNITS BUG, LOCKED DOWN. atrPct() is computed from ONE-MINUTE candles, so it is
-  // already per-minute. The first version of sigmaFor divided it by sqrt(390) believing
-  // it was a daily figure, which understated volatility twentyfold. Expected return is
-  // linear in sigma, so that single line made every forecast twenty times too small to
-  // clear a round trip — Mercury would have sat permanently inert while reporting
-  // perfectly healthy-looking probabilities, which is the hardest kind of bug to notice.
+  // THE UNITS BUG, CORRECTED TWICE. Round one: sigmaFor divided atrPct by sqrt(390)
+  // believing it daily, understating volatility twentyfold. The fix asserted atrPct was
+  // ALREADY per-minute, and this test locked that in.
+  //
+  // It was still wrong. atrPct() reads candleData[].m1 — a field NAMED m1 that holds
+  // HOURLY bars whenever DECISION_TIMEFRAME=1Hour, the production default. So atrPct is
+  // a per-DECISION-BAR figure, and treating it as per-minute overstates sigma by
+  // sqrt(60). The value this test used to demand, 0.012 per minute, implies 23.7% DAILY
+  // and 376% ANNUAL volatility. That is not a US equity; it is not any asset.
+  //
+  // The old sanity check below was one-sided — it guarded the floor (`daily > 0.002`)
+  // and had no ceiling, which is exactly how a 376% figure sat here unchallenged. Both
+  // ends are checked now.
   // Only reachable when the EWMA has no bars, i.e. a freshly added name.
   const snap = snapMercury();
   try {
@@ -5178,15 +5185,19 @@ check('a symbol with no candle history still gets an honest volatility', () => {
     const atr = I.atrPct(sym);
     ok(atr > 0, `premise: atrPct returns a figure (${atr})`);
     const perMin = I.mercury.sigmaFor(sym, 1);
-    near(perMin, atr / 1.25, 1e-6,
-         'with no candles and no history, per-minute sigma must be the per-minute ATR ' +
-         'converted by the ATR/sigma ratio — NOT divided by the length of a session');
+    near(perMin, atr / Math.sqrt(I.DECISION_BAR_MINUTES) / 1.25, 1e-6,
+         'per-minute sigma must be the DECISION-BAR ATR converted down to one minute ' +
+         'and then by the ATR/sigma ratio — not divided by a session, and not taken raw');
     const daily = I.mercury.sigmaFor(sym, 390);
     near(daily / perMin, Math.sqrt(390), 1e-3, 'and horizons must scale as the square root of time');
-    // Sanity: a US equity's daily sigma is not one basis point.
+    // BOTH ENDS. A one-sided check is what let a 376%-annual fallback live here.
     ok(daily > 0.002,
        `a fallback daily sigma of ${(daily*100).toFixed(4)}% is not a plausible US equity — ` +
        'this is the twentyfold understatement, back');
+    ok(daily < 0.10,
+       `a fallback daily sigma of ${(daily*100).toFixed(1)}% implies ` +
+       `${(daily*Math.sqrt(252)*100).toFixed(0)}% a year — no US equity does that, and the ` +
+       'missing ceiling is what hid the overstatement for an entire release');
   } finally { restoreMercury(snap); }
 });
 
@@ -5695,6 +5706,67 @@ check('mercurySkillLevel no longer takes a bare maximum', () => {
   ok(/qualified\[MERCURY_ALLOC_MIN_HORIZONS - 1\]/.test(fn),
      'returning the Nth best is the whole correction — returning qualified[0] would ' +
      'reintroduce the bias with extra steps');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  v13.75 — THE SPREAD MODEL WAS CHARGING HOURLY VOLATILITY AS A PER-MINUTE ONE
+//  candleData[sym].m1 is NAMED m1 and holds HOURLY bars whenever
+//  DECISION_TIMEFRAME=1Hour, which is the production default. calculateATR reads
+//  .m1, so atrPct() is an HOURLY figure — and estimateDynamicSpread multiplied it by
+//  a coefficient its own comment says was calibrated on 1-minute ATR.
+// ════════════════════════════════════════════════════════════════════════════
+check('per-minute volatility is converted from the decision bar, not assumed', () => {
+  eq(I.DECISION_BAR_MINUTES, 60,
+     'the production default is 1Hour bars, so one decision bar spans 60 minutes');
+  const now = Date.now();
+  I.marketData.ZATR = { price: 100, prevClose: 100, lastUpdate: now, dailyVolume: 50e6 };
+  I.candleData.ZATR = { m1: [] };
+  const perBar = I.atrPct('ZATR'), perMin = I.atrPctPerMinute('ZATR');
+  ok(perBar > 0, 'premise: the bar-level figure is positive');
+  const ratio = perBar / perMin;
+  ok(Math.abs(ratio - Math.sqrt(60)) < 0.01,
+     `volatility scales with the square root of time, so the ratio must be sqrt(60)=7.75, got ${ratio.toFixed(3)}`);
+});
+
+check('a liquid name is no longer charged a thin-market spread', () => {
+  const now = Date.now();
+  for (const [sym, px] of [['ZQQQ', 751], ['ZSPY', 778], ['ZAPL', 333]]) {
+    I.marketData[sym] = { price: px, prevClose: px, lastUpdate: now, dailyVolume: 50e6 };
+    I.candleData[sym] = { m1: [] };
+    const bp = I.estimateDynamicSpread(sym) * 1e4;
+    ok(bp < 6, `${sym} at $${px} must model under 6bp, got ${bp.toFixed(2)}bp — it was 14.00bp, ` +
+               `against a real quoted spread of 1-2bp (a penny on $750 is 0.13bp)`);
+    ok(bp >= 2, `but never under the 2bp floor, got ${bp.toFixed(2)}bp`);
+  }
+});
+
+check('the spread still widens with volatility, just by the right amount', () => {
+  // The fix must not flatten the model into a constant — the sign and shape were
+  // always right, only the units were wrong.
+  const now = Date.now();
+  const mk = (sym, atr) => {
+    I.marketData[sym] = { price: 100, prevClose: 100, lastUpdate: now, dailyVolume: 50e6 };
+    // a bar series whose range gives roughly the ATR we want
+    I.candleData[sym] = { m1: Array.from({ length: 20 }, () => ({
+      o: 100, h: 100 + atr * 50, l: 100 - atr * 50, c: 100, v: 1e6 })) };
+    return I.estimateDynamicSpread(sym);
+  };
+  const calm = mk('ZCALM', 0.004), wild = mk('ZWILD', 0.040);
+  ok(wild > calm, `a ten-times-more-volatile name must still quote wider (${(calm*1e4).toFixed(2)}bp vs ${(wild*1e4).toFixed(2)}bp)`);
+  ok(wild * 1e4 < 100, `but must stay sane, got ${(wild*1e4).toFixed(1)}bp`);
+});
+
+check('the cost ceiling is reachable again for ordinary names', () => {
+  // MAX_ROUND_TRIP_COST rejects an entry whose modelled cost exceeds it. At 14bp of
+  // spread plus the adverse-selection allowance, liquid mega-caps were being charged
+  // a sizeable fraction of the ceiling for no reason.
+  const now = Date.now();
+  I.marketData.ZCEIL = { price: 500, prevClose: 500, lastUpdate: now, dailyVolume: 50e6 };
+  I.candleData.ZCEIL = { m1: [] };
+  const roundTrip = I.estimateDynamicSpread('ZCEIL') * 2;   // in and out
+  ok(roundTrip < I.STRATEGY.MAX_ROUND_TRIP_COST,
+     `a liquid name's round trip (${(roundTrip*1e4).toFixed(1)}bp) must sit well inside the ` +
+     `${(I.STRATEGY.MAX_ROUND_TRIP_COST*1e4).toFixed(0)}bp ceiling`);
 });
 
 // ════════════════════════════════════════════════════════════════════════════

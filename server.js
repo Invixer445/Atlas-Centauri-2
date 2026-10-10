@@ -5579,6 +5579,22 @@ function atrQuality(symbol) {
 function hasReliableVolatility(symbol) { return atrQuality(symbol) === 'candle'; }
 
 // ATR as a fraction of price (volatility %), clamped to a sane band.
+// How many minutes one decision bar spans. Indicators WANT decision-timeframe ATR —
+// the stop geometry, the R:R and the entry floor are all defined on it — so atrPct()
+// is right as it stands. Only the spread model wanted per-minute volatility, and it
+// is the one place that must convert.
+const DECISION_BAR_MINUTES = DECISION_TIMEFRAME === '1Hour' ? 60
+                           : DECISION_TIMEFRAME === '15Min' ? 15
+                           : DECISION_TIMEFRAME === '5Min'  ? 5
+                           : 1;
+
+// Volatility scales with the square root of time, so a bar spanning N minutes carries
+// sqrt(N) times the per-minute move.
+function atrPctPerMinute(symbol) {
+  const a = atrPct(symbol);
+  return Number.isFinite(a) ? a / Math.sqrt(Math.max(1, DECISION_BAR_MINUTES)) : 0;
+}
+
 function atrPct(symbol) {
   const price = marketData[symbol]?.price || 0;
   if (price <= 0) return 0.02;
@@ -5833,7 +5849,19 @@ function estimateDynamicSpread(symbol) {
   //   • Thin participation and hard-to-borrow names carry a modest premium.
   const tick = 0.01 / d.price;                    // one cent as a fraction of price
   let spread = Math.max(tick, 0.0002);            // floor: 1 tick, min 2bp
-  spread += atrPct(symbol) * 0.08;                // per-minute vol premium (weak, correct sign)
+  // PER-MINUTE, NOT PER-BAR. This line read atrPct() directly, and atrPct() reads
+  // candleData[].m1 — a field NAMED m1 that holds HOURLY bars whenever
+  // DECISION_TIMEFRAME=1Hour, which is the production default (server.js sets
+  // candleData[sym].m1 = c1h). Hourly ATR is about sqrt(60) = 7.75x the per-minute
+  // figure this coefficient was calibrated against, so the premium was 7.75x too big
+  // and the modelled spread 3-4x too wide: 14bp on names whose real quoted spread is
+  // 1-2bp, and 0.13bp for SPY and QQQ where a penny on $750 IS the spread.
+  //
+  // THAT NUMBER IS NOT COSMETIC. It feeds MAX_ROUND_TRIP_COST, which rejects entries
+  // for being too expensive, and it is what the backtest charges per trade — so the
+  // trading layer's measured "$0.73 of cost against $0.80 of gross edge" was computed
+  // against a toll several times larger than the market charges.
+  spread += atrPctPerMinute(symbol) * 0.08;       // vol premium (weak, correct sign)
 
   // BUG B FIX: Use RVOL instead of static dailyVolume for the liquidity penalty.
   // dailyVolume is a stale daily snapshot; RVOL reflects current 5-min participation.
@@ -9856,7 +9884,12 @@ function createMercury() {
     // and Mercury would have sat inert for ever while reporting healthy-looking
     // probabilities. ATR is roughly 1.25 standard deviations for a normal, hence /1.25.
     if (perMin == null || !(perMin > 0)) perMin = historyVol(sym);
-    const atrFallback = fin(atrPct(sym), 0.02) / 1.25;
+    // SAME UNIT TRAP as estimateDynamicSpread, and the comment above still describes
+    // the pre-1Hour world: .m1 holds HOURLY bars in production, so atrPct() is not a
+    // per-minute figure at all. This is only the third fallback — the EWMA state and
+    // historyVol are tried first — but when it does run it was overstating sigma by
+    // sqrt(60), which inflates every expected return built on it.
+    const atrFallback = fin(atrPctPerMinute(sym), 0.02 / Math.sqrt(DECISION_BAR_MINUTES)) / 1.25;
     if (perMin == null || !(perMin > 0)) perMin = atrFallback;
     const s = perMin * Math.sqrt(Math.max(1, minutes));
     // Clamp to something a US equity can plausibly do, so one bad bar cannot produce a
@@ -12384,6 +12417,7 @@ module.exports = {
     REGIME_SHIELD_ON, REGIME_SHIELD_SYMBOL, REGIME_SHIELD_DAYS, REGIME_SHIELD_FLOOR,
     REGIME_SHIELD_MAX_AGE_MS, _regimeShieldPoke: (v) => { _regimeShield = { ..._regimeShield, ...v }; },
     CORE_WEIGHT_OVERRIDE, CORE_WEIGHTS_ON, unpriceableCoreNames, reportUnpriceableCoreNames,
+    atrPctPerMinute, DECISION_BAR_MINUTES,
     basketDailyReturns, evaluateBasketChallenger, challengerVerdict, basketChallengerTick,
     challengerWins,
     BASKET_CHALLENGER_ON, CHALLENGER_MIN_DAYS, CHALLENGER_MIN_T, CHALLENGER_AUTO_SWITCH,
