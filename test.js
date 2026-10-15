@@ -5709,6 +5709,61 @@ check('mercurySkillLevel no longer takes a bare maximum', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+//  v13.76 — THE SHIELD MUST NOT DE-RISK A CORE THAT IS ALREADY THE SAFE ASSET
+//  The shield sells the core down and the proceeds sit in portfolio.cash, which
+//  accrues NOTHING here. On an equity core that is the point. On a T-bill core it
+//  swaps a ~4% yield for 0% while taking the same risk — about $315/yr on $10,000,
+//  logged as a textbook risk-off and invisible as a loss.
+// ════════════════════════════════════════════════════════════════════════════
+check('a T-bill core is never de-risked into idle cash', () => {
+  const r = weightProbe({ CORE_BASKET_SOURCE: 'fixed', CORE_HOLD_SYMBOLS: 'BIL,QQQ',
+                          CORE_WEIGHTS: 'BIL:0.95,QQQ:0.05', CORE_HOLD_FRACTION: '0.9',
+                          REGIME_SHIELD: 'on' }, `
+    I._regimeShieldPoke({ price: 600, ma: 700, asOf: Date.now(), bars: 300 });
+    console.log(JSON.stringify({ defensive: I.coreDefensiveWeight(),
+                                 riskOff: I.regimeShieldStatus().riskOff,
+                                 ceiling: I.regimeShieldCeiling() }));`);
+  eq(r.defensive, 0.95, 'premise: the core is 95% cash-equivalents');
+  eq(r.riskOff, true,  'premise: the shield genuinely reads risk-off');
+  eq(r.ceiling, 1, 'yet it must impose NO ceiling — selling bills into cash is the ' +
+                   'same risk for less yield');
+});
+
+check('an equity core is still de-risked exactly as before', () => {
+  // The guard must not quietly disable the shield for the case it was built for.
+  const r = weightProbe({ CORE_BASKET_SOURCE: 'fixed', CORE_HOLD_SYMBOLS: 'QQQ,SPY',
+                          CORE_WEIGHTS: 'QQQ:0.70,SPY:0.30', CORE_HOLD_FRACTION: '0.9',
+                          REGIME_SHIELD: 'on', REGIME_SHIELD_FLOOR: '0.30' }, `
+    I._regimeShieldPoke({ price: 600, ma: 700, asOf: Date.now(), bars: 300 });
+    console.log(JSON.stringify({ defensive: I.coreDefensiveWeight(),
+                                 ceiling: I.regimeShieldCeiling() }));`);
+  eq(r.defensive, 0, 'an all-equity core holds no cash-equivalents');
+  eq(r.ceiling, 0.30, 'so the shield must still step it down to the floor');
+});
+
+check('a half-and-half core falls on the side the threshold names', () => {
+  const r = weightProbe({ CORE_BASKET_SOURCE: 'fixed', CORE_HOLD_SYMBOLS: 'BIL,QQQ',
+                          CORE_WEIGHTS: 'BIL:0.50,QQQ:0.50', CORE_HOLD_FRACTION: '0.9',
+                          REGIME_SHIELD: 'on', REGIME_SHIELD_FLOOR: '0.30',
+                          REGIME_SHIELD_SKIP_DEFENSIVE: '0.60' }, `
+    I._regimeShieldPoke({ price: 600, ma: 700, asOf: Date.now(), bars: 300 });
+    console.log(JSON.stringify({ defensive: I.coreDefensiveWeight(),
+                                 ceiling: I.regimeShieldCeiling() }));`);
+  eq(r.defensive, 0.5, '50% defensive');
+  eq(r.ceiling, 0.30, 'below the 60% threshold, so the shield still acts on the ' +
+                      'equity half — the guard is a threshold, not an on/off switch');
+});
+
+check('the cash-equivalent list is a real list and is configurable', () => {
+  ok(I.CASH_EQUIVALENT_SYMBOLS.has('BIL'), 'BIL is the canonical T-bill fund');
+  ok(I.CASH_EQUIVALENT_SYMBOLS.has('SGOV'), 'and SGOV');
+  ok(!I.CASH_EQUIVALENT_SYMBOLS.has('QQQ'), 'QQQ is emphatically not a cash equivalent');
+  ok(!I.CASH_EQUIVALENT_SYMBOLS.has('SPY'), 'nor SPY');
+  ok(I.REGIME_SHIELD_SKIP_DEFENSIVE > 0 && I.REGIME_SHIELD_SKIP_DEFENSIVE <= 1,
+     `the threshold must be a fraction, got ${I.REGIME_SHIELD_SKIP_DEFENSIVE}`);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 //  v13.75 — THE SPREAD MODEL WAS CHARGING HOURLY VOLATILITY AS A PER-MINUTE ONE
 //  candleData[sym].m1 is NAMED m1 and holds HOURLY bars whenever
 //  DECISION_TIMEFRAME=1Hour, which is the production default. calculateATR reads

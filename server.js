@@ -6434,9 +6434,42 @@ function regimeShieldStatus(now = Date.now()) {
                `above its ${REGIME_SHIELD_DAYS}-day average` };
 }
 
+// SYMBOLS THAT ARE ALREADY THE SAFE SIDE OF THE TRADE. T-bill and ultra-short
+// treasury funds move so little that "de-risking" out of them is not de-risking.
+const CASH_EQUIVALENT_SYMBOLS = new Set(
+  String(process.env.CASH_EQUIVALENTS || 'BIL,SGOV,SHV,BILS,USFR,TFLO,XHLF,SHY')
+    .split(',').map(x => x.trim().toUpperCase()).filter(Boolean));
+
+// How much of the core is already sitting in those.
+function coreDefensiveWeight() {
+  try {
+    const w = coreWeightMap();
+    let sum = 0;
+    for (const k of Object.keys(w)) {
+      if (CASH_EQUIVALENT_SYMBOLS.has(k) && Number.isFinite(w[k])) sum += w[k];
+    }
+    return Math.max(0, Math.min(1, sum));
+  } catch (e) { return 0; }
+}
+
+// Above this share of cash-equivalents, the shield stands down. See regimeShieldCeiling.
+const REGIME_SHIELD_SKIP_DEFENSIVE = Math.max(0, Math.min(1,
+  parseFloat(process.env.REGIME_SHIELD_SKIP_DEFENSIVE || '0.60')));
+
 // The ceiling the shield imposes on the core right now. 1 = no constraint.
 function regimeShieldCeiling() {
-  return regimeShieldStatus().riskOff ? REGIME_SHIELD_FLOOR : 1;
+  if (!regimeShieldStatus().riskOff) return 1;
+  // DO NOT DE-RISK A CORE THAT IS ALREADY THE SAFE ASSET. The shield sells the core
+  // down to REGIME_SHIELD_FLOOR and the proceeds sit in portfolio.cash, which accrues
+  // NOTHING in this ledger. On an equity core that is the whole point: swap market risk
+  // for zero return. On a T-bill core it is strictly destructive — it swaps an asset
+  // with essentially no drawdown and a ~4% yield for one with no drawdown and no yield,
+  // taking the same risk for less money. On a 95% BIL core that is roughly $315 a year
+  // on a $10,000 account, paid for nothing, and it would have been invisible: the
+  // shield would have logged a textbook risk-off and quietly cost money every day it
+  // stayed there.
+  if (coreDefensiveWeight() >= REGIME_SHIELD_SKIP_DEFENSIVE) return 1;
+  return REGIME_SHIELD_FLOOR;
 }
 
 function effectiveCoreFraction() {
@@ -12438,6 +12471,7 @@ module.exports = {
     ALLOC_SHORT_TARGET, ALLOC_FULL_SKILL, MERCURY_EDGE_COST_MULT, MERCURY_RISK_AVERSION,
     MERCURY_ALLOC_MIN_SAMPLES, MERCURY_ALLOC_MIN_HORIZONS, MERCURY_HORIZON_KEYS,
     regimeShieldStatus, regimeShieldCeiling, refreshRegimeShield,
+    coreDefensiveWeight, CASH_EQUIVALENT_SYMBOLS, REGIME_SHIELD_SKIP_DEFENSIVE,
     REGIME_SHIELD_ON, REGIME_SHIELD_SYMBOL, REGIME_SHIELD_DAYS, REGIME_SHIELD_FLOOR,
     REGIME_SHIELD_MAX_AGE_MS, _regimeShieldPoke: (v) => { _regimeShield = { ..._regimeShield, ...v }; },
     CORE_WEIGHT_OVERRIDE, CORE_WEIGHTS_ON, unpriceableCoreNames, reportUnpriceableCoreNames,
