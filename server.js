@@ -312,7 +312,16 @@ class OnlineLogistic {
   constructor(dim, opts = {}) {
     this.dim   = dim;
     this.w     = new Array(dim).fill(0);
-    this.b     = 0;
+    // SEEDABLE BIAS. With b=0 and zero weights the model outputs sigmoid(0) = 0.5 for
+    // every input. That is not neutral — it is a confident claim that the event is a
+    // coin flip. On Mercury's 30-minute horizon the sigma band makes "up" happen about
+    // 10-15% of the time, so a 0.5 forecast scores a Brier skill of about -1.2 against
+    // the base rate. See the reset loop documented in skillOf(): that score tripped the
+    // corruption detector, which zeroed the weights, which produced the same 0.5
+    // forecast, which scored -1.2 again. The reset WAS the cause of the next reset.
+    // Seeding b = logit(baseRate) makes an untrained model say "the usual rate", which
+    // is the honest thing for a model that knows nothing.
+    this.b     = Number.isFinite(opts.bias) ? opts.bias : 0;
     this.lr    = opts.lr ?? 0.06;     // learning rate
     this.l2    = opts.l2 ?? 1e-3;     // L2 regularization
     this.n     = 0;                   // training samples seen (persists)
@@ -9792,6 +9801,10 @@ const MERCURY_SKILL_FLOOR = Math.max(0, parseFloat(process.env.MERCURY_SKILL_FLO
 // a reliably anti-predictive model would be free money, which it is not — it is an
 // artifact of bad labels, and inverting an artifact yields another artifact.
 const MERCURY_BROKEN_BSS = parseFloat(process.env.MERCURY_BROKEN_BSS || '-0.5');
+// How many times one horizon may be rebuilt before the engine accepts that the problem
+// is not corruption and stops trying.
+const MERCURY_MAX_RESETS = Math.max(1, parseInt(process.env.MERCURY_MAX_RESETS || '2', 10));
+const _mercuryResets = {};
 // Inputs older than this are not evidence about now.
 const MERCURY_FRESH_MS = 120000;
 // How long a computed forecast may be reused. This was 2000ms against a 2000ms main
@@ -10015,19 +10028,34 @@ function createMercury() {
     // not: observed live 2026-09-30, `1w 64 bss -2.200` — more than three times worse than
     // the base rate — sat un-healed for days because 64 samples fell short of the 80 the
     // single gate demanded, so the horizon stayed dead while the counter crawled.
-    const brokenEnough = (s.n >= MERCURY_MIN_SAMPLES * 2 && bss < MERCURY_BROKEN_BSS)
-                      || (s.n >= MERCURY_MIN_SAMPLES     && bss < -1.0);
+    // A HARD STOP ON REPEATED RESETS. Observed live 2026-10-26: `immediate` reset at
+    // bss -1.100 / n=42, rebuilt to n=42, reset again, three times in one log. The
+    // cold-start bias above removes the cause; this makes the symptom impossible
+    // regardless. After MERCURY_MAX_RESETS the horizon is simply reported as unskilled
+    // and left alone — a detector that fires for ever is not detecting anything.
+    _mercuryResets[hKey] = _mercuryResets[hKey] || 0;
+    const mayReset = _mercuryResets[hKey] < MERCURY_MAX_RESETS;
+    const brokenEnough = mayReset && (
+                         (s.n >= MERCURY_MIN_SAMPLES * 2 && bss < MERCURY_BROKEN_BSS)
+                      || (s.n >= MERCURY_MIN_SAMPLES     && bss < -1.0));
     if (Number.isFinite(bss) && brokenEnough) {
       console.warn(`[MERCURY] ⚠️  ${hKey} scored a Brier skill of ${bss.toFixed(3)} over ${s.n} ` +
                    `resolved forecasts. Noise cannot reach that — this is corrupted training ` +
                    `data, almost certainly forecasts scored outside their window before ` +
                    `v13.66.3. Discarding this horizon's weights and history and starting it ` +
                    `clean; it will simply have no opinion until it has earned one again.`);
-      models[hKey].up   = new OnlineLogistic(MERCURY_DIM, { lr: 0.03, l2: 3e-3, names: MERCURY_FEATURES });
-      models[hKey].down = new OnlineLogistic(MERCURY_DIM, { lr: 0.03, l2: 3e-3, names: MERCURY_FEATURES });
+      // REBUILD AT THE OBSERVED BASE RATE, NOT AT 0.5. s.ups/s.n is what actually
+      // happened on this horizon; handing that to the fresh model as its bias means it
+      // starts by saying "the usual rate" instead of "coin flip", which is both honest
+      // and the thing that stops this reset from causing the next one.
+      const rate = (s.n > 0 && s.ups >= 0) ? Math.max(0.02, Math.min(0.98, s.ups / s.n)) : 0.3;
+      const logit = Math.log(rate / (1 - rate));
+      models[hKey].up   = new OnlineLogistic(MERCURY_DIM, { lr: 0.03, l2: 3e-3, names: MERCURY_FEATURES, bias: logit });
+      models[hKey].down = new OnlineLogistic(MERCURY_DIM, { lr: 0.03, l2: 3e-3, names: MERCURY_FEATURES, bias: -logit });
       Object.assign(s, { n: 0, brier: 0, brierBase: 0, ups: 0, downs: 0, hits: 0, calls: 0,
                          sumAbsErr: 0, realisedSum: 0, predictedSum: 0 });
       for (const id of Object.keys(open)) if (open[id].h === hKey) delete open[id];
+      _mercuryResets[hKey]++;
       return 0;
     }
     if (!Number.isFinite(bss) || bss <= MERCURY_SKILL_FLOOR) return 0;
@@ -12470,6 +12498,7 @@ module.exports = {
     mercuryExitPass, mercuryTick, mercurySkillLevel, allocationShortTarget,
     ALLOC_SHORT_TARGET, ALLOC_FULL_SKILL, MERCURY_EDGE_COST_MULT, MERCURY_RISK_AVERSION,
     MERCURY_ALLOC_MIN_SAMPLES, MERCURY_ALLOC_MIN_HORIZONS, MERCURY_HORIZON_KEYS,
+    MERCURY_MAX_RESETS, _mercuryResets, OnlineLogistic,
     regimeShieldStatus, regimeShieldCeiling, refreshRegimeShield,
     coreDefensiveWeight, CASH_EQUIVALENT_SYMBOLS, REGIME_SHIELD_SKIP_DEFENSIVE,
     REGIME_SHIELD_ON, REGIME_SHIELD_SYMBOL, REGIME_SHIELD_DAYS, REGIME_SHIELD_FLOOR,

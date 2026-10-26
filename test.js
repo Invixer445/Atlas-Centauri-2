@@ -5709,6 +5709,69 @@ check('mercurySkillLevel no longer takes a bare maximum', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+//  v13.77 — THE RESET THAT CAUSED THE NEXT RESET
+//  Live 2026-10-26: "immediate scored a Brier skill of -1.100 over 42 resolved
+//  forecasts ... Discarding this horizon's weights" fired three times in one log,
+//  rebuilding to n=42 and resetting again each time. A zero-weight OnlineLogistic
+//  outputs sigmoid(0) = 0.5 for every input. On the 30-minute horizon the sigma band
+//  makes "up" happen ~10-15% of the time, so a flat 0.5 scores about -1.2 against the
+//  base rate — below the -1.0 corruption bar. The reset WAS the cause of the next one.
+// ════════════════════════════════════════════════════════════════════════════
+check('an untrained model says the base rate, not "coin flip"', () => {
+  const L = I.OnlineLogistic;
+  const p = m => 1 / (1 + Math.exp(-m.b));
+  near(p(new L(12)), 0.5, 1e-9, 'premise: with no bias it claims a coin flip');
+  for (const rate of [0.10, 0.12, 0.30, 0.65]) {
+    const seeded = new L(12, { bias: Math.log(rate / (1 - rate)) });
+    near(p(seeded), rate, 1e-9,
+         `a model seeded at ${rate} must actually predict ${rate} before it learns anything`);
+  }
+  ok(Number.isFinite(new L(12, { bias: NaN }).b),
+     'and a non-finite bias must not poison the model');
+});
+
+check('the rebuild seeds from what actually happened on that horizon', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fn = src.slice(src.indexOf('function skillOf'), src.indexOf('function accuracyFor'));
+  ok(/s\.ups \/ s\.n/.test(fn),
+     'the fresh model must be seeded from the OBSERVED up-rate, not a constant');
+  ok(/bias: logit/.test(fn) && /bias: -logit/.test(fn),
+     'and the down-model takes the mirrored bias — seeding both at the same sign would ' +
+     'have them agree that the event both happens and does not');
+});
+
+check('one horizon cannot be reset for ever', () => {
+  ok(I.MERCURY_MAX_RESETS >= 1 && I.MERCURY_MAX_RESETS <= 5,
+     `a detector that fires for ever detects nothing, got ${I.MERCURY_MAX_RESETS}`);
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fn = src.slice(src.indexOf('function skillOf'), src.indexOf('function accuracyFor'));
+  ok(/mayReset && \(/.test(fn), 'the reset must be gated on the attempt counter');
+  ok(/_mercuryResets\[hKey\]\+\+/.test(fn), 'and the counter must actually increment');
+});
+
+check('a reset horizon no longer re-trips the corruption bar', () => {
+  // The regression, in arithmetic. Score a flat-0.5 model and a base-rate-seeded model
+  // against the same 12%-up stream and compare to the -1.0 reset bar.
+  const run = (p0, n, rate) => {
+    let s = { n: 0, brier: 0, brierBase: 0, ups: 0 };
+    let seed = 12345;
+    const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    for (let i = 0; i < n; i++) {
+      const up = rnd() < rate ? 1 : 0;
+      const base = s.n >= 20 ? Math.max(0.001, Math.min(0.999, s.ups / s.n)) : 0.30;
+      s.brier += (p0 - up) ** 2; s.brierBase += (base - up) ** 2; s.n++; s.ups += up;
+    }
+    return 1 - s.brier / s.brierBase;
+  };
+  const flat = run(0.50, 42, 0.12);
+  const seeded = run(0.12, 42, 0.12);
+  ok(flat < -1.0, `premise: a flat-0.5 model trips the -1.0 reset bar (got ${flat.toFixed(3)})`);
+  ok(seeded > -1.0,
+     `a model seeded at the base rate must NOT trip it (got ${seeded.toFixed(3)}) — this is ` +
+     'the loop, broken at the cause rather than the symptom');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 //  v13.76 — THE SHIELD MUST NOT DE-RISK A CORE THAT IS ALREADY THE SAFE ASSET
 //  The shield sells the core down and the proceeds sit in portfolio.cash, which
 //  accrues NOTHING here. On an equity core that is the point. On a T-bill core it
