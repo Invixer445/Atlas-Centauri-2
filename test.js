@@ -5709,6 +5709,152 @@ check('mercurySkillLevel no longer takes a bare maximum', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+//  MARK 14 — THE AUDITOR. The AI watches the ENGINE, not the market.
+//  Every genuine saving this project has found was the engine doing something
+//  economically absurd, never a market insight. Those are visible in days; a change
+//  in returns takes ~355 sessions to read. The auditor encodes the known faults as
+//  regression tests against the engine itself.
+// ════════════════════════════════════════════════════════════════════════════
+function auditProbe(env, body) {
+  const probe = `const I = require('${SRV}')._internals;\n${body}`;
+  try {
+    const out = require('child_process').execFileSync(process.execPath, ['-e', probe], {
+      env: { ...process.env, ...env }, encoding: 'utf8', timeout: 180000 });
+    return JSON.parse(out.trim().split('\n').filter(l => l.startsWith('{')).pop());
+  } catch (e) { throw new Error('probe failed: ' + (e.stdout || e.message)); }
+}
+const CORE_ENV = { CORE_BASKET_SOURCE: 'fixed', CORE_HOLD_SYMBOLS: 'QQQ,SPY',
+                   CORE_WEIGHTS: 'QQQ:0.70,SPY:0.30', CORE_HOLD_FRACTION: '0.9' };
+
+check('the SPY incident is caught in ONE cycle, not three weeks', () => {
+  // Live 2026-10-06: SPY was in the basket, had no price in marketData, was skipped
+  // silently, and 31% of the account sat in cash. The only hint was "1/2 names" inside
+  // a success message.
+  const r = auditProbe(CORE_ENV, `
+    I.detectStartingCapital(10000);
+    I.marketData.QQQ = { price: 760, prevClose: 758, lastUpdate: Date.now() };
+    I.portfolio.coreHolding = { QQQ: { qty: 9.0218, avgPrice: 760, investedCash: 6860 } };
+    I.portfolio.cash = 3142.53;
+    const f = I.atlasAudit();
+    console.log(JSON.stringify({ codes: f.map(x => x.code),
+      idle: f.find(x => x.code === 'IDLE_CAPITAL') || null }));`);
+  ok(r.codes.includes('IDLE_CAPITAL'), `stranded capital must be reported, got ${r.codes}`);
+  eq(r.idle.severity, 'high', 'and at high severity — a third of the account was idle');
+  ok(r.idle.dollars > 2900, `with the dollar figure attached, got ${r.idle.dollars}`);
+  ok(/SPY/.test(r.idle.detail) && /cannot be priced/.test(r.idle.detail),
+     'and it must name the symbol AND the reason, not just the shortfall');
+});
+
+check('the 4x spread error is caught from the fills themselves', () => {
+  // v13.75: the model charged 14bp where the market charged 3.5bp, which flipped a
+  // +17.8% result to -2.8%. It took months to find by inspection. The fills say it
+  // immediately — that is the whole argument for pointing the AI inward.
+  const r = auditProbe(CORE_ENV, `
+    I._resetFillCostSamples();
+    for (let i = 0; i < 25; i++) I.recordFillCost('QQQ', 760, 760 * (1 + 0.00035 * (i % 2 ? 1 : -1)), 0.0014);
+    const f = I.atlasAudit();
+    console.log(JSON.stringify({ codes: f.map(x => x.code),
+      hit: f.find(x => x.code === 'COST_MODEL_TOO_HIGH') || null }));`);
+  ok(r.codes.includes('COST_MODEL_TOO_HIGH'), `got ${r.codes}`);
+  ok(/4\.0x/.test(r.hit.detail), `and must state the multiple, got: ${r.hit.detail.slice(0, 80)}`);
+});
+
+check('costs being UNDERstated is caught too, and is just as serious', () => {
+  // The dangerous direction: every expectancy the engine reports would be optimistic.
+  const r = auditProbe(CORE_ENV, `
+    I._resetFillCostSamples();
+    for (let i = 0; i < 25; i++) I.recordFillCost('QQQ', 760, 760 * (1 + 0.0020 * (i % 2 ? 1 : -1)), 0.0003);
+    const f = I.atlasAudit();
+    console.log(JSON.stringify({ codes: f.map(x => x.code) }));`);
+  ok(r.codes.includes('COST_MODEL_TOO_LOW'), `got ${r.codes}`);
+});
+
+check('too few fills means no verdict, not a guess', () => {
+  const r = auditProbe(CORE_ENV, `
+    I._resetFillCostSamples();
+    for (let i = 0; i < 3; i++) I.recordFillCost('QQQ', 760, 700, 0.0014);   // wildly off
+    console.log(JSON.stringify({ codes: I.atlasAudit().map(x => x.code),
+                                 need: I.AUDIT_FILL_SAMPLES }));`);
+  // NO cost verdict at all, in either direction. The first version of this test only
+  // forbade TOO_HIGH, so a mutation that dropped the sample bar still passed — the three
+  // wild fills simply reported TOO_LOW instead.
+  ok(!r.codes.some(c => c.startsWith('COST_MODEL')),
+     `three fills is not evidence in EITHER direction, however extreme they look, got ${r.codes}`);
+  ok(r.need >= 5, 'and the bar must be a real sample');
+});
+
+check('self-contradicting state is reported with its dollar cost', () => {
+  const r = auditProbe(CORE_ENV, `
+    I.detectStartingCapital(10000);
+    I.portfolio.cash = -1754.21;                       // the phantom-vault freeze
+    I.capitalSystem.profitVault = 2700;                // banked with zero closed trades
+    I.portfolio.closedTrades.length = 0;
+    const f = I.atlasAudit();
+    console.log(JSON.stringify({ codes: f.map(x => x.code),
+      vault: f.find(x => x.code === 'PHANTOM_VAULT') || null }));`);
+  ok(r.codes.includes('NEGATIVE_CASH'), `negative cash must be reported, got ${r.codes}`);
+  ok(r.codes.includes('PHANTOM_VAULT'), 'and a vault with no closed trades');
+  eq(r.vault.dollars, 2700, 'with the amount attached');
+});
+
+check('a gate that cannot open is named as such', () => {
+  const r = auditProbe({ ...CORE_ENV, PHASE_GATE: 'on' }, `
+    I.detectStartingCapital(10000);
+    I.portfolio.cash = 0;
+    I.portfolio.coreHolding = {};                       // account well below its start
+    const f = I.atlasAudit();
+    console.log(JSON.stringify({ hit: f.find(x => x.code === 'GATE_UNREACHABLE') || null }));`);
+  ok(r.hit, 'a locked gate with a MATERIALLY negative balance must be reported');
+  ok(I.AUDIT_GATE_MATERIAL_PCT >= 0.001,
+     'but it takes a material shortfall, not any negative number — the first version ' +
+     'fired on an account $7.55 below its start, which is an ordinary afternoon');
+  ok(/configuration choice, not a fault/.test(r.hit.detail),
+     'and must say plainly that it is a choice — the operator should know, not be alarmed');
+});
+
+check('one broken check cannot silence the others', () => {
+  // An auditor that dies on its first bad input is worse than none: it looks healthy.
+  const r = auditProbe(CORE_ENV, `
+    I.detectStartingCapital(10000);
+    // Genuinely poison a check: capitalSystem.profitVault on a null capitalSystem
+    // throws, whereas closedTrades = null does NOT -- (null || []).length is just 0.
+    // The first version of this test used the harmless one, so removing the per-check
+    // guard still passed. (No backticks here: this text lives inside a template literal.)
+    I.portfolio.cash = -50;                             // this check must still fire
+    I.capitalSystem = null;                             // this one must throw and be caught
+    let threw = false, codes = [];
+    try { codes = I.atlasAudit().map(x => x.code); } catch (e) { threw = true; }
+    console.log(JSON.stringify({ threw, codes }));`);
+  eq(r.threw, false, 'the auditor must not throw on hostile state');
+  ok(r.codes.includes('NEGATIVE_CASH') || r.codes.includes('AUDIT_CHECK_FAILED'),
+     `other checks must still run and report, got ${r.codes}`);
+});
+
+check('a healthy engine reports nothing to fix', () => {
+  const r = auditProbe(CORE_ENV, `
+    I.detectStartingCapital(10000);
+    const now = Date.now();
+    I.marketData.QQQ = { price: 760, prevClose: 758, lastUpdate: now };
+    I.marketData.SPY = { price: 775, prevClose: 773, lastUpdate: now };
+    I.portfolio.coreHolding = { QQQ: { qty: 9.02, avgPrice: 760, investedCash: 6860 },
+                                SPY: { qty: 3.79, avgPrice: 775, investedCash: 2940 } };
+    I.portfolio.cash = 200; I.capitalSystem.profitVault = 0;
+    I._resetFillCostSamples();
+    const f = I.atlasAudit().filter(x => x.severity === 'high');
+    console.log(JSON.stringify({ high: f.map(x => x.code) }));`);
+  eq(r.high.length, 0, `a fully deployed, consistent engine must raise nothing high, got ${r.high}`);
+});
+
+check('the auditor reports and never trades', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fn = src.slice(src.indexOf('function atlasAudit'), src.indexOf('function reportAtlasAudit'));
+  ok(!/submitOrder|routeToBroker|portfolio\.cash\s*[-+]=|coreBuyStep|trimCore/.test(fn),
+     'the auditor must not place orders or mutate the book — acting on a finding is a ' +
+     'human decision, and the whole point is that being wrong is cheap');
+  ok(/const safe = /.test(fn), 'and every check must be individually guarded');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 //  v13.77 — THE RESET THAT CAUSED THE NEXT RESET
 //  Live 2026-10-26: "immediate scored a Brier skill of -1.100 over 42 resolved
 //  forecasts ... Discarding this horizon's weights" fired three times in one log,

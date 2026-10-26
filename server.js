@@ -7691,6 +7691,211 @@ async function pollPendingOrders() {
   } finally { _pollingOrders = false; }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+//  THE AUDITOR (Mark 14) — the AI watches the ENGINE, not the market
+// ════════════════════════════════════════════════════════════════════════════
+//  WHY THIS EXISTS, AND WHY IT POINTS INWARD.
+//
+//  Adaptation is only as fast as the feedback it learns from, and the two questions
+//  this bot can ask have wildly different feedback rates:
+//
+//      predicting returns   : daily drift $3.78 against daily noise $71.22 = 19:1,
+//                             so ~355 sessions (1.4 YEARS) to read one change
+//      its own execution    : modelled 14bp against realised 3.5bp shows up in the
+//                             FIRST FILL, because the measurement noise is smaller
+//                             than the error
+//
+//  That is a ~355x difference, and it is why every adaptive mechanism aimed at prices
+//  in this project has failed — Mercury (12 features, weeks of runtime, zero measured
+//  skill), walk-forward exit tuning (profitable in 1 of 4 forward blocks), the 1.5%
+//  volatility floor (won 3 of 3 windows it was tuned on, lost 3 of 4 held out). None
+//  were badly built. All were pointed at an unlearnable target.
+//
+//  Meanwhile EVERY genuine saving found in this project was the engine doing something
+//  economically absurd, and every one was visible within days:
+//
+//      SPY in the basket but never bought        31% of the account idle, 3 weeks
+//      spread model 4x too wide                  flipped a +17.8% result to -2.8%
+//      Mercury reset loop                        erased its own learning every 42 forecasts
+//      phantom vault                             froze the core, cash to -$1,754
+//      shield applied to a T-bill core           ~$315/yr for no risk reduction
+//      max-of-4 skill gate                       35% of the account to zero skill
+//
+//  Those are worth more than any signal this project has found. The auditor encodes
+//  them as the first things it watches for, and the rule for adding to it is simple:
+//  a check belongs here when the evidence arrives in days, not years.
+//
+//  IT NEVER TRADES. It reports. Acting on its findings is a human decision, and the
+//  whole point is that it is cheap to be wrong.
+const AUDITOR_ON = (process.env.ATLAS_AUDITOR || 'on').toLowerCase() !== 'off';
+const AUDIT_FILL_SAMPLES = Math.max(5, parseInt(process.env.AUDIT_FILL_SAMPLES || '20', 10));
+// Realised cost may exceed modelled by this multiple before it is worth saying so.
+const AUDIT_COST_DRIFT_X = Math.max(1.2, parseFloat(process.env.AUDIT_COST_DRIFT_X || '2.0'));
+// How far under its target the core may sit before it counts as stranded capital.
+const AUDIT_IDLE_PCT = Math.max(0.01, parseFloat(process.env.AUDIT_IDLE_PCT || '0.05'));
+// How far below its starting capital an account must sit before a shut phase gate is
+// worth calling structural rather than ordinary.
+const AUDIT_GATE_MATERIAL_PCT = Math.max(0.001,
+  parseFloat(process.env.AUDIT_GATE_MATERIAL_PCT || '0.02'));
+
+let _fillCostSamples = [];      // { sym, modelledBp, realisedBp, at }
+let _auditLastLogged = {};
+
+// Called from dispatchFill. The ONLY place realised execution cost is observed.
+function recordFillCost(sym, refPrice, fillPrice, modelledSpread) {
+  try {
+    if (!(refPrice > 0) || !(fillPrice > 0)) return;
+    const realisedBp = Math.abs(fillPrice - refPrice) / refPrice * 1e4;
+    const modelledBp = Number.isFinite(modelledSpread) ? modelledSpread * 1e4 : null;
+    _fillCostSamples.push({ sym, realisedBp, modelledBp, at: Date.now() });
+    if (_fillCostSamples.length > 200) _fillCostSamples = _fillCostSamples.slice(-200);
+  } catch (e) { /* observation must never break a fill */ }
+}
+
+const median = (a) => {
+  if (!a.length) return null;
+  const x = [...a].sort((p, q) => p - q);
+  return x.length % 2 ? x[(x.length - 1) / 2] : (x[x.length/2 - 1] + x[x.length/2]) / 2;
+};
+
+// Every check is independent and wrapped, so one throwing cannot silence the rest —
+// an auditor that dies on its first bad input is worse than none, because it looks fine.
+function atlasAudit(now = Date.now()) {
+  const out = [];
+  const add = (code, severity, detail, dollars = null) => out.push({ code, severity, detail, dollars });
+  const safe = (fn) => { try { fn(); } catch (e) { add('AUDIT_CHECK_FAILED', 'warn',
+    `an audit check threw: ${e && e.message}. The others still ran.`); } };
+
+  // 1. STRANDED CAPITAL. Caught SPY three weeks late by hand; this is one cycle.
+  safe(() => {
+    if (!CORE_HOLD_ON) return;
+    const tv = getTotalValue();
+    if (!(tv > 0)) return;
+    const target = tv * effectiveCoreFraction();
+    const held = coreHoldingValue();
+    const shortfall = target - held;
+    if (shortfall > tv * AUDIT_IDLE_PCT) {
+      const bad = unpriceableCoreNames(now);
+      add('IDLE_CAPITAL', 'high',
+        `the core is $${shortfall.toFixed(2)} under its target (${(held/tv*100).toFixed(1)}% invested, ` +
+        `target ${(effectiveCoreFraction()*100).toFixed(0)}%)` +
+        (bad.length ? `. ${bad.map(b => b.sym + ' cannot be priced: ' + b.why).join('; ')}`
+                    : `. Every basket name IS priceable, so the cause is funding or sizing, not the feed.`),
+        shortfall);
+    }
+  });
+
+  // 2. EXECUTION COST DRIFT. The 4x spread error, visible in the first fills.
+  safe(() => {
+    const withBoth = _fillCostSamples.filter(x => Number.isFinite(x.modelledBp) && x.modelledBp > 0);
+    if (withBoth.length < AUDIT_FILL_SAMPLES) return;
+    const mReal = median(withBoth.map(x => x.realisedBp));
+    const mModel = median(withBoth.map(x => x.modelledBp));
+    if (!(mModel > 0) || !Number.isFinite(mReal)) return;
+    const ratio = mModel / Math.max(0.01, mReal);
+    if (ratio >= AUDIT_COST_DRIFT_X) {
+      add('COST_MODEL_TOO_HIGH', 'high',
+        `the engine charges itself ${mModel.toFixed(1)}bp but is actually filling at ` +
+        `${mReal.toFixed(1)}bp — ${ratio.toFixed(1)}x too pessimistic over ${withBoth.length} fills. ` +
+        `This number gates entries and prices every backtest, so an error here can flip a ` +
+        `strategy's sign without touching the strategy.`);
+    } else if (ratio <= 1 / AUDIT_COST_DRIFT_X) {
+      add('COST_MODEL_TOO_LOW', 'high',
+        `fills are costing ${mReal.toFixed(1)}bp against a modelled ${mModel.toFixed(1)}bp over ` +
+        `${withBoth.length} fills. Real costs are being understated, so every expectancy the ` +
+        `engine reports is optimistic.`);
+    }
+  });
+
+  // 3. A GATE THAT CANNOT OPEN. The phase gate, at -$518 needing +$1,000.
+  safe(() => {
+    if (!PHASE_GATE_ENABLED || !tradingPhaseLocked()) return;
+    const banked = tradingFundsAvailable();
+    const bar = startingCapital() * TRADING_UNLOCK_PCT;
+    // MATERIALITY, NOT SIGN. The first version fired whenever `banked` was negative at
+    // all, which flagged an account $7.55 below its start — an ordinary afternoon, not a
+    // structural problem. A gate is worth calling UNREACHABLE when the account has to
+    // make back a real amount first, so the bar is a percentage of starting capital.
+    const material = startingCapital() * AUDIT_GATE_MATERIAL_PCT;
+    if (banked < -material) {
+      add('GATE_UNREACHABLE', 'high',
+        `trading unlocks when the holding side banks $${bar.toFixed(2)}, and it currently sits at ` +
+        `$${banked.toFixed(2)} — the gate is $${(bar - banked).toFixed(2)} away, so the core must ` +
+        `rise ${((bar - banked) / Math.max(1, startingCapital()) * 100).toFixed(1)}% before the trading ` +
+        `engine may place its first order. Everything downstream of it is inert until then. ` +
+        `This is a configuration choice, not a fault — but it should be a KNOWN one.`);
+    }
+  });
+
+  // 4. STATE THAT CONTRADICTS ITSELF. The phantom vault class.
+  safe(() => {
+    if (portfolio.cash < 0) {
+      add('NEGATIVE_CASH', 'high',
+        `ledger cash is $${portfolio.cash.toFixed(2)}. Cash cannot be negative here; something ` +
+        `has been double-counted and the core will be frozen until it is resolved.`, portfolio.cash);
+    }
+    const vault = capitalSystem.profitVault || 0;
+    const closed = (portfolio.closedTrades || []).length;
+    if (vault > 0 && closed === 0) {
+      add('PHANTOM_VAULT', 'high',
+        `$${vault.toFixed(2)} is held in the profit vault but not one trade has ever closed. ` +
+        `Profit that was never realised cannot have been banked.`, vault);
+    }
+  });
+
+  // 5. A SUBSYSTEM REBUILDING ITSELF IN A LOOP. Mercury, every 42 forecasts.
+  safe(() => {
+    for (const [k, n] of Object.entries(_mercuryResets || {})) {
+      if (n >= MERCURY_MAX_RESETS) {
+        add('RESET_EXHAUSTED', 'warn',
+          `the ${k} horizon has been rebuilt ${n} time(s) and has stopped trying. Repeated ` +
+          `rebuilds mean the diagnosis was wrong: a model reset to zero weights predicts 0.5 ` +
+          `for everything, which scores badly on a rare event and triggers the next reset.`);
+      }
+    }
+  });
+
+  // 6. A RISK CONTROL THAT COSTS MONEY WITHOUT REDUCING RISK.
+  safe(() => {
+    if (!REGIME_SHIELD_ON) return;
+    const def = coreDefensiveWeight();
+    if (def >= REGIME_SHIELD_SKIP_DEFENSIVE && regimeShieldStatus(now).riskOff) {
+      add('SHIELD_STOOD_DOWN', 'info',
+        `the shield reads risk-off but the core is ${(def*100).toFixed(0)}% cash-equivalents, so it ` +
+        `stood down. Selling T-bills into idle cash would be the same risk for less yield.`);
+    }
+  });
+
+  // 7. AN EXPENSIVE SUBSYSTEM THAT CANNOT AFFECT ANYTHING.
+  safe(() => {
+    if (!AI_ENABLED) return;
+    const locked = PHASE_GATE_ENABLED && tradingPhaseLocked();
+    const noSkill = MERCURY_ON && mercurySkillLevel() <= 0;
+    if (locked && noSkill) {
+      add('RESEARCH_WITHOUT_AN_OUTLET', 'info',
+        `Venus is spending its LLM budget on trade ideas while the phase gate is shut and Mercury ` +
+        `has no measured skill, so nothing it produces can move money. Its basket proposals still ` +
+        `feed the challenger, which is the part that is actually being scored.`);
+    }
+  });
+
+  return out;
+}
+
+// Say it out loud, at most once an hour per distinct finding.
+function reportAtlasAudit(now = Date.now()) {
+  if (!AUDITOR_ON) return [];
+  const found = atlasAudit(now);
+  for (const f of found) {
+    if (now - (_auditLastLogged[f.code] || 0) < 3600000) continue;
+    _auditLastLogged[f.code] = now;
+    const mark = f.severity === 'high' ? '🚨' : f.severity === 'warn' ? '⚠️ ' : 'ℹ️ ';
+    console.warn(`[AUDIT] ${mark} ${f.code}: ${f.detail}` +
+      (Number.isFinite(f.dollars) ? ` (${f.dollars >= 0 ? '$' : '-$'}${Math.abs(f.dollars).toFixed(2)})` : ''));
+  }
+  return found;
+}
+
 function dispatchFill(p, o) {
   const fillPrice = Number(o.filled_avg_price);
   const fillQty   = Number(o.filled_qty);
@@ -7713,6 +7918,10 @@ function dispatchFill(p, o) {
     return;
   }
   console.log(`[BROKER] ✓ FILLED ${p.kind} ${p.ticker} ×${fillQty} @ $${fillPrice.toFixed(2)} (real ${broker.name} fill)`);
+  // THE ONLY PLACE THE ENGINE LEARNS WHAT EXECUTION ACTUALLY COSTS. Everything else
+  // uses the MODEL; this is the measurement the model can be checked against.
+  try { recordFillCost(p.ticker, Number(p.refPrice) || marketData[p.ticker]?.price,
+                       fillPrice, estimateDynamicSpread(p.ticker)); } catch (e) {}
   if (p.kind === 'entry')          applyEntryFill(p.plan, fillPrice, fillQty, true);
   else if (p.kind === 'exitLong')  closeLong(p.ticker,  p.stopLoss, { brokerFill: true, fillPrice });
   else if (p.kind === 'exitShort') closeShort(p.ticker, p.stopLoss, { brokerFill: true, fillPrice });
@@ -12192,6 +12401,16 @@ if (require.main === module) app.listen(PORT, async () => {
   } else {
     console.log('[MERCURY] ☿ Forecaster OFF (MERCURY_ENABLED=false) — exits revert to stop/target only');
   }
+  if (AUDITOR_ON) {
+    const f = atlasAudit();
+    console.log(`[AUDIT] 🔍 Mark 14 auditor ON — it watches the ENGINE, not the market, because ` +
+                `the feedback is ~355x faster: reading a change in returns takes ~355 sessions, ` +
+                `reading your own fill cost takes one fill. Every real saving this project has ` +
+                `found was the engine doing something absurd, never a market insight. ` +
+                `It reports and never trades. Right now: ${f.length} finding(s)` +
+                `${f.length ? ' — ' + f.map(x => x.code).join(', ') : ', nothing to report'}. ` +
+                `Detail: /api/audit. ATLAS_AUDITOR=off disables it.`);
+  }
   if (BASKET_CHALLENGER_ON) {
     console.log(`[CHALLENGER] 🥊 Venus's stock basket is being scored against the index core on ` +
                 `bars that did not exist when it was proposed. It needs ${CHALLENGER_MIN_DAYS}+ ` +
@@ -12499,6 +12718,10 @@ module.exports = {
     ALLOC_SHORT_TARGET, ALLOC_FULL_SKILL, MERCURY_EDGE_COST_MULT, MERCURY_RISK_AVERSION,
     MERCURY_ALLOC_MIN_SAMPLES, MERCURY_ALLOC_MIN_HORIZONS, MERCURY_HORIZON_KEYS,
     MERCURY_MAX_RESETS, _mercuryResets, OnlineLogistic,
+    atlasAudit, reportAtlasAudit, recordFillCost, AUDITOR_ON, AUDIT_COST_DRIFT_X,
+    AUDIT_IDLE_PCT, AUDIT_FILL_SAMPLES, AUDIT_GATE_MATERIAL_PCT,
+    _getFillCostSamples: () => _fillCostSamples,
+    _resetFillCostSamples: () => { _fillCostSamples = []; _auditLastLogged = {}; },
     regimeShieldStatus, regimeShieldCeiling, refreshRegimeShield,
     coreDefensiveWeight, CASH_EQUIVALENT_SYMBOLS, REGIME_SHIELD_SKIP_DEFENSIVE,
     REGIME_SHIELD_ON, REGIME_SHIELD_SYMBOL, REGIME_SHIELD_DAYS, REGIME_SHIELD_FLOOR,
