@@ -5849,6 +5849,31 @@ check('a healthy engine reports nothing to fix', () => {
   eq(r.high.length, 0, `a fully deployed, consistent engine must raise nothing high, got ${r.high}`);
 });
 
+check('the auditor is actually WIRED, not merely defined', () => {
+  // THE FAULT THIS TEST EXISTS FOR. v14.78 shipped atlasAudit() fully working and
+  // fully tested, with reportAtlasAudit() defined and exported — and neither a
+  // setInterval nor the /api/audit route survived, because a multi-patch edit aborted
+  // on a failed assertion partway through and only part of it was re-applied. The
+  // auditor ran once at boot and then never again.
+  //
+  // That is EXACTLY the class of fault the auditor was built to catch: a subsystem that
+  // exists, passes its own tests, and cannot act. Behavioural tests on the checks
+  // themselves could never see it, because the checks were perfect. Only a test on the
+  // WIRING can.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  ok(/setInterval\(\(\) => \{ try \{ reportAtlasAudit\(\)/.test(src),
+     'reportAtlasAudit must be on a timer — defining it is not running it');
+  ok(/app\.get\('\/api\/audit'/.test(src),
+     'and /api/audit must exist, or the findings are unreachable between log lines');
+  ok(/Mark 14 auditor ON/.test(src),
+     'and the boot banner must say it is on, or an operator cannot tell');
+  // the timer must be guarded, or one bad check silences the auditor for the session
+  const sched = src.slice(src.indexOf('setInterval(() => { try { reportAtlasAudit()'), 
+                          src.indexOf('setInterval(() => { try { reportAtlasAudit()') + 300);
+  ok(/catch/.test(sched), 'and the timer body must be wrapped — a throw inside a timer ' +
+                          'kills it silently for the rest of the process');
+});
+
 check('the auditor reports and never trades', () => {
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
   const fn = src.slice(src.indexOf('function atlasAudit'), src.indexOf('function reportAtlasAudit'));

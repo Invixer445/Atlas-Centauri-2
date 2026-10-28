@@ -7739,6 +7739,7 @@ const AUDIT_GATE_MATERIAL_PCT = Math.max(0.001,
   parseFloat(process.env.AUDIT_GATE_MATERIAL_PCT || '0.02'));
 
 let _fillCostSamples = [];      // { sym, modelledBp, realisedBp, at }
+const _getFillCostSamplesInternal = () => _fillCostSamples;
 let _auditLastLogged = {};
 
 // Called from dispatchFill. The ONLY place realised execution cost is observed.
@@ -11960,6 +11961,29 @@ app.get('/api/challenger', (req, res) => {
   });
 });
 
+// 🔍 WHAT IS THE ENGINE DOING WRONG RIGHT NOW? Read-only. The Mark 14 centrepiece:
+// the one question this bot can answer about itself quickly enough to act on.
+app.get('/api/audit', (req, res) => {
+  const found = AUDITOR_ON ? atlasAudit() : [];
+  const samples = _getFillCostSamplesInternal();
+  const withBoth = samples.filter(x => Number.isFinite(x.modelledBp) && x.modelledBp > 0);
+  res.json({
+    enabled: AUDITOR_ON,
+    findings: found,
+    high: found.filter(f => f.severity === 'high').length,
+    execution: {
+      fillsObserved: samples.length,
+      comparable: withBoth.length,
+      needed: AUDIT_FILL_SAMPLES,
+      medianRealisedBp: withBoth.length ? +median(withBoth.map(x => x.realisedBp)).toFixed(2) : null,
+      medianModelledBp: withBoth.length ? +median(withBoth.map(x => x.modelledBp)).toFixed(2) : null
+    },
+    note: 'This watches the ENGINE, not the market. A check belongs here only when the ' +
+          'evidence arrives in days: reading a change in returns takes ~355 sessions, ' +
+          'reading your own fill cost takes one fill.'
+  });
+});
+
 app.get('/api/shield', (req, res) => {
   const st = regimeShieldStatus();
   res.json({
@@ -12574,6 +12598,14 @@ if (require.main === module) app.listen(PORT, async () => {
 
   // 3d. Score Venus's stock basket against whatever the core actually holds. Daily,
   //     because it reads daily bars and the answer cannot change faster than that.
+  // THE AUDITOR'S HEARTBEAT. Every 15 minutes, because the faults it looks for appear
+  // in cycles and fills, not in quarters — that speed is the entire reason it points at
+  // the engine rather than at prices.
+  if (AUDITOR_ON) {
+    setInterval(() => { try { reportAtlasAudit(); } catch (e) {
+      console.warn(`[AUDIT] the auditor itself failed: ${e && e.message}`); } }, 15 * 60 * 1000);
+  }
+
   if (BASKET_CHALLENGER_ON) {
     basketChallengerTick().catch(e => console.warn(`[CHALLENGER] ${e.message}`));
     setInterval(() => basketChallengerTick().catch(e => console.warn(`[CHALLENGER] ${e.message}`)),
