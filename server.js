@@ -8910,6 +8910,64 @@ function closeShort(ticker, stopLoss = false, opts = {}) {
 //
 //    fraction: portion of CURRENT quantity to close (e.g. 0.40 = 40%)
 //    rung:     label stored on the lot so each tier only fires once
+//
+// ── HOW BIG ONE RUNG IS, AND WHY THE ROUNDING RULE MOVED (v14.79) ───────────
+// THE ROUNDING MUST COME FROM WHETHER WE CAN SELL FRACTIONALLY, NOT FROM WHETHER THE
+// LOT HAPPENS TO BE FRACTIONAL. Both sites below chose their floor with
+// isFractionalQty(lot.qty), so a WHOLE-share lot was always floored to whole shares:
+// a 2-share position taking the 40% rung computed Math.floor(0.8) = 0, failed the
+// `< 1` test, and marked the rung TAKEN without selling anything. tp2 then did the
+// same. With ATR_TRAIL_ARM_R at 99 the trail is off by measurement and there is no
+// end-of-day flat anywhere in this engine, so such a position had NO PROFIT EXIT AT
+// ALL — its only way out was the hard stop. Every loss realised at -2.2xATR and every
+// winner ridden back down to it: the exact asymmetry the ladder exists to prevent.
+//
+// AND IT WAS THE COMMON CASE, not an edge case. computeSize floors to whole shares the
+// moment the size reaches 1, and at 1.5% risk on a $1,000 book a position is typically
+// 1-6 shares. qty <= 2 got no take-profit; qty 3-5 took tp1 and then lost tp2 on the
+// remainder. It is also why the live exits diverge from backtest.js, which closes the
+// WHOLE position at the first target and never models the ladder at all.
+//
+// Alpaca sells fractionally on any fractionable equity — broker.js downgrades a
+// fractional order to market/day on its own and refuses only sell_short — so a 2-share
+// lot can perfectly well give up 0.8 shares. Keying off FRACTIONAL_ENABLED is the same
+// reasoning the sizer already uses: fractional exists to RESCUE an order the whole-share
+// floor would otherwise throw away. minTotal below was already written this way; these
+// two were simply left behind.
+//
+// AND A RUNG MUST BE WORTH SENDING, NOT MERELY REPRESENTABLE (v14.79.1). Fixing the
+// rounding made small rungs fire that never fired before — which is the point — but the
+// quantity test alone lets through orders the engine would refuse to OPEN. Entry sizing
+// has always had a notional floor (MIN_FRACTIONAL_NOTIONAL, $5: "no dust positions");
+// the ladder had none, so a minimum-size $5 position taking its 40% rung submitted a
+// $2.00 sale. The spread on that is pure waste, and it is below the engine's own stated
+// dust line.
+//
+// Skipping the rung would reintroduce exactly the bug above — a small position with no
+// profit exit and only the hard stop to end it. So when ONE SLICE is dust but the WHOLE
+// POSITION is not, the ladder collapses to a single exit and takes all of it. A position
+// too small to ladder is not too small to close, and that keeps the profit exit alive
+// without ever sending dust.
+//
+// `price` is optional: without it the notional cannot be known and the behaviour is
+// exactly as before, which keeps the booking path (where the quantity was already fixed
+// at submit time) untouched.
+function rungSellQty(lotQty, fraction, price) {
+  if (!(Number.isFinite(lotQty) && lotQty > 0)) return 0;
+  if (!(Number.isFinite(fraction) && fraction > 0)) return 0;
+  const want = Math.min(lotQty, lotQty * fraction);
+  const slice = FRACTIONAL_ENABLED ? Math.floor(want * 1e6) / 1e6 : Math.floor(want);
+  if (!(Number.isFinite(price) && price > 0)) return slice;
+  if (slice * price >= MIN_FRACTIONAL_NOTIONAL) return slice;
+  // The slice is dust. Take the whole position if THAT is worth sending, else nothing.
+  return (lotQty * price >= MIN_FRACTIONAL_NOTIONAL)
+    ? (FRACTIONAL_ENABLED ? Math.floor(lotQty * 1e6) / 1e6 : Math.floor(lotQty))
+    : 0;
+}
+// The smallest slice worth sending. Must NOT be derived from the lot: in broker phase 2
+// the quantity being booked was fixed at submit time, so testing it against a
+// whole-share minimum would discard a fill the broker has already made.
+const rungMinQty = () => (FRACTIONAL_ENABLED ? 1e-6 : 1);
 function partialClose(ticker, direction, fraction, rung, opts = {}) {
   const book = direction === 'LONG' ? portfolio.longPositions : portfolio.shortPositions;
   const positions = book[ticker];
@@ -8926,12 +8984,9 @@ function partialClose(ticker, direction, fraction, rung, opts = {}) {
     positions.forEach(p => {
       p.partialsTaken = p.partialsTaken || {};
       if (p.partialsTaken[rung]) return;
-      // Fractional lots must ladder fractionally, else Math.floor turns every partial
-      // on a 0.18-share position into 0 and the rung is silently marked "taken".
-      const q = isFractionalQty(p.qty) ? Math.floor(p.qty * fraction * 1e6) / 1e6
-                                       : Math.floor(p.qty * fraction);
-      const minQ = isFractionalQty(p.qty) ? 1e-6 : 1;
-      if (q < minQ) { p.partialsTaken[rung] = true; return; }         // too small to ladder
+      // Ladder fractionally whenever fractional selling is available — see rungSellQty.
+      const q = rungSellQty(p.qty, fraction, marketData[ticker]?.price);
+      if (q < rungMinQty()) { p.partialsTaken[rung] = true; return; }  // too small to ladder
       sells.push({ lotId: p.lotId, qty: q });
       p._pendingRung = rung;
     });
@@ -8997,11 +9052,9 @@ function partialClose(ticker, direction, fraction, rung, opts = {}) {
       sellQty = sellFor[pos.lotId];
       delete pos._pendingRung;                  // consumed
     } else {
-      sellQty = isFractionalQty(pos.qty) ? Math.floor(pos.qty * fraction * 1e6) / 1e6
-                                         : Math.floor(pos.qty * fraction);
+      sellQty = rungSellQty(pos.qty, fraction, exitPrice);
     }
-    const minSell = isFractionalQty(pos.qty) ? 1e-6 : 1;
-    if (sellQty < minSell) { pos.partialsTaken[rung] = true; return; }  // too small to ladder
+    if (sellQty < rungMinQty()) { pos.partialsTaken[rung] = true; return; }  // too small to ladder
 
     if (direction === 'LONG') {
       realizedPnL += (exitPrice - pos.entryPrice) * sellQty;
@@ -12681,7 +12734,7 @@ module.exports = {
     releaseExpiredLossHalt, LOSS_HALT_MS, getKillSwitchReason, lossHaltReason, priceFeedHalt, riskSystem, aiSystem,
     institutionalScore, ideaDirection, EFFECTIVE_MIN_DAY_VOL, FEED_VOLUME_FACTOR, DYNAMIC_MIN_DAY_VOL,
     extractJsonArray, extractJsonObject, affordableMaxPrice, MAX_SINGLE_SHARE_FRACTION, fetchBars,
-    FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty,
+    FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty, rungSellQty, rungMinQty,
     CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore,
     CORE_PHASE1_FRACTION, effectiveCoreFraction, rebasePeakForCoreFlow, unlockStepDownIsActionable, tradingFundsAvailable,
     coreWeightMap, basketWithRecovered, coreBuyStep, logPerformanceDigest,

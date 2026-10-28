@@ -76,8 +76,16 @@ function maxDD(dailyRets) {
   process.stdout.write('  fetching daily bars … ');
   const bars = await daily(SYMBOLS, start);
   const usable = SYMBOLS.filter(s => (bars[s] || []).length > 400);
+  // THE GUARD HAS TO COME FIRST. This logged `bars[usable[0]].length` BEFORE checking
+  // that `usable` had anything in it, so a failed fetch — expired keys, a 401, a rate
+  // limit — threw "Cannot read properties of undefined (reading 'length')" instead of
+  // printing the one message that would have explained it.
+  if (usable.length < 5) {
+    console.log(`${usable.length}/${SYMBOLS.length} symbols`);
+    console.error('  not enough history — check APCA_API_KEY_ID / APCA_API_SECRET_KEY and the feed');
+    process.exit(1);
+  }
   console.log(`${usable.length}/${SYMBOLS.length} symbols, ${bars[usable[0]].length} days`);
-  if (usable.length < 5) { console.error('  not enough history'); process.exit(1); }
   const N = Math.min(...usable.map(s => bars[s].length));
   const YEARS = N / 252;
 

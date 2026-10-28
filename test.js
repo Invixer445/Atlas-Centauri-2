@@ -1590,19 +1590,23 @@ check('a fractional quantity is never sent as a limit order', () => {
 check('fractional positions can still take partial profits', () => {
   // Math.floor(0.18 * 0.5) is 0, which silently marked the rung "taken" and meant a
   // fractional position could never ladder out.
+  //
+  // REWRITTEN IN v14.79, FROM SHAPE TO BEHAVIOUR. This used to assert the exact source
+  // text of the old implementation — two inline `isFractionalQty(lot.qty)` branches and
+  // two `minQ/minSell = isFractionalQty` floors. That shape was itself the v14.79 bug:
+  // branching on whether the LOT was fractional meant a whole-share lot was always
+  // floored to whole shares, so a 2-share position's 40% rung computed 0 and marked
+  // itself taken. A test that pins the shape of a defect cannot catch the defect, so it
+  // now asserts what the ladder must DO and leaves the implementation free.
+  for (const [q, f] of [[0.18, 0.5], [0.18, 0.4], [1.81, 0.4], [0.5, 0.3]])
+    ok(I.rungSellQty(q, f) > 0 && I.rungSellQty(q, f) >= I.rungMinQty(),
+       `a ${q}-share lot must be able to ladder out ${f * 100}%`);
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
-  // Both partial-close sites must compute the fractional quantity, not just the whole-
-  // share one. The whole-share expression legitimately survives as the ELSE branch, so
-  // assert the fractional branch exists at each site rather than banning the pattern.
-  const fracBranches = (src.match(/Math\.floor\((?:p|pos)\.qty \* fraction \* 1e6\) \/ 1e6/g) || []);
-  ok(fracBranches.length === 2,
-     `expected both partial-close sites to have a fractional branch, found ${fracBranches.length}`);
-  const guards = (src.match(/isFractionalQty\((?:p|pos)\.qty\)/g) || []);
-  ok(guards.length >= 2, `partial closes must branch on fractional lots, found ${guards.length} guard(s)`);
-  // And the "too small to ladder" floor must scale with the lot type, or a fractional
-  // position is instantly marked as having taken every rung.
-  ok(/minQ = isFractionalQty/.test(src) && /minSell = isFractionalQty/.test(src),
-     'the minimum-ladder threshold must adapt to fractional lots');
+  const fn = src.slice(src.indexOf('function partialClose'), src.indexOf('function finalizeClose'));
+  ok((fn.match(/rungSellQty\(/g) || []).length === 2,
+     'both partial-close sites must size the rung through the shared helper');
+  ok((fn.match(/rungMinQty\(\)/g) || []).length === 2,
+     'and both must take their minimum from it too');
 });
 
 check('no whole-share assumptions remain on the fractional paths', () => {
@@ -8012,6 +8016,78 @@ check('the inception clock survives a restart and resets on a new account', () =
     I.setSignalAnchor(saved.a); I.portfolio.cash = saved.cash;
     I.detectStartingCapital(saved.sc, { force: true });
   }
+});
+
+
+group('v14.79 — the take-profit ladder on a whole-share book');
+
+check('a rung must be worth SENDING, not merely representable', () => {
+  // Fixing the rounding made small rungs fire that never fired before — correct — but
+  // the quantity test alone lets through orders the engine would refuse to OPEN. Entry
+  // sizing has a $5 notional floor ("no dust positions"); the ladder had none, so a
+  // minimum-size $5 position submitted a $2.00 sale. The spread on that is pure waste.
+  const min = I.MIN_FRACTIONAL_NOTIONAL;
+  ok(min >= 1, `premise: the engine has a dust floor, got ${min}`);
+  // a $5 position: one slice is dust, the position is not -> take all of it
+  eq(I.rungSellQty(1, 0.40, 5), 1,
+     'when one slice is dust but the position is not, the ladder collapses to a single ' +
+     'exit — a position too small to ladder is not too small to close');
+  eq(I.rungSellQty(0.25, 0.40, 20), 0.25, 'and that holds for a fractional lot too');
+  // genuinely dust end to end -> send nothing
+  eq(I.rungSellQty(1, 0.40, 2), 0,
+     'but when the WHOLE position is dust, send nothing at all');
+  // a real position is unaffected
+  ok(Math.abs(I.rungSellQty(9.0218, 0.40, 700) - 3.60872) < 1e-6,
+     'a normal position still takes a normal slice');
+});
+
+check('the booking path is left alone by the notional rule', () => {
+  // In broker phase 2 the quantity was fixed at submit time. Re-deciding it against a
+  // notional floor there would discard a fill the broker has already made.
+  eq(I.rungSellQty(2, 0.40), 0.8,
+     'called without a price, the helper must behave exactly as before');
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fn = src.slice(src.indexOf('function partialClose'), src.indexOf('function finalizeClose'));
+  ok(/sellQty = sellFor\[pos\.lotId\];/.test(fn),
+     'the sellFor branch must take the submitted quantity verbatim, not resize it');
+  ok((fn.match(/rungSellQty\([^)]*,[^,)]*,[^)]*\)/g) || []).length === 2,
+     'and both SIZING sites must pass a price so the notional rule can apply');
+});
+
+
+check('a whole-share lot too small to floor still takes its rung', () => {
+  // THE BUG. Both ladder sites chose their rounding from isFractionalQty(lot.qty), so a
+  // WHOLE-share lot floored to whole shares: Math.floor(2 * 0.40) = 0, which failed the
+  // `< 1` test and marked the rung TAKEN without selling anything. tp2 did the same. The
+  // trail is off by measurement (ATR_TRAIL_ARM_R 99) and there is no end-of-day flat, so
+  // the position's ONLY remaining exit was the hard stop.
+  ok(I.rungSellQty(2, 0.40) > 0, 'a 2-share lot must be able to give up 40%');
+  ok(I.rungSellQty(1, 0.40) > 0, 'and so must a 1-share lot');
+  ok(I.rungSellQty(2, 0.30) > 0, 'tp2 must survive on the remainder of a small lot');
+  ok(Math.abs(I.rungSellQty(2, 0.40) - 0.8) < 1e-9,
+     `a 2-share 40% rung is 0.8 shares, got ${I.rungSellQty(2, 0.40)}`);
+  ok(I.rungSellQty(2, 0.40) >= I.rungMinQty(),
+     'and it must clear the minimum slice, or it is marked taken and silently skipped');
+});
+
+check('the rung minimum is never derived from the lot', () => {
+  // In broker phase 2 the quantity was fixed at submit time. Testing a 0.8-share booking
+  // against a whole-share minimum (because the LOT reads as 2 shares) would discard a
+  // fill the broker has already made — the same class of error, one step later.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fn = src.slice(src.indexOf('function partialClose'), src.indexOf('function finalizeClose'));
+  ok(!/isFractionalQty\(p(os)?\.qty\)/.test(fn),
+     'partialClose must not pick its rounding or its minimum from the lot');
+  ok(/rungSellQty\(/.test(fn) && /rungMinQty\(\)/.test(fn),
+     'both sites must go through the shared helpers');
+});
+
+check('a rung never sells more than the lot holds', () => {
+  for (const [q, f] of [[1, 0.4], [0.18, 0.4], [3, 0.4], [6, 0.3], [1.81, 0.4]])
+    ok(I.rungSellQty(q, f) <= q + 1e-9, `rung on ${q} at ${f} must not exceed the lot`);
+  ok(I.rungSellQty(0, 0.4) === 0, 'an empty lot sells nothing');
+  ok(I.rungSellQty(NaN, 0.4) === 0, 'a non-finite lot sells nothing, never NaN');
+  ok(I.rungSellQty(2, NaN) === 0, 'a non-finite fraction sells nothing, never NaN');
 });
 
 // ════════════════════════════════════════════════════════════════════════════
