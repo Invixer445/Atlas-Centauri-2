@@ -5713,6 +5713,142 @@ check('mercurySkillLevel no longer takes a bare maximum', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+//  MARK 15 — THE RISK VOCABULARY, COMPUTED CORRECTLY
+//  The engine computed no Sharpe, VaR, skewness, kurtosis or beta before this. Each
+//  statistic is tested against a distribution whose answer is known in closed form,
+//  and the three formulas the source notes got wrong are pinned to the right version.
+// ════════════════════════════════════════════════════════════════════════════
+function knownNormal(n, mu, sigma, seed = 7) {
+  let s = seed; const rnd = () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    let u = 0, v = 0; while (!u) u = rnd(); while (!v) v = rnd();
+    out.push(mu + sigma * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v));
+  }
+  return out;
+}
+
+check('VaR and CVaR match the closed-form answers for a normal distribution', () => {
+  const p = I.riskProfile(knownNormal(20000, 0.0004, 0.01), 0.04);
+  // VaR95 = 1.645 sigma - mu ; CVaR95 = sigma * phi(1.645) / 0.05 - mu
+  ok(Math.abs(p.var95 - (1.645 * 0.01 - 0.0004)) < 0.0006, `VaR95 ${p.var95.toFixed(5)} vs 0.01605`);
+  ok(Math.abs(p.cvar95 - (0.01 * 2.0627 - 0.0004)) < 0.0007, `CVaR95 ${p.cvar95.toFixed(5)} vs 0.02023`);
+  ok(Math.abs(p.var99 - (2.326 * 0.01 - 0.0004)) < 0.0009, `VaR99 ${p.var99.toFixed(5)} vs 0.02286`);
+  ok(p.cvar95 > p.var95, 'CVaR must exceed VaR — it is the average of the losses PAST the VaR line');
+  ok(Math.abs(p.skew) < 0.08 && Math.abs(p.excessKurtosis) < 0.15,
+     `a normal curve has skew 0 and excess kurtosis 0, got ${p.skew.toFixed(3)} / ${p.excessKurtosis.toFixed(3)}`);
+});
+
+check('kurtosis actually detects fat tails', () => {
+  // Same variance budget, but 1% of days are 6-sigma shocks: the tails get heavy.
+  const base = knownNormal(20000, 0, 0.01, 3);
+  const fat = base.map((x, i) => (i % 100 === 0 ? (i % 200 === 0 ? 0.06 : -0.06) : x));
+  const pf = I.riskProfile(fat, 0.04), pn = I.riskProfile(base, 0.04);
+  ok(pf.excessKurtosis > 3, `fat-tailed series must read clearly above 0, got ${pf.excessKurtosis.toFixed(2)}`);
+  ok(pf.excessKurtosis > pn.excessKurtosis + 2, 'and well above the same series without the shocks');
+});
+
+check('skewness reads the LONGER TAIL, not where the curve sits', () => {
+  // The notes describe skew as "whether the curve is more to the left or the right" —
+  // that is the mean. Shift a series and skew must not move; give it a long left tail
+  // and skew must go negative.
+  const base = knownNormal(20000, 0, 0.01, 5);
+  const shifted = base.map(x => x + 0.05);
+  ok(Math.abs(I.riskProfile(shifted, 0).skew - I.riskProfile(base, 0).skew) < 1e-9,
+     'moving the whole curve right must not change skew at all');
+  const leftTail = base.map((x, i) => (i % 50 === 0 ? -Math.abs(x) * 6 : x));
+  ok(I.riskProfile(leftTail, 0).skew < -0.5, 'a long LEFT tail must read negative');
+});
+
+check('Sharpe is measured over the RISK-FREE rate, never the market return', () => {
+  // The notes wrote S = (expected - market) / SD. That is a different statistic, and it
+  // scores the market itself at exactly 0 against itself. A series earning exactly the
+  // risk-free rate has Sharpe 0; one earning more has positive Sharpe — whatever the
+  // market did.
+  const rf = 0.04, rfD = (1 + rf) ** (1 / 252) - 1;
+  const atRf = knownNormal(5000, rfD, 0.01, 9);
+  const m = atRf.reduce((a, b) => a + b, 0) / atRf.length;
+  const centred = atRf.map(x => x - m + rfD);                // mean exactly rf
+  ok(Math.abs(I.riskProfile(centred, rf).sharpe) < 1e-9, 'earning exactly the risk-free rate is Sharpe 0');
+  ok(I.riskProfile(centred.map(x => x + 0.0004), rf).sharpe > 0.5, 'earning more is positive');
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const fn = src.slice(src.indexOf('function riskProfile'), src.indexOf('function betaOf'));
+  ok(/\(mean - rfDaily\) \/ sd/.test(fn), 'the numerator must subtract the risk-free rate');
+});
+
+check('beta is correlation times relative volatility, not relative volatility alone', () => {
+  const mkt = knownNormal(5000, 0.0004, 0.01, 11);
+  const noise = knownNormal(5000, 0, 0.02, 13);
+  // A very VOLATILE asset with NO market exposure has beta ~0, whatever its volatility.
+  const indep = noise;
+  ok(Math.abs(I.betaOf(indep, mkt)) < 0.1,
+     `an asset twice as volatile but uncorrelated has beta ~0, got ${I.betaOf(indep, mkt).toFixed(3)} — ` +
+     'reading beta as "relative volatility" would have said 2');
+  const levered = mkt.map((x, i) => 1.3 * x + 0.3 * noise[i] * 0);
+  ok(Math.abs(I.betaOf(levered, mkt) - 1.3) < 1e-6, 'pure 1.3x leverage is beta 1.3 exactly');
+  eq(I.betaOf([0.01, 0.02], [0.01, 0.02]), null, 'and too short a series is no answer at all');
+});
+
+check('the risk profile refuses what it cannot measure', () => {
+  eq(I.riskProfile([], 0.04), null, 'empty');
+  eq(I.riskProfile(knownNormal(20, 0, 0.01), 0.04), null, 'twenty days is not a distribution');
+  const junk = [...knownNormal(100, 0, 0.01), NaN, Infinity, -Infinity, 'x', null];
+  const p = I.riskProfile(junk, 0.04);
+  eq(p.sessions, 100, 'non-finite entries are dropped, never propagated');
+  ok(['var95', 'cvar95', 'sharpe', 'skew', 'excessKurtosis'].every(k => Number.isFinite(p[k])),
+     'and every statistic stays finite');
+});
+
+check('distributing funds are priced on ADJUSTED bars wherever a return is computed', () => {
+  // BIL pays its yield as a monthly distribution; the RAW price drops by exactly that on
+  // every ex-date, so raw returns describe an asset that loses money once a month and
+  // earns nothing. The risk profile and the challenger both read BIL.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  ok(/async function fetchBars\(symbols, timeframe, startISO, keepPerSymbol, adjustment = 'raw'\)/.test(src),
+     'fetchBars must default to raw, so every existing caller is unchanged');
+  const risk = src.slice(src.indexOf('async function refreshRiskProfile'), src.indexOf('function riskReport'));
+  // `.*` on one line, not `[^)]*` — the calls contain nested parens (new Date(...),
+  // .toISOString()), and a class that stops at the first ')' never reaches the argument.
+  ok(/fetchBars\(.*'all'\)/.test(risk), 'the risk profile must ask for adjusted bars');
+  const ch = src.slice(src.indexOf('async function evaluateBasketChallenger'), src.indexOf('function challengerVerdict'));
+  ok(/fetchBars\(.*'all'\)/.test(ch), 'and so must the challenger');
+});
+
+check('the challenger tests ALPHA against a real risk-free series', () => {
+  // Raw differences reward beta. And a constant risk-free rate is worse: against a
+  // T-bill-heavy core it called Venus's stocks the winner in 36 of 96 rolling windows
+  // where the real-T-bill version says 2.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const ch = src.slice(src.indexOf('async function evaluateBasketChallenger'), src.indexOf('function challengerVerdict'));
+  ok(/betaOf\(cx, ix\)/.test(ch), 'the verdict must be beta-adjusted');
+  ok(/x - b \* ix\[i\]/.test(ch), 'and the tested series must be the daily alpha');
+  ok(/basketDailyReturns\(\[RISK_FREE_PROXY\]/.test(ch), 'with the risk-free leg taken from real T-bill returns');
+  const tick = src.slice(src.indexOf('async function basketChallengerTick'), src.indexOf('// How old a broker snapshot'));
+  ok(/challengerNextBasket\(CORE_HOLD_SYMBOLS, v\.challenger\)/.test(tick),
+     'the switch must go through the tested rule');
+});
+
+check('a winning challenger replaces the risky sleeve and keeps the T-bills', () => {
+  // BEHAVIOUR, not identifiers. The first version of this check matched the word
+  // `keepSafe` in the source, and passed against code that computed it and threw it away.
+  const next = I.challengerNextBasket(['QLD', 'BIL'], ['AAPL', 'MSFT', 'JNJ']);
+  ok(next.includes('BIL'), `the risk-free leg must survive a switch, got ${next}`);
+  ok(!next.includes('QLD'), 'the risky sleeve it beat must go');
+  ok(['AAPL', 'MSFT', 'JNJ'].every(x => next.includes(x)), 'and the winners must come in');
+  eq(I.challengerNextBasket(['QQQ', 'SPY'], ['AAPL']).join(','), 'AAPL',
+     'a core with no risk-free leg is simply replaced');
+  eq(I.challengerNextBasket(['BIL'], ['bil', 'AAPL']).filter(x => x === 'BIL').length, 1,
+     'and nothing is duplicated when the challenger already names a T-bill fund');
+});
+
+check('the risk profile is actually WIRED, not merely defined', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  ok(/setInterval\(\(\) => refreshRiskProfile\(\)/.test(src), 'it must be on a timer');
+  ok(/app\.get\('\/api\/risk'/.test(src), 'and reachable at /api/risk');
+  ok(/Risk profile ON/.test(src), 'and announced at boot');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 //  MARK 14 — THE AUDITOR. The AI watches the ENGINE, not the market.
 //  Every genuine saving this project has found was the engine doing something
 //  economically absurd, never a market insight. Those are visible in days; a change
@@ -5802,7 +5938,7 @@ check('self-contradicting state is reported with its dollar cost', () => {
 });
 
 check('a gate that cannot open is named as such', () => {
-  const r = auditProbe({ ...CORE_ENV, PHASE_GATE: 'on' }, `
+  const r = auditProbe({ ...CORE_ENV, PHASE_GATE_ENABLED: 'true' }, `
     I.detectStartingCapital(10000);
     I.portfolio.cash = 0;
     I.portfolio.coreHolding = {};                       // account well below its start
@@ -5979,26 +6115,56 @@ check('an equity core is still de-risked exactly as before', () => {
   eq(r.ceiling, 0.30, 'so the shield must still step it down to the floor');
 });
 
-check('a half-and-half core falls on the side the threshold names', () => {
+check('a half-and-half core moves weight into its T-bills on risk-off (Mark 15)', () => {
+  // REWRITTEN. The Mark 14 version of this test asserted that a 50/50 BIL/QQQ core,
+  // sitting under a 60% threshold, should be SHRUNK to 30% on risk-off — which sold the
+  // T-bills into idle cash along with the equities. That was the bug, written down as a
+  // requirement. The Capital Allocation Line says risk-off is a move from the risky asset
+  // TO the risk-free one: the core stays invested and only the mix changes.
   const r = weightProbe({ CORE_BASKET_SOURCE: 'fixed', CORE_HOLD_SYMBOLS: 'BIL,QQQ',
                           CORE_WEIGHTS: 'BIL:0.50,QQQ:0.50', CORE_HOLD_FRACTION: '0.9',
-                          REGIME_SHIELD: 'on', REGIME_SHIELD_FLOOR: '0.30',
-                          REGIME_SHIELD_SKIP_DEFENSIVE: '0.60' }, `
+                          REGIME_SHIELD: 'on', REGIME_SHIELD_FLOOR: '0.30' }, `
     I._regimeShieldPoke({ price: 600, ma: 700, asOf: Date.now(), bars: 300 });
-    console.log(JSON.stringify({ defensive: I.coreDefensiveWeight(),
-                                 ceiling: I.regimeShieldCeiling() }));`);
-  eq(r.defensive, 0.5, '50% defensive');
-  eq(r.ceiling, 0.30, 'below the 60% threshold, so the shield still acts on the ' +
-                      'equity half — the guard is a threshold, not an on/off switch');
+    console.log(JSON.stringify({ ceiling: I.regimeShieldCeiling(), w: I.coreWeightMap(),
+                                 frac: I.effectiveCoreFraction() }));`);
+  eq(r.ceiling, 1, 'the core must NOT be shrunk — that would sell the bills into dead cash');
+  ok(Math.abs(r.w.QQQ - 0.15) < 1e-9, `the equity sleeve keeps 30% of its weight (0.15), got ${r.w.QQQ}`);
+  ok(Math.abs(r.w.BIL - 0.85) < 1e-9, `and the rest moves INTO the T-bills (0.85), got ${r.w.BIL}`);
+  ok(r.frac > 0.9, `while the core stays fully invested, got ${r.frac}`);
 });
 
-check('the cash-equivalent list is a real list and is configurable', () => {
+check('the recommended 35/65 core is actually protected (the Mark 14 hole)', () => {
+  // Mark 14 stood the shield down whenever the core was >=60% cash-equivalents. At
+  // 65% BIL / 35% QLD that left the QLD sleeve — 70% equity exposure — wholly
+  // unprotected: 40.6% worst fall through 2007-09, identical to having no shield.
+  const r = weightProbe({ CORE_BASKET_SOURCE: 'fixed', CORE_HOLD_SYMBOLS: 'QLD,BIL',
+                          CORE_WEIGHTS: 'QLD:0.35,BIL:0.65', CORE_HOLD_FRACTION: '0.9',
+                          REGIME_SHIELD: 'on', REGIME_SHIELD_FLOOR: '0.30' }, `
+    const on = I.coreWeightMap();
+    I._regimeShieldPoke({ price: 600, ma: 700, asOf: Date.now(), bars: 300 });
+    console.log(JSON.stringify({ on, off: I.coreWeightMap() }));`);
+  eq(r.on.QLD, 0.35, 'premise: risk-on holds the full sleeve');
+  ok(Math.abs(r.off.QLD - 0.105) < 1e-9,
+     `risk-off must cut QLD to 30% of its weight (0.105), got ${r.off.QLD} — Mark 14 left it at 0.35`);
+});
+
+check('the cash-equivalent list is a real list, and the shift is pure arithmetic', () => {
   ok(I.CASH_EQUIVALENT_SYMBOLS.has('BIL'), 'BIL is the canonical T-bill fund');
   ok(I.CASH_EQUIVALENT_SYMBOLS.has('SGOV'), 'and SGOV');
-  ok(!I.CASH_EQUIVALENT_SYMBOLS.has('QQQ'), 'QQQ is emphatically not a cash equivalent');
-  ok(!I.CASH_EQUIVALENT_SYMBOLS.has('SPY'), 'nor SPY');
-  ok(I.REGIME_SHIELD_SKIP_DEFENSIVE > 0 && I.REGIME_SHIELD_SKIP_DEFENSIVE <= 1,
-     `the threshold must be a fraction, got ${I.REGIME_SHIELD_SKIP_DEFENSIVE}`);
+  ok(!I.CASH_EQUIVALENT_SYMBOLS.has('QQQ') && !I.CASH_EQUIVALENT_SYMBOLS.has('QLD'),
+     'equity funds, levered or not, are emphatically not cash-equivalents');
+  // the shift itself, directly
+  const out = I.applyRegimeShift({ QLD: 0.35, BIL: 0.65 }, true, 0.30);
+  ok(Math.abs(out.QLD + out.BIL - 1) < 1e-12, 'weights must still sum to 1 after the shift');
+  eq(I.applyRegimeShift({ QLD: 0.35, BIL: 0.65 }, false, 0.30).QLD, 0.35, 'risk-on is a no-op');
+  eq(I.applyRegimeShift({ QQQ: 0.7, SPY: 0.3 }, true, 0.30).QQQ, 0.7,
+     'with no risk-free leg the shift does nothing — the ceiling path handles that core');
+  const two = I.applyRegimeShift({ QLD: 0.4, BIL: 0.4, SGOV: 0.2 }, true, 0.0);
+  ok(Math.abs(two.BIL - 0.6667) < 1e-3 && Math.abs(two.SGOV - 0.3333) < 1e-3,
+     'freed weight is split pro rata across several cash-equivalents');
+  const hostile = I.applyRegimeShift({ QLD: NaN, BIL: 0.5 }, true, 0.3);
+  ok(Object.values(hostile).every(v => Number.isFinite(v) || Number.isNaN(v)),
+     'and hostile input must not throw');
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -6250,7 +6416,7 @@ check('a two-ETF core actually fills BOTH legs', () => {
   // The end-to-end regression: run the real buy loop and require it to reach 2/2.
   const r = weightProbe({ CORE_HOLD_SYMBOLS: 'QQQ,SPY', CORE_HOLD_FRACTION: '0.9',
                           CORE_BASKET_SOURCE: 'fixed', CORE_WEIGHTS: 'QQQ:0.7,SPY:0.3',
-                          PHASE_GATE: 'on' }, `
+                          PHASE_GATE_ENABLED: 'true' }, `
     I.detectStartingCapital(10000);
     const now = Date.now();
     I.marketData.QQQ = { price: 760.38, prevClose: 758, lastUpdate: now };
@@ -6437,7 +6603,7 @@ check('the shield applies on the PHASE-LOCKED path, which is the live one', () =
   // early branch. A shield wired only into the expression at the bottom of that
   // function would do nothing in production and pass every test that unlocks the gate.
   const r = shieldProbe({ REGIME_SHIELD: 'on', REGIME_SHIELD_FLOOR: '0.30',
-                          CORE_HOLD_FRACTION: '0.5', PHASE_GATE: 'on' }, `
+                          CORE_HOLD_FRACTION: '0.5', PHASE_GATE_ENABLED: 'true' }, `
     const locked = I.tradingPhaseLocked();
     I._regimeShieldPoke({ price: 110, ma: 100, asOf: Date.now(), bars: 300 });
     const normal = I.effectiveCoreFraction();

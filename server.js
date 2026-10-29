@@ -3420,23 +3420,47 @@ async function evaluateBasketChallenger() {
     }
     const challenger = [...new Set(first.basket.map(x => String(x || '').toUpperCase()))];
     const incumbent  = [...new Set(CORE_HOLD_SYMBOLS)];
-    const all = [...new Set([...challenger, ...incumbent])];
-    const bars = await fetchBars(all, '1Day', new Date(since).toISOString(), sessions + 10);
+    // The risk-free leg is fetched alongside, because alpha is measured in EXCESS of it.
+    const all = [...new Set([...challenger, ...incumbent, RISK_FREE_PROXY])];
+    // ADJUSTED prices: a distributing fund in the incumbent (BIL) would otherwise read
+    // as losing money every ex-date and earning nothing — see fetchBars.
+    const bars = await fetchBars(all, '1Day', new Date(since).toISOString(), sessions + 10, 'all');
     const cR = basketDailyReturns(challenger, bars || {});
-    const iR = basketDailyReturns(incumbent,  bars || {}, coreWeightMap());
+    const iR = basketDailyReturns(incumbent,  bars || {}, coreBaseWeightMap());   // structural, not regime-shifted
     if (!cR || !iR) {
       _challengerVerdict = { ready: false, sessions,
         reason: 'not enough daily history for one of the baskets' };
       return _challengerVerdict;
     }
-    const n = Math.min(cR.length, iR.length);
+    const rfR = basketDailyReturns([RISK_FREE_PROXY], bars || {});
+    const n = Math.min(cR.length, iR.length, rfR ? rfR.length : Infinity);
     if (n < CHALLENGER_MIN_DAYS) {
       _challengerVerdict = { ready: false, sessions: n, need: CHALLENGER_MIN_DAYS,
         reason: `only ${n} comparable sessions` };
       return _challengerVerdict;
     }
-    const d = [];
-    for (let i = 0; i < n; i++) d.push(cR[cR.length - n + i] - iR[iR.length - n + i]);
+    // JENSEN'S ALPHA, NOT A RAW RETURN DIFFERENCE (Mark 15). The raw test rewards BETA:
+    // a basket with more market exposure out-runs a cautious incumbent in any rising
+    // market without any skill at all. Alpha strips that out — it asks whether the
+    // challenger beat a version of the incumbent levered to the SAME market exposure.
+    //
+    // AND THE RISK-FREE RATE MUST BE THE REAL ONE. The first version of this used a
+    // constant 4%. In 2020-21 T-bills paid ~0%, so a T-bill-heavy incumbent's excess
+    // return carried a fake -4%/yr drift, and a beta of ~11 against it turned that
+    // into enormous spurious alpha: against a 95/5 BIL/QQQ core it called Venus's
+    // stocks the winner in 36 of 96 rolling windows, where the real-T-bill version says
+    // 2 — exactly the false-alarm rate of a zero-skill control. With auto-switch on,
+    // that artifact would have sold the T-bills for sixteen stocks.
+    const rfConst = (1 + RISK_FREE_RATE) ** (1 / 252) - 1;
+    const rfAt = (i) => (rfR ? rfR[rfR.length - n + i] : rfConst);
+    const cx = [], ix = [];
+    for (let i = 0; i < n; i++) {
+      cx.push(cR[cR.length - n + i] - rfAt(i));
+      ix.push(iR[iR.length - n + i] - rfAt(i));
+    }
+    const beta = betaOf(cx, ix);
+    const b = Number.isFinite(beta) ? beta : 1;
+    const d = cx.map((x, i) => x - b * ix[i]);                // daily alpha
     const mean = d.reduce((a, b) => a + b, 0) / n;
     let v = 0; for (const x of d) v += (x - mean) ** 2;
     const sd = n > 1 ? Math.sqrt(v / (n - 1)) : 0;
@@ -3447,14 +3471,16 @@ async function evaluateBasketChallenger() {
       challenger, incumbent,
       challengerReturn: compound(cR.slice(-n)),
       incumbentReturn:  compound(iR.slice(-n)),
-      dailyEdge: mean, t,
+      beta: b, dailyEdge: mean, alphaAnnual: mean * 252, t,
+      riskFree: rfR ? `${RISK_FREE_PROXY} daily total return` : `constant ${(RISK_FREE_RATE * 100).toFixed(1)}% (no ${RISK_FREE_PROXY} data)`,
       wins: challengerWins(t, n),
       reason: challengerWins(t, n)
-        ? `Venus's stock basket is beating the index core by ${(mean * 25200).toFixed(1)}%/yr ` +
-          `equivalent over ${n} sessions, t=${t.toFixed(2)} — that clears the ${CHALLENGER_MIN_T} bar`
-        : `Venus's stock basket is ${mean >= 0 ? 'ahead' : 'behind'} by ` +
-          `${(mean * 25200).toFixed(1)}%/yr equivalent over ${n} sessions, but t=${t.toFixed(2)} ` +
-          `is inside the noise (needs ${CHALLENGER_MIN_T}). Money stays on the index.`
+        ? `Venus's stock basket shows ${(mean * 25200).toFixed(1)}%/yr of ALPHA over the core ` +
+          `(beta ${b.toFixed(2)}, so market exposure is already netted out) across ${n} sessions, ` +
+          `t=${t.toFixed(2)} — that clears the ${CHALLENGER_MIN_T} bar`
+        : `Venus's stock basket's alpha over the core is ${(mean * 25200).toFixed(1)}%/yr ` +
+          `(beta ${b.toFixed(2)}) across ${n} sessions, but t=${t.toFixed(2)} is inside the noise ` +
+          `(needs ${CHALLENGER_MIN_T}). Money stays on the core.`
     };
     return _challengerVerdict;
   } catch (e) {
@@ -3464,6 +3490,17 @@ async function evaluateBasketChallenger() {
 }
 
 function challengerVerdict() { return _challengerVerdict; }
+
+// WHAT THE CORE BECOMES IF THE CHALLENGER WINS. Pure, so the rule is tested by what it
+// returns rather than by which identifiers appear near it — a source-text check passed
+// against a version that computed the T-bill list and then ignored it. The challenger's
+// alpha was measured NET of market exposure, so it earns the risky sleeve only; the
+// risk-free leg stays exactly where it is, or a win would silently re-lever the account.
+function challengerNextBasket(current, challenger) {
+  const keepSafe = (current || []).filter(k => CASH_EQUIVALENT_SYMBOLS.has(k));
+  const risky = (challenger || []).map(x => String(x || '').toUpperCase()).filter(Boolean);
+  return [...new Set([...keepSafe, ...risky])];
+}
 
 // Run the comparison, say what it found, and switch only if asked to AND it won.
 async function basketChallengerTick() {
@@ -3481,8 +3518,12 @@ async function basketChallengerTick() {
     } else {
       console.log(`[CHALLENGER] 🥊 SWITCHING the core to Venus's basket: ${v.challenger.join(',')}. ` +
                   `It earned this on ${v.sessions} sessions of out-of-sample data.`);
+      // KEEP THE RISK-FREE LEG. The challenger competes for the RISKY sleeve; its alpha
+      // was measured net of market exposure, so it earned the right to replace the
+      // equities, not the T-bills. Dropping them would silently re-lever the account.
+      const next = challengerNextBasket(CORE_HOLD_SYMBOLS, v.challenger);
       CORE_HOLD_SYMBOLS.length = 0;
-      CORE_HOLD_SYMBOLS.push(...withGrowthSleeve(v.challenger));
+      CORE_HOLD_SYMBOLS.push(...withGrowthSleeve(next));
       _lastBasketSwapAt = Date.now();
       subscribeCoreSymbols(v.challenger);
       queueSaveState();
@@ -4440,7 +4481,14 @@ async function fetchInitialPrices() {
 // `t` is normalised to epoch SECONDS to match the rest of the engine.
 const MAX_BAR_PAGES = 12;   // safety stop; 12 x 10k bars covers any watchlist we run
 
-async function fetchBars(symbols, timeframe, startISO, keepPerSymbol) {
+// `adjustment` (Mark 15): 'raw' by default, so every existing caller is byte-identical.
+// The risk profile passes 'all'. A T-bill fund like BIL pays its yield as a monthly
+// distribution, and on every ex-date the RAW price drops by exactly that amount — so
+// raw daily returns show BIL losing money once a month and earning nothing overall,
+// when its total return is ~4.5% a year. Any statistic built on raw prices of a
+// distributing fund describes the wrong asset.
+async function fetchBars(symbols, timeframe, startISO, keepPerSymbol, adjustment = 'raw') {
+  const ADJ = ['raw', 'split', 'dividend', 'all'].includes(adjustment) ? adjustment : 'raw';
   // PAGINATION IS MANDATORY, NOT AN OPTIMISATION.
   // Alpaca's `limit` is the TOTAL number of bars across every requested symbol — not
   // per symbol, which is what the old parameter name assumed. Asking for 25 symbols
@@ -4468,7 +4516,7 @@ async function fetchBars(symbols, timeframe, startISO, keepPerSymbol) {
   do {
     const qs = `symbols=${symbols.join(',')}&timeframe=${timeframe}` +
                `&start=${encodeURIComponent(startISO)}&limit=${perPage}` +
-               `&adjustment=raw&feed=${ALPACA_DATA_FEED}&sort=${wantNewestFirst ? 'desc' : 'asc'}` +
+               `&adjustment=${ADJ}&feed=${ALPACA_DATA_FEED}&sort=${wantNewestFirst ? 'desc' : 'asc'}` +
                (token ? `&page_token=${encodeURIComponent(token)}` : '');
     const j = await alpacaDataGet(`/v2/stocks/bars?${qs}`);
     if (!j) break;
@@ -4934,7 +4982,7 @@ async function runIntelCycle() {
           console.log(`[VENUS]    ${overlap}/${prop.basket.length} overlap with the live basket · ${prop.reasoning}`);
           recordBasketProposal(prop);
           if (CORE_TILT_ON && prop.conviction) {
-            const w = coreWeightMap(prop.basket, prop.conviction);
+            const w = coreBaseWeightMap(prop.basket, prop.conviction);   // a proposal's weights do not depend on today's regime
             const spread = Object.values(w);
             console.log(`[VENUS]    conviction → weights ` +
               prop.basket.map(s => `${s} ${(w[s] * 100).toFixed(1)}%`).join(' · '));
@@ -6418,6 +6466,159 @@ async function refreshRegimeShield() {
   }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+//  THE RISK PROFILE (Mark 15) — the vocabulary of the notes, computed correctly
+// ════════════════════════════════════════════════════════════════════════════
+//  The engine computed NONE of these before this release: no Sharpe, no VaR, no
+//  skewness, no kurtosis, no beta. An operator asking "is a $371 loss normal?" had no
+//  number to check it against. This answers that question in the units of the course
+//  notes it was built from — with three of the notes' formulas corrected:
+//
+//   SHARPE uses the RISK-FREE rate, not the market return. The notes wrote
+//     (expected - market) / SD; that is a different statistic, and it scores the
+//     market itself at exactly 0 against itself. Correct: (mean - rf) / SD, x sqrt(252).
+//   BETA is correlation x relative volatility, not relative volatility alone:
+//     cov(asset, market) / var(market). QQQ: 1.17 vol ratio x 0.91 corr = 1.07.
+//   SKEWNESS measures which TAIL is longer, not whether the curve sits left or right
+//     (that is the mean). Measured on SPY 2003-2026 daily: skew -0.01, essentially
+//     symmetric — but excess kurtosis 15.4, with 40 days beyond 4 sigma where a normal
+//     curve predicts 0.4. The danger in equities is the TAILS, on both sides.
+//
+//  VaR here is HISTORICAL SIMULATION: today's weights applied to real past returns.
+//  Its known blind spot is exactly what kurtosis measures — it cannot see a crash that
+//  is not in the window — so the window defaults to five years, and CVaR (the average
+//  loss on the days past the VaR line) is reported beside it.
+const RISK_PROFILE_ON = (process.env.RISK_PROFILE || 'on').toLowerCase() !== 'off';
+const RISK_FREE_RATE = Math.max(0, Math.min(0.2, parseFloat(process.env.RISK_FREE_RATE || '0.04')));
+const RISK_LOOKBACK_DAYS = Math.max(60, Math.min(2520,
+  parseInt(process.env.RISK_LOOKBACK_DAYS || '1260', 10)));
+
+// Linear interpolation between order statistics (the numpy/Excel default).
+function quantileSorted(sorted, p) {
+  if (!sorted.length) return NaN;
+  const h = (sorted.length - 1) * Math.max(0, Math.min(1, p));
+  const lo = Math.floor(h), hi = Math.min(sorted.length - 1, lo + 1);
+  return sorted[lo] + (h - lo) * (sorted[hi] - sorted[lo]);
+}
+
+// Every statistic the notes name, from a series of DAILY simple returns. Pure.
+function riskProfile(returns, rfAnnual = RISK_FREE_RATE) {
+  const r = (Array.isArray(returns) ? returns : []).filter(x => typeof x === 'number' && Number.isFinite(x));
+  const n = r.length;
+  if (n < 30) return null;                                   // too few to call a distribution
+  const mean = r.reduce((a, b) => a + b, 0) / n;
+  const sd = Math.sqrt(r.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1));
+  const rfDaily = (1 + rfAnnual) ** (1 / 252) - 1;
+  let eq = 1, peak = 1, maxDD = 0;
+  const path = [];
+  for (const x of r) { eq *= (1 + x); path.push(eq); if (eq > peak) peak = eq; else maxDD = Math.max(maxDD, 1 - eq / peak); }
+  const sorted = [...r].sort((a, b) => a - b);
+  const q05 = quantileSorted(sorted, 0.05), q01 = quantileSorted(sorted, 0.01);
+  const tail = sorted.filter(x => x <= q05);
+  const z = sd > 0 ? r.map(x => (x - mean) / sd) : r.map(() => 0);
+  let upM = 0, nM = 0;
+  for (let i = 21; i < path.length; i += 21) { nM++; if (path[i] > path[i - 21]) upM++; }
+  return {
+    sessions: n,
+    annualReturn: eq ** (252 / n) - 1,
+    annualVol: sd * Math.sqrt(252),
+    sharpe: sd > 0 ? ((mean - rfDaily) / sd) * Math.sqrt(252) : null,
+    var95: -q05,                                             // positive = a loss
+    var99: -q01,
+    cvar95: tail.length ? -(tail.reduce((a, b) => a + b, 0) / tail.length) : null,
+    skew: sd > 0 ? z.reduce((a, b) => a + b ** 3, 0) / n : 0,
+    excessKurtosis: sd > 0 ? z.reduce((a, b) => a + b ** 4, 0) / n - 3 : 0,
+    pUpDay: r.filter(x => x > 0).length / n,
+    pUpMonth: nM ? upM / nM : null,
+    maxDrawdown: maxDD,
+    riskFree: rfAnnual
+  };
+}
+
+// cov(asset, market) / var(market) on aligned series. Pure.
+function betaOf(asset, market) {
+  const n = Math.min(asset.length, market.length);
+  if (n < 30) return null;
+  const a = asset.slice(-n), m = market.slice(-n);
+  const ma = a.reduce((x, y) => x + y, 0) / n, mm = m.reduce((x, y) => x + y, 0) / n;
+  let c = 0, v = 0;
+  for (let i = 0; i < n; i++) { c += (a[i] - ma) * (m[i] - mm); v += (m[i] - mm) ** 2; }
+  return v > 0 ? c / v : null;
+}
+
+let _riskReport = null;
+
+// Today's target weights, applied to real past daily returns of the same symbols.
+async function refreshRiskProfile() {
+  if (!RISK_PROFILE_ON || !CORE_HOLD_ON) return null;
+  try {
+    const w = coreWeightMap();                               // what the core trades toward NOW
+    const syms = Object.keys(w).filter(k => w[k] > 0);
+    if (!syms.length) return null;
+    const all = [...new Set([...syms, 'SPY', RISK_FREE_PROXY])];
+    const startISO = new Date(Date.now() - Math.ceil((RISK_LOOKBACK_DAYS + 15) * 1.55) * 86400000).toISOString();
+    // ADJUSTED, for the reason given at fetchBars: a distributing fund's raw price drops
+    // on every ex-date, and a VaR built on that describes an asset that does not exist.
+    const bars = await fetchBars(all, '1Day', startISO, RISK_LOOKBACK_DAYS + 15, 'all');
+    const close = {};
+    for (const k of all) close[k] = new Map(((bars && bars[k]) || []).map(b => [b.t, b.c]));
+    let ts = [...close.SPY.keys()];
+    for (const k of syms) ts = ts.filter(t => close[k].has(t));
+    ts.sort((a, b) => a - b);
+    if (ts.length < 61) {
+      _riskReport = { ready: false, reason: `only ${ts.length} aligned daily bars across ${all.join(',')}` };
+      return _riskReport;
+    }
+    const wsum = syms.reduce((a, k) => a + w[k], 0);
+    const port = [], mkt = [];
+    for (let i = 1; i < ts.length; i++) {
+      let r = 0;
+      for (const k of syms) r += (w[k] / wsum) * (close[k].get(ts[i]) / close[k].get(ts[i - 1]) - 1);
+      port.push(r);
+      mkt.push(close.SPY.get(ts[i]) / close.SPY.get(ts[i - 1]) - 1);
+    }
+    // THE WINDOW'S OWN RISK-FREE RATE. Sharpe is measured over the T-bill return that was
+    // actually available across these sessions — a constant 4% over a window that
+    // contains 2021, when bills paid ~0%, understates every Sharpe in it.
+    let rfAnnual = RISK_FREE_RATE, rfSource = `constant ${(RISK_FREE_RATE * 100).toFixed(1)}%`;
+    const rfMap = close[RISK_FREE_PROXY];
+    if (rfMap && rfMap.size && rfMap.has(ts[0]) && rfMap.has(ts[ts.length - 1])) {
+      const g = rfMap.get(ts[ts.length - 1]) / rfMap.get(ts[0]);
+      const yrs = (ts.length - 1) / 252;
+      if (g > 0 && yrs > 0.1) { rfAnnual = g ** (1 / yrs) - 1; rfSource = `${RISK_FREE_PROXY} over the window`; }
+    }
+    const prof = riskProfile(port, rfAnnual);
+    if (!prof) { _riskReport = { ready: false, reason: 'too few returns for a distribution' }; return _riskReport; }
+    const tv = getTotalValue();
+    _riskReport = {
+      ready: true, asOf: Date.now(),
+      from: new Date(ts[0] * 1000).toISOString().slice(0, 10),
+      to: new Date(ts[ts.length - 1] * 1000).toISOString().slice(0, 10),
+      weights: Object.fromEntries(syms.map(k => [k, +(w[k] / wsum).toFixed(4)])),
+      regime: regimeShieldStatus().riskOff ? 'risk-off' : 'risk-on',
+      ...prof,
+      riskFreeSource: rfSource,
+      beta: betaOf(port, mkt),
+      accountValue: tv,
+      var95Dollars: prof.var95 * tv,
+      var99Dollars: prof.var99 * tv,
+      cvar95Dollars: prof.cvar95 != null ? prof.cvar95 * tv : null
+    };
+    const R = _riskReport, pct = x => (x * 100).toFixed(1) + '%', usd = x => '$' + Math.abs(x).toFixed(0);
+    console.log(`[RISK] 📐 ${Object.entries(R.weights).map(([k, v]) => k + ' ' + (v * 100).toFixed(0) + '%').join(' · ')} ` +
+      `over ${R.sessions} sessions (${R.from}..${R.to}, ${R.regime}): on a ${usd(tv)} account a normal ` +
+      `bad day (1-day VaR95) is -${usd(R.var95Dollars)}, the worst 1-in-20 average (CVaR95) -${usd(R.cvar95Dollars)}, ` +
+      `1-in-100 -${usd(R.var99Dollars)}. Sharpe ${R.sharpe.toFixed(2)} vs ${pct(R.riskFree)} risk-free, ` +
+      `beta ${R.beta != null ? R.beta.toFixed(2) : 'n/a'}, skew ${R.skew.toFixed(2)}, excess kurtosis ` +
+      `${R.excessKurtosis.toFixed(1)}. Up days ${pct(R.pUpDay)}, up months ${R.pUpMonth != null ? pct(R.pUpMonth) : 'n/a'}.`);
+    return _riskReport;
+  } catch (e) {
+    console.warn(`[RISK] profile failed: ${e.message}`);
+    return null;
+  }
+}
+function riskReport() { return _riskReport; }
+
 // THE ONLY READER. Returns `riskOff: false` whenever the shield is off, has no data,
 // or the data is stale. FAIL OPEN IS DELIBERATE: a missed de-risk costs some drawdown
 // in a bear market, while a false de-risk on a failed fetch sells the entire book at
@@ -6449,10 +6650,16 @@ const CASH_EQUIVALENT_SYMBOLS = new Set(
   String(process.env.CASH_EQUIVALENTS || 'BIL,SGOV,SHV,BILS,USFR,TFLO,XHLF,SHY')
     .split(',').map(x => x.trim().toUpperCase()).filter(Boolean));
 
+// The asset whose daily return IS the risk-free rate for alpha and Sharpe. A T-bill
+// fund is the textbook proxy; a constant is only the fallback when it has no data.
+const RISK_FREE_PROXY = String(process.env.RISK_FREE_PROXY || 'BIL').toUpperCase().trim();
+
 // How much of the core is already sitting in those.
 function coreDefensiveWeight() {
   try {
-    const w = coreWeightMap();
+    // The BASE map: how much of the core is structurally risk-free. Reading the shifted
+    // map here would make the answer depend on the regime it is used to judge.
+    const w = coreBaseWeightMap();
     let sum = 0;
     for (const k of Object.keys(w)) {
       if (CASH_EQUIVALENT_SYMBOLS.has(k) && Number.isFinite(w[k])) sum += w[k];
@@ -6461,9 +6668,9 @@ function coreDefensiveWeight() {
   } catch (e) { return 0; }
 }
 
-// Above this share of cash-equivalents, the shield stands down. See regimeShieldCeiling.
-const REGIME_SHIELD_SKIP_DEFENSIVE = Math.max(0, Math.min(1,
-  parseFloat(process.env.REGIME_SHIELD_SKIP_DEFENSIVE || '0.60')));
+// REGIME_SHIELD_SKIP_DEFENSIVE (Mark 14) is retired: the shield now shifts weight into
+// the cash-equivalents instead of standing down above a threshold. Setting it in the
+// environment is harmless — nothing reads it.
 
 // The ceiling the shield imposes on the core right now. 1 = no constraint.
 function regimeShieldCeiling() {
@@ -6477,7 +6684,15 @@ function regimeShieldCeiling() {
   // on a $10,000 account, paid for nothing, and it would have been invisible: the
   // shield would have logged a textbook risk-off and quietly cost money every day it
   // stayed there.
-  if (coreDefensiveWeight() >= REGIME_SHIELD_SKIP_DEFENSIVE) return 1;
+  //
+  // MARK 15: if the core holds ANY cash-equivalent, the shield acts through
+  // coreWeightMap() instead — it moves the risky weight into the T-bills and the core
+  // stays fully invested. Mark 14 used a 60% threshold here, which meant a 65/35
+  // bills/QLD core stood the shield down and left its equity sleeve unprotected (40.6%
+  // through 2008, identical to no shield), while a 50/50 core shrank to 30% and sold
+  // the bills into dead cash alongside the equities. Only a core with NO risk-free leg
+  // shrinks now, because for it there is nowhere better to put the money.
+  if (coreDefensiveWeight() > 0) return 1;
   return REGIME_SHIELD_FLOOR;
 }
 
@@ -6585,7 +6800,65 @@ function basketWithRecovered(proposal, recovered, holdings, maxNames = CORE_BASK
 // confident basket stays equal-weight, and only genuine spread moves money.
 //
 // Pure apart from its defaults, so the weighting is testable without a live market.
+// Move risky weight to the risk-free side when the shield is risk-off. Pure on its
+// inputs so the arithmetic is testable without a regime reading.
+function applyRegimeShift(base, riskOff, floor = REGIME_SHIELD_FLOOR) {
+  if (!riskOff || !base || typeof base !== 'object') return base;
+  const syms = Object.keys(base);
+  const cash = syms.filter(k => CASH_EQUIVALENT_SYMBOLS.has(k));
+  if (!cash.length) return base;                  // no risk-free leg: the ceiling path handles it
+  const keep = Math.max(0, Math.min(1, Number.isFinite(floor) ? floor : 0));
+  const out = { ...base };
+  let freed = 0;
+  for (const k of syms) {
+    if (CASH_EQUIVALENT_SYMBOLS.has(k) || !Number.isFinite(out[k])) continue;
+    const kept = out[k] * keep;
+    freed += out[k] - kept;
+    out[k] = kept;
+  }
+  const cashTot = cash.reduce((a, k) => a + (Number.isFinite(out[k]) ? out[k] : 0), 0);
+  for (const k of cash) {
+    const share = cashTot > 0 ? (Number.isFinite(out[k]) ? out[k] : 0) / cashTot : 1 / cash.length;
+    out[k] = (Number.isFinite(out[k]) ? out[k] : 0) + freed * share;
+  }
+  return out;
+}
+
 function coreWeightMap(symbols = CORE_HOLD_SYMBOLS, conv = CORE_CONVICTION) {
+  const base = coreBaseWeightMap(symbols, conv);
+  let off = false;
+  try { off = regimeShieldStatus().riskOff; } catch (e) { off = false; }
+  return applyRegimeShift(base, off);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  THE CORE'S TARGET WEIGHTS, AND HOW THE SHIELD MOVES THEM (Mark 15)
+// ════════════════════════════════════════════════════════════════════════════
+//  coreBaseWeightMap() is the structural allocation: explicit CORE_WEIGHTS,
+//  conviction tilt or equal weight. coreWeightMap() is what the core actually trades
+//  toward RIGHT NOW: the base map, re-weighted by the regime shield.
+//
+//  WHY THE SHIELD NOW MOVES WEIGHT INSTEAD OF SHRINKING THE CORE. The notes this
+//  release was built from say it directly: an investor holds one risky portfolio and
+//  sets risk by mixing it with the risk-free asset — the Capital Allocation Line. Going
+//  risk-off is a move ALONG that line: less risky asset, more risk-free asset. Mark 14
+//  could not express that. regimeShieldCeiling() could only shrink the WHOLE core
+//  (selling the T-bills along with the equities, proceeds to idle cash earning 0) or
+//  stand down entirely. With the core at 65% BIL / 35% QLD it stood down, and the
+//  QLD sleeve — 70% equity exposure — went completely unprotected:
+//
+//      35/65 QLD/BIL through 2007-2009    worst fall
+//        no shield                           40.6%
+//        Mark 14 as coded                    40.6%    <- identical: it never fired
+//        Mark 15 (this)                      25.7%
+//
+//  And below the 60% line it did fire, but sold the bills into dead cash too.
+//
+//  Now: when the core holds any cash-equivalent, risk-off keeps REGIME_SHIELD_FLOOR of
+//  each risky weight and moves the rest INTO the cash-equivalents, pro rata. The core
+//  stays fully invested — in T-bills instead of equities — and keeps earning the short
+//  rate. A core with no cash-equivalent falls back to the old ceiling path.
+function coreBaseWeightMap(symbols = CORE_HOLD_SYMBOLS, conv = CORE_CONVICTION) {
   const list = Array.isArray(symbols) && symbols.length ? symbols : [];
   const n = Math.max(1, list.length);
   const eq = 1 / n;
@@ -7858,12 +8131,22 @@ function atlasAudit(now = Date.now()) {
 
   // 6. A RISK CONTROL THAT COSTS MONEY WITHOUT REDUCING RISK.
   safe(() => {
-    if (!REGIME_SHIELD_ON) return;
+    if (!REGIME_SHIELD_ON || !regimeShieldStatus(now).riskOff) return;
     const def = coreDefensiveWeight();
-    if (def >= REGIME_SHIELD_SKIP_DEFENSIVE && regimeShieldStatus(now).riskOff) {
-      add('SHIELD_STOOD_DOWN', 'info',
-        `the shield reads risk-off but the core is ${(def*100).toFixed(0)}% cash-equivalents, so it ` +
-        `stood down. Selling T-bills into idle cash would be the same risk for less yield.`);
+    if (def > 0) {
+      const w = coreWeightMap();
+      const nowSafe = Object.keys(w).filter(k => CASH_EQUIVALENT_SYMBOLS.has(k))
+                                    .reduce((a, k) => a + (w[k] || 0), 0);
+      add('SHIELD_SHIFTED', 'info',
+        `risk-off: the core's cash-equivalent share moved from ${(def*100).toFixed(0)}% to ` +
+        `${(nowSafe*100).toFixed(0)}%. The equity sleeve is being trimmed into T-bills, which ` +
+        `keep earning the short rate — the core stays invested.`);
+    } else {
+      add('SHIELD_PROCEEDS_IDLE', 'warn',
+        `risk-off with no cash-equivalent in the core, so the shield shrinks it to ` +
+        `${(REGIME_SHIELD_FLOOR*100).toFixed(0)}% and the rest sits in cash earning nothing. ` +
+        `Adding a T-bill fund (e.g. BIL) to CORE_HOLD_SYMBOLS lets the shield move money into ` +
+        `it instead — same protection, plus the short rate.`);
     }
   });
 
@@ -11984,6 +12267,28 @@ app.get('/api/audit', (req, res) => {
   });
 });
 
+// 📐 HOW MUCH CAN THIS ALLOCATION LOSE, IN DOLLARS? Read-only. VaR, CVaR, Sharpe (vs
+// the risk-free rate), beta, skew, kurtosis and the up-day / up-month rates — computed
+// on TODAY's weights over real past returns.
+app.get('/api/risk', (req, res) => {
+  const R = riskReport();
+  res.json({
+    enabled: RISK_PROFILE_ON,
+    report: R,
+    howToRead: {
+      var95Dollars: 'a normal bad day: losses this size or worse happen about 1 day in 20',
+      cvar95Dollars: 'the AVERAGE loss on those 1-in-20 days — VaR says where the tail starts, this says how deep it goes',
+      var99Dollars: 'losses this size or worse happen about 1 day in 100 (2-3 times a year)',
+      sharpe: 'return per unit of risk, over the RISK-FREE rate (not the market return)',
+      beta: 'covariance with SPY over SPY variance — correlation times relative volatility',
+      excessKurtosis: '0 for a normal curve; above 0 means extreme days are more common than a bell curve predicts',
+      pUpDay: 'share of days that closed up — for any portfolio with real equity exposure this sits near 55%'
+    },
+    caveat: 'Historical simulation cannot see a crash that is not in its window. That blind spot is ' +
+            'exactly what the kurtosis figure measures, which is why CVaR is reported beside VaR.'
+  });
+});
+
 app.get('/api/shield', (req, res) => {
   const st = regimeShieldStatus();
   res.json({
@@ -12478,6 +12783,11 @@ if (require.main === module) app.listen(PORT, async () => {
   } else {
     console.log('[MERCURY] ☿ Forecaster OFF (MERCURY_ENABLED=false) — exits revert to stop/target only');
   }
+  if (RISK_PROFILE_ON && CORE_HOLD_ON) {
+    console.log(`[RISK] 📐 Risk profile ON — VaR, CVaR, Sharpe (vs ${(RISK_FREE_RATE * 100).toFixed(1)}% ` +
+                `risk-free), beta, skew and kurtosis on today's weights over up to ${RISK_LOOKBACK_DAYS} ` +
+                `sessions of real returns. It answers "is a loss this size normal?" in dollars. /api/risk`);
+  }
   if (AUDITOR_ON) {
     const f = atlasAudit();
     console.log(`[AUDIT] 🔍 Mark 14 auditor ON — it watches the ENGINE, not the market, because ` +
@@ -12509,9 +12819,15 @@ if (require.main === module) app.listen(PORT, async () => {
   }
   if (REGIME_SHIELD_ON) {
     const st = regimeShieldStatus();
+    const hasSafe = coreDefensiveWeight() > 0;
     console.log(`[SHIELD] 🛡  Regime shield ON — while ${REGIME_SHIELD_SYMBOL} sits below its ` +
-                `${REGIME_SHIELD_DAYS}-day average the core steps down to ` +
-                `${(REGIME_SHIELD_FLOOR * 100).toFixed(0)}% invested. Measured over 24 years ` +
+                `${REGIME_SHIELD_DAYS}-day average ` +
+                (hasSafe
+                  ? `the core keeps ${(REGIME_SHIELD_FLOOR * 100).toFixed(0)}% of its risky weight and moves ` +
+                    `the rest INTO its T-bills, staying fully invested (Mark 15). `
+                  : `the core steps down to ${(REGIME_SHIELD_FLOOR * 100).toFixed(0)}% invested and the rest ` +
+                    `waits in cash — add a T-bill fund like BIL to the basket and it moves there instead. `) +
+                `Measured over 24 years ` +
                 `(2002-2026, through the financial crisis, COVID and 2022): worst drawdown ` +
                 `55.2% -> 26.0%, and in the crisis itself 55.2% -> 12.8%.`);
     console.log(`[SHIELD] 🛡  The price: it is NOT free. $10,000 in 2003 became $366k holding ` +
@@ -12598,6 +12914,15 @@ if (require.main === module) app.listen(PORT, async () => {
 
   // 3d. Score Venus's stock basket against whatever the core actually holds. Daily,
   //     because it reads daily bars and the answer cannot change faster than that.
+  // THE RISK PROFILE. At boot and then daily: it reads daily bars, so it cannot change
+  // faster than that. After the shield refresh, because the weights it measures depend
+  // on the regime.
+  if (RISK_PROFILE_ON && CORE_HOLD_ON) {
+    refreshRiskProfile().catch(e => console.warn(`[RISK] ${e.message}`));
+    setInterval(() => refreshRiskProfile().catch(e => console.warn(`[RISK] ${e.message}`)),
+                24 * 3600 * 1000);
+  }
+
   // THE AUDITOR'S HEARTBEAT. Every 15 minutes, because the faults it looks for appear
   // in cycles and fills, not in quarters — that speed is the entire reason it points at
   // the engine rather than at prices.
@@ -12808,7 +13133,9 @@ module.exports = {
     _getFillCostSamples: () => _fillCostSamples,
     _resetFillCostSamples: () => { _fillCostSamples = []; _auditLastLogged = {}; },
     regimeShieldStatus, regimeShieldCeiling, refreshRegimeShield,
-    coreDefensiveWeight, CASH_EQUIVALENT_SYMBOLS, REGIME_SHIELD_SKIP_DEFENSIVE,
+    coreDefensiveWeight, CASH_EQUIVALENT_SYMBOLS, applyRegimeShift, coreBaseWeightMap,
+    riskProfile, betaOf, quantileSorted, refreshRiskProfile, riskReport,
+    RISK_PROFILE_ON, RISK_FREE_RATE, RISK_LOOKBACK_DAYS, RISK_FREE_PROXY, challengerNextBasket,
     REGIME_SHIELD_ON, REGIME_SHIELD_SYMBOL, REGIME_SHIELD_DAYS, REGIME_SHIELD_FLOOR,
     REGIME_SHIELD_MAX_AGE_MS, _regimeShieldPoke: (v) => { _regimeShield = { ..._regimeShield, ...v }; },
     CORE_WEIGHT_OVERRIDE, CORE_WEIGHTS_ON, unpriceableCoreNames, reportUnpriceableCoreNames,

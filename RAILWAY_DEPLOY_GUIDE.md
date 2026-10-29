@@ -73,7 +73,7 @@ share one.
 | Variable | Why |
 |---|---|
 | `LIVE_TRADING=true` | Routes orders to the **paper** broker. With `false` the engine runs its full pipeline against an internal ledger and places nothing. |
-| `CORE_HOLD_FRACTION` | **Default is `0`, which switches the entire holding side OFF.** The holding side is where this build's measured return comes from. `0.5` is the usual setting; it is a floor, not a target — phase 1 runs at `CORE_PHASE1_FRACTION` (0.97). |
+| `CORE_HOLD_FRACTION` | **Default is `0`, which switches the entire holding side OFF.** The holding side is where this build's measured return comes from. `0.5` is the usual setting; it is a floor, not a target — phase 1 runs at `CORE_PHASE1_FRACTION` (0.98). |
 | `GROQ_API_KEY` | Free at console.groq.com. Without it Venus's news/LLM layer is off; 13F and volume research still run. |
 
 ### Optional, and what they cost you
@@ -316,3 +316,100 @@ railway logs | grep "\[FLOOR\]"
 
 And `[PROFIT]` reports your gain, your peak and how much is being held back, on every
 digest, whether the floor is on or off.
+
+---
+
+## 10. Mark 15 — the configuration for a new account
+
+Every value below is read by the code, checked name-by-name against `server.js`. That
+check matters: a misspelled variable is silently ignored. The test suite itself was
+caught setting `PHASE_GATE` — a name nothing reads — instead of `PHASE_GATE_ENABLED`,
+and passed only because the gate defaults to on.
+
+### The variables
+
+```bash
+# ── broker: a NEW paper account ─────────────────────────────────────────────
+APCA_API_KEY_ID=<new paper key>
+APCA_API_SECRET_KEY=<new paper secret>
+BROKER=alpaca
+ALPACA_PAPER=true
+LIVE_TRADING=true           # routes orders to the PAPER broker; live endpoints are refused at boot
+ALPACA_DATA_FEED=iex
+ATLAS_DATA_DIR=/data/acct3  # fresh state for the fresh account (or wipe the volume)
+ADMIN_TOKEN=<any long random string>
+
+# ── the core: the Capital Allocation Line ───────────────────────────────────
+CORE_HOLD_FRACTION=0.9
+CORE_BASKET_SOURCE=fixed
+CORE_HOLD_SYMBOLS=QLD,BIL
+CORE_WEIGHTS=QLD:0.35,BIL:0.65
+
+# ── crash protection ────────────────────────────────────────────────────────
+REGIME_SHIELD=on
+REGIME_SHIELD_DAYS=200
+REGIME_SHIELD_FLOOR=0.30
+
+# ── AI pointed at prices: off (zero measured skill, see Mark 14) ────────────
+MERCURY_ENABLED=false
+
+# ── gates: unchanged ────────────────────────────────────────────────────────
+PHASE_GATE_ENABLED=true
+TRADING_UNLOCK_PCT=0.10
+TRADING_RECORD_GATE=on
+BASKET_CHALLENGER=on
+BASKET_CHALLENGER_AUTO=off
+
+# ── measurement: on ─────────────────────────────────────────────────────────
+ATLAS_AUDITOR=on
+RISK_PROFILE=on
+RISK_FREE_PROXY=BIL
+```
+
+`REGIME_SHIELD_SKIP_DEFENSIVE` (Mark 14) is retired — delete it if you set it. Nothing
+reads it any more.
+
+### Why this shape
+
+An investor holds **one** risky portfolio and sets their risk level by mixing it with
+the risk-free asset: the Capital Allocation Line. `QLD` (2× the Nasdaq-100) is the risky
+portfolio; `BIL` (1–3 month T-bills) is the risk-free asset. Leverage via QLD lets 35% of
+the money carry ~70% equity exposure, so 65% can sit in T-bills earning the short rate.
+
+When the shield goes risk-off, Mark 15 moves along that line: it keeps 30% of QLD's
+weight and shifts the rest **into BIL**. The core stays fully invested.
+
+Measured 2007-05 → 2026-10, including 2008, COVID and 2022, `$10,000` start:
+
+| QLD/BIL | CAGR | worst fall | up days | up months | 1-day VaR95 | CVaR95 |
+|---|---|---|---|---|---|---|
+| 70/30 | 17.7% | 47.0% | 56% | 63% | −$240 | −$345 |
+| 50/50 | 13.4% | 35.6% | 56% | 63% | −$171 | −$246 |
+| **35/65** | **10.0%** | **25.7%** | **56%** | **64%** | **−$120** | **−$172** |
+| 25/75 | 7.6% | 18.4% | 56% | 66% | −$85 | −$122 |
+| 15/85 | 5.1% | 10.5% | 56% | 67% | −$51 | −$73 |
+
+The CAGR column includes the 2009–2021 zero-rate era, when T-bills paid ~0%. At today's
+~4.5% short rate the low-QLD rows earn noticeably more than shown.
+
+**The up-days column is the important one.** It sits at ~56% for every row. No mix of
+equities and T-bills changes how often a day is green — only how large the red days are.
+Up *months* do move, from 63% to 67%+. Check monthly.
+
+### Verifying
+
+```
+[CORE] ⚖️  Explicit weights in force: QLD 35% · BIL 65%
+[SHIELD] 🛡  Regime shield ON — ... the core keeps 30% of its risky weight and moves the rest INTO its T-bills
+[RISK] 📐 QLD 35% · BIL 65% over N sessions ... 1-day VaR95 is -$...
+[AUDIT] 🔍 Mark 14 auditor ON — ...
+```
+
+`/api/risk` answers "is a loss this size normal?" in dollars. `/api/audit` answers "is the
+machine misbehaving?". Those two, not the balance, are what to check.
+
+### One thing that will look wrong and isn't
+
+BIL pays its yield as a **monthly cash distribution**. On each ex-date its price drops by
+that amount, so Alpaca's per-position P/L for BIL will hover near $0 and dip monthly —
+while the cash balance rises by the same amount. Judge the account total, not BIL's row.
