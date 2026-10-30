@@ -6807,12 +6807,18 @@ function basketWithRecovered(proposal, recovered, holdings, maxNames = CORE_BASK
 // Pure apart from its defaults, so the weighting is testable without a live market.
 // Move risky weight to the risk-free side when the shield is risk-off. Pure on its
 // inputs so the arithmetic is testable without a regime reading.
-function applyRegimeShift(base, riskOff, floor = REGIME_SHIELD_FLOOR) {
-  if (!riskOff || !base || typeof base !== 'object') return base;
+// `volMult` (Mark 15.81) is the volatility multiplier from sleeveVolMultiplier(): 1 when
+// the risky sleeve is at or below its normal volatility, less when it is running hot.
+// The two compose: risk-off AND hot keeps floor x volMult of each risky weight.
+function applyRegimeShift(base, riskOff, floor = REGIME_SHIELD_FLOOR, volMult = 1) {
+  if (!base || typeof base !== 'object') return base;
+  const vm = Number.isFinite(volMult) ? Math.max(0, Math.min(1, volMult)) : 1;   // CUT-ONLY: never above 1
+  const fl = Number.isFinite(floor) ? Math.max(0, Math.min(1, floor)) : 0;
+  const keep = (riskOff ? fl : 1) * vm;
+  if (keep >= 1 - 1e-12) return base;
   const syms = Object.keys(base);
   const cash = syms.filter(k => CASH_EQUIVALENT_SYMBOLS.has(k));
   if (!cash.length) return base;                  // no risk-free leg: the ceiling path handles it
-  const keep = Math.max(0, Math.min(1, Number.isFinite(floor) ? floor : 0));
   const out = { ...base };
   let freed = 0;
   for (const k of syms) {
@@ -6831,9 +6837,124 @@ function applyRegimeShift(base, riskOff, floor = REGIME_SHIELD_FLOOR) {
 
 function coreWeightMap(symbols = CORE_HOLD_SYMBOLS, conv = CORE_CONVICTION) {
   const base = coreBaseWeightMap(symbols, conv);
-  let off = false;
+  let off = false, vm = 1;
   try { off = regimeShieldStatus().riskOff; } catch (e) { off = false; }
-  return applyRegimeShift(base, off);
+  try { vm = sleeveVolMultiplier(); } catch (e) { vm = 1; }
+  return applyRegimeShift(base, off, REGIME_SHIELD_FLOOR, vm);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  VOLATILITY SCALING (Mark 15.81) — dynamic, but only in the safe direction
+// ════════════════════════════════════════════════════════════════════════════
+//  The shield is a two-position switch on a 200-day trend: right for slow bear markets,
+//  too slow for a crash that is over in three weeks. This is the continuous half. Each
+//  day the risky sleeve keeps  min(1, its NORMAL volatility / its volatility NOW)  of
+//  its weight, and the rest moves into the T-bills. Twice its usual volatility, half
+//  the weight. At or below normal, nothing happens — on ~57% of days this IS Mark 15.
+//
+//  WHY IT HAS A MECHANICAL REASON TO WORK. QLD rebalances daily, so it decays in
+//  proportion to VARIANCE. When volatility spikes, holding it is both riskier and more
+//  expensive, and volatility clusters — a violent week predicts a violent next week far
+//  better than any return predicts the next return.
+//
+//  WHY AN EARLIER TEST SAID IT DID NOT. Volatility targeting was tested in v13.68 on 339
+//  sessions of 2025-26 with a worst drawdown of 8.4% — no crash in the window, so there
+//  was nothing for it to cut. On 2008-2026, QLD/BIL 35/65 with the shield:
+//
+//                         static (15.80)   dynamic (this)
+//      CAGR                   10.1%            9.3%
+//      worst drawdown         20.8%           14.2%
+//      worst year            -20.5%          -13.4%
+//      Sharpe                  0.78            0.82
+//      2008 / COVID / 2022    13.3/11.2/20.5   9.9/6.7/13.3
+//
+//  Split-half: drawdown AND Sharpe better in both 2008-17 and 2017-26. No parameter was
+//  tuned: "normal" measured over 1, 3, 5 years or all history all improve every crash.
+//
+//  WHAT WAS TESTED AND REJECTED: letting it RAISE exposure above the base when markets
+//  are calm. In-sample it earned more; walk-forward it did not (Sharpe 0.80 vs 0.84 out
+//  of sample), and only 12 of 20 settings beat the static mix. Cut-only passed; that is
+//  why this can never return more than 1.
+//
+//  FAIL OPEN, like the shield: no data, too little data, or a reading older than 48h
+//  returns 1 — exactly Mark 15. It never de-risks on a failed fetch.
+const CORE_VOL_SCALING = (process.env.CORE_VOL_SCALING || 'on').toLowerCase() !== 'off';
+const CORE_VOL_LOOKBACK = Math.max(5, Math.min(120, parseInt(process.env.CORE_VOL_LOOKBACK || '20', 10)));
+const CORE_VOL_NORMAL_DAYS = Math.max(120, Math.min(2520, parseInt(process.env.CORE_VOL_NORMAL_DAYS || '1260', 10)));
+const CORE_VOL_MAX_AGE_MS = 48 * 3600 * 1000;
+let _sleeveVol = { now: null, normal: null, asOf: 0, symbols: [] };
+
+// Pure: the multiplier from two volatility readings. Exported so the rule is tested by
+// what it returns, not by the text around it.
+function volMultiplierFrom(normal, now) {
+  if (!(Number.isFinite(normal) && normal > 0 && Number.isFinite(now) && now > 0)) return 1;
+  return Math.max(0, Math.min(1, normal / now));
+}
+
+function sleeveVolMultiplier(nowMs = Date.now()) {
+  if (!CORE_VOL_SCALING) return 1;
+  if (!(_sleeveVol.asOf > 0) || nowMs - _sleeveVol.asOf > CORE_VOL_MAX_AGE_MS) return 1;
+  return volMultiplierFrom(_sleeveVol.normal, _sleeveVol.now);
+}
+
+// Rolling annualised volatility of a daily return series, one value per day.
+function rollingVol(returns, n) {
+  const out = [];
+  for (let i = n; i <= returns.length; i++) {
+    const w = returns.slice(i - n, i);
+    const m = w.reduce((a, b) => a + b, 0) / n;
+    out.push(Math.sqrt(w.reduce((a, b) => a + (b - m) ** 2, 0) / (n - 1)) * Math.sqrt(252));
+  }
+  return out;
+}
+
+async function refreshSleeveVol() {
+  if (!CORE_VOL_SCALING || !CORE_HOLD_ON) return null;
+  try {
+    // The BASE map's risky sleeve: what we would hold at normal volatility. Reading the
+    // live map here would measure an allocation this function is about to change.
+    const base = coreBaseWeightMap();
+    const syms = Object.keys(base);
+    if (!syms.some(k => CASH_EQUIVALENT_SYMBOLS.has(k))) return null;   // nowhere to move it
+    const risky = syms.filter(k => !CASH_EQUIVALENT_SYMBOLS.has(k) && base[k] > 0);
+    if (!risky.length) return null;
+    const startISO = new Date(Date.now() - Math.ceil((CORE_VOL_NORMAL_DAYS + CORE_VOL_LOOKBACK + 20) * 1.55) * 86400000).toISOString();
+    const bars = await fetchBars(risky, '1Day', startISO, CORE_VOL_NORMAL_DAYS + CORE_VOL_LOOKBACK + 20, 'all');
+    const close = {};
+    for (const k of risky) close[k] = new Map(((bars && bars[k]) || []).map(b => [b.t, b.c]));
+    let ts = [...close[risky[0]].keys()];
+    for (const k of risky) ts = ts.filter(t => close[k].has(t));
+    ts.sort((a, b) => a - b);
+    if (ts.length < CORE_VOL_LOOKBACK + 60) {
+      console.warn(`[VOL] only ${ts.length} daily bars for ${risky.join(',')} — staying at full weight`);
+      return null;
+    }
+    const wsum = risky.reduce((a, k) => a + base[k], 0);
+    const r = [];
+    for (let i = 1; i < ts.length; i++) {
+      let x = 0;
+      for (const k of risky) x += (base[k] / wsum) * (close[k].get(ts[i]) / close[k].get(ts[i - 1]) - 1);
+      r.push(x);
+    }
+    const vols = rollingVol(r, CORE_VOL_LOOKBACK);
+    const now = vols[vols.length - 1];
+    const past = vols.slice(0, -1).sort((a, b) => a - b);
+    const normal = past[Math.floor(past.length / 2)];
+    if (!(now > 0) || !(normal > 0)) return null;
+    _sleeveVol = { now, normal, asOf: Date.now(), symbols: risky };
+    const mult = volMultiplierFrom(normal, now);
+    const riskyBase = risky.reduce((a, k) => a + base[k], 0);
+    console.log(`[VOL] 🌡  ${risky.join('+')} ${CORE_VOL_LOOKBACK}-day volatility ${(now * 100).toFixed(0)}% ` +
+      `against a normal ${(normal * 100).toFixed(0)}% — ` +
+      (mult >= 0.999
+        ? `at or below normal, full weight (${(riskyBase * 100).toFixed(0)}% of the core).`
+        : `running hot, holding ${(mult * 100).toFixed(0)}% of it: ${(riskyBase * mult * 100).toFixed(1)}% of the core ` +
+          `instead of ${(riskyBase * 100).toFixed(0)}%, the rest in T-bills.`));
+    return _sleeveVol;
+  } catch (e) {
+    console.warn(`[VOL] refresh failed: ${e.message} — staying at full weight`);
+    return null;
+  }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -8155,6 +8276,18 @@ function atlasAudit(now = Date.now()) {
         `${(REGIME_SHIELD_FLOOR*100).toFixed(0)}% and the rest sits in cash earning nothing. ` +
         `Adding a T-bill fund (e.g. BIL) to CORE_HOLD_SYMBOLS lets the shield move money into ` +
         `it instead — same protection, plus the short rate.`);
+    }
+  });
+
+  // 6b. VOLATILITY SCALING IS CUTTING. Information, not a fault — but an operator who
+  //     sees the risky sleeve shrink should be able to find out why without a log trawl.
+  safe(() => {
+    const vm = sleeveVolMultiplier(now);
+    if (vm < 0.999) {
+      add('VOL_SCALED', 'info',
+        `the risky sleeve is at ${(_sleeveVol.now * 100).toFixed(0)}% volatility against a normal ` +
+        `${(_sleeveVol.normal * 100).toFixed(0)}%, so it is holding ${(vm * 100).toFixed(0)}% of its weight ` +
+        `and the rest is in T-bills. It returns to full weight as volatility settles.`);
     }
   });
 
@@ -12306,6 +12439,14 @@ app.get('/api/shield', (req, res) => {
     coreCeiling: regimeShieldCeiling(),
     effectiveCoreFraction: effectiveCoreFraction(),
     maxAgeHours: +(REGIME_SHIELD_MAX_AGE_MS / 3600000).toFixed(1),
+    volatilityScaling: {
+      enabled: CORE_VOL_SCALING,
+      sleeve: _sleeveVol.symbols,
+      volNow: _sleeveVol.now, volNormal: _sleeveVol.normal,
+      multiplier: sleeveVolMultiplier(),
+      asOf: _sleeveVol.asOf || null,
+      note: 'the risky sleeve keeps min(1, normal / now) of its weight — cut-only, never above 1'
+    },
     note: 'riskOff is false whenever the shield is off, unread or stale — a failed fetch ' +
           'must never sell the book, so every uncertain path resolves to staying invested.'
   });
@@ -12791,6 +12932,15 @@ if (require.main === module) app.listen(PORT, async () => {
   } else {
     console.log('[MERCURY] ☿ Forecaster OFF (MERCURY_ENABLED=false) — exits revert to stop/target only');
   }
+  if (CORE_VOL_SCALING && CORE_HOLD_ON) {
+    const hasSafe = coreDefensiveWeight() > 0;
+    console.log(`[VOL] 🌡  Volatility scaling ON (cut-only) — each day the risky sleeve keeps ` +
+                `min(1, its normal volatility / its ${CORE_VOL_LOOKBACK}-day volatility now) of its weight, ` +
+                `the rest in T-bills. Measured 2008-2026 on QLD/BIL 35/65 with the shield: worst drawdown ` +
+                `20.8% -> 14.2%, worst year -20.5% -> -13.4%, every crash shallower; it costs about 0.8%/yr. ` +
+                (hasSafe ? `Active.` : `INACTIVE: the core has no T-bill leg to move weight into — add BIL.`) +
+                ` CORE_VOL_SCALING=off disables it.`);
+  }
   if (RISK_PROFILE_ON && CORE_HOLD_ON) {
     console.log(`[RISK] 📐 Risk profile ON — VaR, CVaR, Sharpe (vs the realised ${RISK_FREE_PROXY} ` +
                 `T-bill rate over the window; ${(RISK_FREE_RATE * 100).toFixed(1)}% only if that is ` +
@@ -12926,10 +13076,16 @@ if (require.main === module) app.listen(PORT, async () => {
   // THE RISK PROFILE. At boot and then daily: it reads daily bars, so it cannot change
   // faster than that. After the shield refresh, because the weights it measures depend
   // on the regime.
-  if (RISK_PROFILE_ON && CORE_HOLD_ON) {
-    refreshRiskProfile().catch(e => console.warn(`[RISK] ${e.message}`));
-    setInterval(() => refreshRiskProfile().catch(e => console.warn(`[RISK] ${e.message}`)),
-                24 * 3600 * 1000);
+  // ORDER MATTERS: the sleeve's volatility sets today's weights, and the risk profile
+  // reports on today's weights. Refreshing them the other way round would describe
+  // yesterday's allocation as if it were today's.
+  const dailyRiskRefresh = async () => {
+    try { await refreshSleeveVol(); } catch (e) { console.warn(`[VOL] ${e.message}`); }
+    if (RISK_PROFILE_ON) { try { await refreshRiskProfile(); } catch (e) { console.warn(`[RISK] ${e.message}`); } }
+  };
+  if ((RISK_PROFILE_ON || CORE_VOL_SCALING) && CORE_HOLD_ON) {
+    dailyRiskRefresh();
+    setInterval(dailyRiskRefresh, 24 * 3600 * 1000);
   }
 
   // THE AUDITOR'S HEARTBEAT. Every 15 minutes, because the faults it looks for appear
@@ -13143,6 +13299,8 @@ module.exports = {
     _resetFillCostSamples: () => { _fillCostSamples = []; _auditLastLogged = {}; },
     regimeShieldStatus, regimeShieldCeiling, refreshRegimeShield,
     coreDefensiveWeight, CASH_EQUIVALENT_SYMBOLS, applyRegimeShift, coreBaseWeightMap,
+    volMultiplierFrom, sleeveVolMultiplier, refreshSleeveVol, rollingVol, CORE_VOL_SCALING,
+    CORE_VOL_LOOKBACK, CORE_VOL_NORMAL_DAYS, _sleeveVolPoke: (v) => { _sleeveVol = { ..._sleeveVol, ...v }; },
     riskProfile, betaOf, quantileSorted, refreshRiskProfile, riskReport,
     RISK_PROFILE_ON, RISK_FREE_RATE, RISK_LOOKBACK_DAYS, RISK_FREE_PROXY, challengerNextBasket,
     REGIME_SHIELD_ON, REGIME_SHIELD_SYMBOL, REGIME_SHIELD_DAYS, REGIME_SHIELD_FLOOR,

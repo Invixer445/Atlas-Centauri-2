@@ -346,9 +346,10 @@ CORE_HOLD_SYMBOLS=QLD,BIL
 CORE_WEIGHTS=QLD:0.35,BIL:0.65
 
 # ── crash protection ────────────────────────────────────────────────────────
-REGIME_SHIELD=on
+REGIME_SHIELD=on            # slow bear markets: the 200-day trend
 REGIME_SHIELD_DAYS=200
 REGIME_SHIELD_FLOOR=0.30
+CORE_VOL_SCALING=on         # fast crashes: cut the sleeve when it runs hotter than normal (15.81)
 
 # ── AI pointed at prices: off (zero measured skill, see Mark 14) ────────────
 MERCURY_ENABLED=false
@@ -388,7 +389,16 @@ the money carry ~70% equity exposure, so 65% can sit in T-bills earning the shor
 When the shield goes risk-off, Mark 15 moves along that line: it keeps 30% of QLD's
 weight and shifts the rest **into BIL**. The core stays fully invested.
 
+**Since 15.81 the mix is also dynamic — in one direction only.** Each day QLD keeps
+`min(1, its normal volatility ÷ its 20-day volatility now)` of its weight. Twice its usual
+volatility, half the weight; the rest goes to BIL. At or below normal it does nothing, so
+on most days the core is exactly 35/65. It can never raise QLD above 35% — the version
+that could earned more in-sample and lost out of sample. The shield handles slow bear
+markets; this handles crashes too fast for a 200-day average.
+
 Measured 2007-05 → 2026-10, including 2008, COVID and 2022, `$10,000` start:
+
+With the shield only (15.80):
 
 | QLD/BIL | CAGR | worst fall | up days | up months | 1-day VaR95 | CVaR95 |
 |---|---|---|---|---|---|---|
@@ -398,7 +408,19 @@ Measured 2007-05 → 2026-10, including 2008, COVID and 2022, `$10,000` start:
 | 25/75 | 7.6% | 18.4% | 56% | 66% | −$85 | −$122 |
 | 15/85 | 5.1% | 10.5% | 56% | 67% | −$51 | −$73 |
 
-The CAGR column includes the 2009–2021 zero-rate era, when T-bills paid ~0%. At today's
+And 35/65 with volatility scaling added (15.81), 2008–2026:
+
+| | shield only | + volatility scaling |
+|---|---|---|
+| CAGR | 10.1% | 9.3% |
+| worst drawdown | 20.8% | **14.2%** |
+| worst year | −20.5% | **−13.4%** |
+| Sharpe | 0.78 | 0.82 |
+| 2008 / COVID / 2022 | 13.3% / 11.2% / 20.5% | **9.9% / 6.7% / 13.3%** |
+
+Better on drawdown and Sharpe in both halves of the history (2008–17 and 2017–26).
+
+The CAGR columns include the 2009–2021 zero-rate era, when T-bills paid ~0%. At today's
 ~4.5% short rate the low-QLD rows earn noticeably more than shown.
 
 **The up-days column is the important one.** It sits at ~56% for every row. No mix of
@@ -410,6 +432,8 @@ Up *months* do move, from 63% to 67%+. Check monthly.
 ```
 [CORE] ⚖️  Explicit weights in force: QLD 35% · BIL 65%
 [SHIELD] 🛡  Regime shield ON — ... the core keeps 30% of its risky weight and moves the rest INTO its T-bills
+[VOL] 🌡  Volatility scaling ON (cut-only) — ... Active.
+[VOL] 🌡  QLD 20-day volatility N% against a normal M% — ...
 [RISK] 📐 QLD 35% · BIL 65% over N sessions ... 1-day VaR95 is -$...
 [AUDIT] 🔍 Mark 14 auditor ON — ...
 ```

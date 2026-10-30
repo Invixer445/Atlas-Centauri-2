@@ -5867,9 +5867,85 @@ check('the risk banner names the rate the report actually uses', () => {
      'the banner must say it uses the realised T-bill rate');
 });
 
+// ── Mark 15.81: VOLATILITY SCALING, CUT-ONLY ────────────────────────────────
+check('the volatility multiplier is min(1, normal / now) and can only CUT', () => {
+  eq(I.volMultiplierFrom(0.34, 0.68), 0.5, 'twice normal volatility, half the weight');
+  eq(I.volMultiplierFrom(0.34, 0.34), 1, 'at normal, full weight');
+  eq(I.volMultiplierFrom(0.34, 0.17), 1,
+     'calmer than normal must NOT raise exposure — the raise-allowed version won in-sample ' +
+     'and lost walk-forward (Sharpe 0.80 vs 0.84 out of sample)');
+  for (const [a, b] of [[NaN, 0.3], [0.3, NaN], [0, 0.3], [0.3, 0], [-1, 0.3], [0.3, Infinity]])
+    eq(I.volMultiplierFrom(a, b), 1, `unusable readings (${a}, ${b}) must mean NO cut`);
+});
+
+check('volatility and the regime compose, and the core stays whole', () => {
+  const both = I.applyRegimeShift({ QLD: 0.35, BIL: 0.65 }, true, 0.30, 0.5);
+  ok(Math.abs(both.QLD - 0.35 * 0.30 * 0.5) < 1e-12,
+     `risk-off AND hot keeps floor x multiplier of the sleeve, got ${both.QLD}`);
+  ok(Math.abs(both.QLD + both.BIL - 1) < 1e-12, 'and every weight still sums to 1');
+  const hot = I.applyRegimeShift({ QLD: 0.35, BIL: 0.65 }, false, 0.30, 0.5);
+  ok(Math.abs(hot.QLD - 0.175) < 1e-12, 'hot alone halves the sleeve');
+  eq(I.applyRegimeShift({ QLD: 0.35, BIL: 0.65 }, false, 0.30, 1.7).QLD, 0.35,
+     'a multiplier above 1 is clamped — the shift can never ADD risk');
+  // The case where the clamp actually bites. Risk-on, the early return hides a missing
+  // clamp; risk-OFF it does not — 0.30 x 1.7 = 0.51 would WEAKEN the shield's floor.
+  ok(Math.abs(I.applyRegimeShift({ QLD: 0.35, BIL: 0.65 }, true, 0.30, 1.7).QLD - 0.105) < 1e-12,
+     'risk-off, a multiplier above 1 must not loosen the shield past its floor (0.35 x 0.30)');
+  eq(I.applyRegimeShift({ QQQ: 0.7, SPY: 0.3 }, false, 0.30, 0.5).QQQ, 0.7,
+     'with no T-bill leg there is nowhere to move the weight, so nothing moves');
+});
+
+check('volatility scaling fails OPEN, exactly like the shield', () => {
+  const r = weightProbe({ CORE_BASKET_SOURCE: 'fixed', CORE_HOLD_SYMBOLS: 'QLD,BIL',
+                          CORE_WEIGHTS: 'QLD:0.35,BIL:0.65', CORE_HOLD_FRACTION: '0.9' }, `
+    const noReading = I.sleeveVolMultiplier();
+    I._sleeveVolPoke({ now: 0.68, normal: 0.34, asOf: Date.now(), symbols: ['QLD'] });
+    const fresh = I.sleeveVolMultiplier(), freshW = I.coreWeightMap().QLD;
+    I._sleeveVolPoke({ asOf: Date.now() - 49 * 3600 * 1000 });
+    const stale = I.sleeveVolMultiplier();
+    console.log(JSON.stringify({ noReading, fresh, freshW, stale }));`);
+  eq(r.noReading, 1, 'before the first reading the core is exactly Mark 15');
+  eq(r.fresh, 0.5, 'a fresh hot reading cuts');
+  ok(Math.abs(r.freshW - 0.175) < 1e-12, `and the live weight map follows it, got ${r.freshW}`);
+  eq(r.stale, 1, 'a reading older than 48h must never keep cutting — a failed fetch cannot de-risk');
+  const off = weightProbe({ CORE_VOL_SCALING: 'off', CORE_BASKET_SOURCE: 'fixed',
+                            CORE_HOLD_SYMBOLS: 'QLD,BIL', CORE_WEIGHTS: 'QLD:0.35,BIL:0.65',
+                            CORE_HOLD_FRACTION: '0.9' }, `
+    I._sleeveVolPoke({ now: 0.68, normal: 0.34, asOf: Date.now(), symbols: ['QLD'] });
+    console.log(JSON.stringify({ m: I.sleeveVolMultiplier() }));`);
+  eq(off.m, 1, 'and CORE_VOL_SCALING=off turns it off completely');
+});
+
+check('rolling volatility is the annualised sample SD of each window', () => {
+  const v = I.rollingVol([0.01, -0.01, 0.01, -0.01, 0.01], 4);
+  eq(v.length, 2, 'one value per complete window');
+  const sd = Math.sqrt((4 * 0.01 ** 2) / 3);           // mean 0, n-1 denominator
+  ok(Math.abs(v[0] - sd * Math.sqrt(252)) < 1e-12, `got ${v[0]}`);
+});
+
+check('volatility scaling is WIRED, and refreshes BEFORE the risk profile', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const i = src.indexOf('const dailyRiskRefresh');
+  ok(i > 0, 'there must be a daily refresh');
+  const body = src.slice(i, i + 400);
+  ok(body.indexOf('refreshSleeveVol') > -1 && body.indexOf('refreshSleeveVol') < body.indexOf('refreshRiskProfile'),
+     'volatility sets today\'s weights and the risk profile reports on them, so volatility goes first');
+  ok(/setInterval\(dailyRiskRefresh/.test(src), 'and it must be on a timer');
+  ok(/Volatility scaling ON/.test(src), 'announced at boot');
+  ok(/volatilityScaling: \{/.test(src), 'reported at /api/shield');
+  ok(/add\('VOL_SCALED'/.test(src), 'and the auditor says when it is cutting');
+  const cw = src.slice(src.indexOf('function coreWeightMap('), src.indexOf('function coreWeightMap(') + 400);
+  ok(/sleeveVolMultiplier\(\)/.test(cw), 'and the live weight map must actually consult it');
+});
+
 check('the risk profile is actually WIRED, not merely defined', () => {
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
-  ok(/setInterval\(\(\) => refreshRiskProfile\(\)/.test(src), 'it must be on a timer');
+  // Reachable from a timer: directly, or through the daily refresh that runs volatility
+  // first (15.81). The invariant is "it refreshes on a schedule", not one call shape.
+  const direct = /setInterval\(\(\) => refreshRiskProfile\(\)/.test(src);
+  const viaDaily = /setInterval\(dailyRiskRefresh/.test(src) &&
+                   /const dailyRiskRefresh[\s\S]{0,400}refreshRiskProfile\(\)/.test(src);
+  ok(direct || viaDaily, 'it must be on a timer');
   ok(/app\.get\('\/api\/risk'/.test(src), 'and reachable at /api/risk');
   ok(/Risk profile ON/.test(src), 'and announced at boot');
 });
