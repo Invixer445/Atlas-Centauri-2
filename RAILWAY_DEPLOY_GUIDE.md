@@ -336,7 +336,7 @@ BROKER=alpaca
 ALPACA_PAPER=true
 LIVE_TRADING=true           # routes orders to the PAPER broker; live endpoints are refused at boot
 ALPACA_DATA_FEED=iex
-ATLAS_DATA_DIR=/data/acct3  # fresh state for the fresh account (or wipe the volume)
+ATLAS_DATA_DIR=/data/acct3  # ONLY when starting a new account; see below
 ADMIN_TOKEN=<any long random string>
 
 # ── the core: the Capital Allocation Line ───────────────────────────────────
@@ -368,6 +368,15 @@ RISK_FREE_PROXY=BIL
 
 `REGIME_SHIELD_SKIP_DEFENSIVE` (Mark 14) is retired — delete it if you set it. Nothing
 reads it any more.
+
+**`ATLAS_DATA_DIR`: change it once, when the ACCOUNT changes — never mid-account.** Any
+path works as long as it is fresh for the new account (a wiped volume does the same job).
+Changing it on a running account starts state from scratch, and the engine re-detects
+starting capital from whatever the balance is that minute — which moves the phase-gate
+bar and every "since inception" figure. To switch an EXISTING account to this config,
+change only the core and Mercury variables and leave `ATLAS_DATA_DIR` alone: the old
+holdings are off-basket, get a target of zero, and are trimmed out on the next
+market-hours cycle while the top-up buys the new basket with the proceeds.
 
 ### Why this shape
 
