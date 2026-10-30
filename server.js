@@ -4982,7 +4982,12 @@ async function runIntelCycle() {
           console.log(`[VENUS]    ${overlap}/${prop.basket.length} overlap with the live basket · ${prop.reasoning}`);
           recordBasketProposal(prop);
           if (CORE_TILT_ON && prop.conviction) {
-            const w = coreBaseWeightMap(prop.basket, prop.conviction);   // a proposal's weights do not depend on today's regime
+            // VENUS'S OWN VIEW, NOT THE OPERATOR'S. With CORE_WEIGHTS set, the default map
+            // applied the operator's allocation to Venus's basket: a proposal containing SPY
+            // printed "conviction -> weights ... SPY 30.0%" because CORE_WEIGHTS said
+            // SPY:0.30 — a line labelled as Venus's conviction, showing someone else's
+            // numbers, and making Venus look heavily tilted toward a name it was not.
+            const w = coreBaseWeightMap(prop.basket, prop.conviction, { explicit: false });
             const spread = Object.values(w);
             console.log(`[VENUS]    conviction → weights ` +
               prop.basket.map(s => `${s} ${(w[s] * 100).toFixed(1)}%`).join(' · '));
@@ -6858,14 +6863,17 @@ function coreWeightMap(symbols = CORE_HOLD_SYMBOLS, conv = CORE_CONVICTION) {
 //  each risky weight and moves the rest INTO the cash-equivalents, pro rata. The core
 //  stays fully invested — in T-bills instead of equities — and keeps earning the short
 //  rate. A core with no cash-equivalent falls back to the old ceiling path.
-function coreBaseWeightMap(symbols = CORE_HOLD_SYMBOLS, conv = CORE_CONVICTION) {
+// `explicit: false` skips CORE_WEIGHTS. Only for DESCRIBING a model's own view — every
+// path that decides what to hold keeps the default, so the operator's allocation still
+// wins wherever money moves.
+function coreBaseWeightMap(symbols = CORE_HOLD_SYMBOLS, conv = CORE_CONVICTION, { explicit = true } = {}) {
   const list = Array.isArray(symbols) && symbols.length ? symbols : [];
   const n = Math.max(1, list.length);
   const eq = 1 / n;
   const out = {};
   // AN EXPLICIT ALLOCATION WINS OVER EVERY MODEL VIEW. Checked first so no conviction
   // value, tilt setting or share cap can move a weight the operator wrote down.
-  if (CORE_WEIGHTS_ON) {
+  if (CORE_WEIGHTS_ON && explicit) {
     let named = 0; const unnamed = [];
     for (const sym of list) {
       const w = CORE_WEIGHT_OVERRIDE[sym];
@@ -12784,8 +12792,9 @@ if (require.main === module) app.listen(PORT, async () => {
     console.log('[MERCURY] ☿ Forecaster OFF (MERCURY_ENABLED=false) — exits revert to stop/target only');
   }
   if (RISK_PROFILE_ON && CORE_HOLD_ON) {
-    console.log(`[RISK] 📐 Risk profile ON — VaR, CVaR, Sharpe (vs ${(RISK_FREE_RATE * 100).toFixed(1)}% ` +
-                `risk-free), beta, skew and kurtosis on today's weights over up to ${RISK_LOOKBACK_DAYS} ` +
+    console.log(`[RISK] 📐 Risk profile ON — VaR, CVaR, Sharpe (vs the realised ${RISK_FREE_PROXY} ` +
+                `T-bill rate over the window; ${(RISK_FREE_RATE * 100).toFixed(1)}% only if that is ` +
+                `unavailable), beta, skew and kurtosis on today's weights over up to ${RISK_LOOKBACK_DAYS} ` +
                 `sessions of real returns. It answers "is a loss this size normal?" in dollars. /api/risk`);
   }
   if (AUDITOR_ON) {

@@ -5841,6 +5841,32 @@ check('a winning challenger replaces the risky sleeve and keeps the T-bills', ()
      'and nothing is duplicated when the challenger already names a T-bill fund');
 });
 
+check("a Venus proposal is described in VENUS's weights, not the operator's", () => {
+  // Live 2026-10-30 boot: "conviction -> weights ... SPY 30.0%" — because CORE_WEIGHTS
+  // said SPY:0.30 and the proposal happened to contain SPY. The line is labelled as
+  // Venus's conviction and was showing the operator's allocation instead.
+  const r = weightProbe({ CORE_BASKET_SOURCE: 'fixed', CORE_HOLD_SYMBOLS: 'QQQ,SPY',
+                          CORE_WEIGHTS: 'QQQ:0.70,SPY:0.30', CORE_HOLD_FRACTION: '0.9' }, `
+    const b = ['AAPL', 'MSFT', 'JNJ', 'SPY'];
+    console.log(JSON.stringify({ view: I.coreBaseWeightMap(b, {}, { explicit: false }),
+                                 held: I.coreWeightMap() }));`);
+  ok(Math.abs(r.view.SPY - 0.25) < 1e-9, `with no conviction Venus's basket is equal-weight, got SPY ${r.view.SPY}`);
+  eq(r.held.QQQ, 0.7, 'and the operator\'s own core is untouched by the change');
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  ok(/coreBaseWeightMap\(prop\.basket, prop\.conviction, \{ explicit: false \}\)/.test(src),
+     'the proposal log must ask for the model\'s view explicitly');
+});
+
+check('the risk banner names the rate the report actually uses', () => {
+  // The banner said "vs 4.0% risk-free"; the live report used the realised BIL rate
+  // (3.7% that morning). A banner describing behaviour the code does not have is how
+  // faults have hidden in this project.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
+  const i = src.indexOf('Risk profile ON');
+  ok(/realised \$\{RISK_FREE_PROXY\}/.test(src.slice(i - 200, i + 400)),
+     'the banner must say it uses the realised T-bill rate');
+});
+
 check('the risk profile is actually WIRED, not merely defined', () => {
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
   ok(/setInterval\(\(\) => refreshRiskProfile\(\)/.test(src), 'it must be on a timer');
