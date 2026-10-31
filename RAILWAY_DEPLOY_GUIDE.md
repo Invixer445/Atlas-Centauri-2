@@ -417,7 +417,7 @@ Mark 15 was set. Shield and volatility scaling on, 2bp a side:
 | 2008 / COVID / 2022 | −10.2 / −7.4 / −11.1% | −11.0 / −7.9 / −9.8% | −9.4 / −6.9 / −8.6% |
 
 The middle column keeps 15.80's return with a smaller worst case. The right-hand column is
-the lower-risk setting: every crash smaller than 15.80, for about 0.7%/yr less.
+the lower-risk setting: every crash smaller than 15.80, for about 0.8%/yr less.
 
 **Both protections held up on the 20 years they never saw.** On 1986–2006 the shield took
 the recommended core's worst fall from 58.9% to 29.8%, and volatility scaling took it to
