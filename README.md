@@ -18,12 +18,12 @@ experiment, and it stays locked until the core has earned the money to fund it.
 
 | Part | What it does | How often it acts |
 |---|---|---|
-| **Core basket** | Holds `CORE_HOLD_SYMBOLS` at `CORE_WEIGHTS` (Mark 15: QLD 35%, BIL 65%), and trims any name that outgrows its slice by more than the trim band | rarely |
+| **Core basket** | Holds `CORE_HOLD_SYMBOLS` at `CORE_WEIGHTS` (15.82: QQQ 40%, SPY 40%, BIL 20%), and trims any name that outgrows its slice by more than the trim band | rarely |
 | **Regime shield** | While SPY is below its 200-day average, the risky names keep 30% of their weight and the rest moves to T-bills | about 5 switches a year (2008–2026) |
 | **Volatility scaling** | The risky names keep (their 5-year normal volatility ÷ the last 20 days') of their weight, capped at 100%, so it can only cut | re-measured daily |
 | **Phase gate** | The trading engine opens **nothing** until the account is up `TRADING_UNLOCK_PCT` (10%). After that it trades only with the profit, and locks again if the account falls back to +5% | once |
-| **Basket challenger** | Scores the research AI's proposed basket against the live one. It needs 60 sessions and an alpha t-stat of 2 before it can switch, and switches by itself only with `BASKET_CHALLENGER_AUTO=on` | months |
-| **Auditor, risk profile** | Idle cash, cost drift and unreachable gates (every 15 min); Sharpe, VaR, CVaR and drawdown against the real T-bill rate (daily) | — |
+| **Basket challenger** | Scores the research AI's proposed basket against the live one. It needs 60 sessions and an alpha t-stat of 3 (it is re-read daily, so 2 would let luck through) before it can switch, and switches by itself only with `BASKET_CHALLENGER_AUTO=on` | months |
+| **Auditor, risk profile** | Idle cash, cost drift, unreachable gates, a leveraged fund held beside T-bills (every 15 min); Sharpe, Sortino, Calmar, VaR, CVaR, worst 12 months and time below a high, against the real T-bill rate (daily) | — |
 
 Nothing closes at the bell, on purpose. On SPY from 2003 to 2026, $10,000 held only from
 each open to each close grew to about $20,000 before costs. Held through the nights as

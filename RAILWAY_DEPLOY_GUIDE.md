@@ -339,11 +339,11 @@ ALPACA_DATA_FEED=iex
 ATLAS_DATA_DIR=/data/acct3  # ONLY when starting a new account; see below
 ADMIN_TOKEN=<any long random string>
 
-# ── the core: the Capital Allocation Line ───────────────────────────────────
+# ── the core: two indexes and T-bills (15.82; was QLD/BIL, see "Why this shape") ─
 CORE_HOLD_FRACTION=0.9
 CORE_BASKET_SOURCE=fixed
-CORE_HOLD_SYMBOLS=QLD,BIL
-CORE_WEIGHTS=QLD:0.35,BIL:0.65
+CORE_HOLD_SYMBOLS=QQQ,SPY,BIL
+CORE_WEIGHTS=QQQ:0.40,SPY:0.40,BIL:0.20
 
 # ── crash protection ────────────────────────────────────────────────────────
 REGIME_SHIELD=on            # slow bear markets: the 200-day trend
@@ -382,61 +382,79 @@ market-hours cycle while the top-up buys the new basket with the proceeds.
 ### Why this shape
 
 An investor holds **one** risky portfolio and sets their risk level by mixing it with
-the risk-free asset: the Capital Allocation Line. `QLD` (2× the Nasdaq-100) is the risky
-portfolio; `BIL` (1–3 month T-bills) is the risk-free asset. Leverage via QLD lets 35% of
-the money carry ~70% equity exposure, so 65% can sit in T-bills earning the short rate.
+the risk-free asset: the Capital Allocation Line. Here the risky portfolio is half
+Nasdaq-100 (`QQQ`), half S&P 500 (`SPY`); `BIL` (1–3 month T-bills) is the risk-free
+asset. When the shield goes risk-off, the core moves along that line: the two indexes
+keep 30% of their weight and the rest shifts **into BIL**. The core stays fully invested.
 
-When the shield goes risk-off, Mark 15 moves along that line: it keeps 30% of QLD's
-weight and shifts the rest **into BIL**. The core stays fully invested.
+**The mix is also dynamic, in one direction only (15.81).** Each day the index sleeve
+keeps `min(1, its normal volatility ÷ its 20-day volatility now)` of its weight, and the
+rest goes to BIL. At or below normal it does nothing. It can never raise the weight: the
+version that could earned more in-sample and lost out of sample.
 
-**Since 15.81 the mix is also dynamic — in one direction only.** Each day QLD keeps
-`min(1, its normal volatility ÷ its 20-day volatility now)` of its weight. Twice its usual
-volatility, half the weight; the rest goes to BIL. At or below normal it does nothing, so
-on most days the core is exactly 35/65. It can never raise QLD above 35% — the version
-that could earned more in-sample and lost out of sample. The shield handles slow bear
-markets; this handles crashes too fast for a 200-day average.
+**Why not QLD/BIL any more (15.82).** Mark 15.80 held `QLD` (2× the Nasdaq-100) at 35%
+beside 65% `BIL`. That was a mistake, for two reasons:
 
-Measured 2007-05 → 2026-10, including 2008, COVID and 2022, `$10,000` start:
+- **It borrowed and lent the same money.** A 2× fund gets its second 1× by borrowing
+  inside the fund, at about the T-bill rate plus 1.6%/yr (measured 2006–2026). Holding
+  T-bills beside it lends that money straight back at the T-bill rate. `QQQ` at 70% is
+  the same exposure with no loan. The auditor now flags this as `LEVERAGE_BESIDE_CASH`.
+- **The Nasdaq-100 on its own is one bet,** and Mark 15 was chosen on 2007–2026. That was
+  the Nasdaq's best era, and it began *after* its worst crash: −83% in 2000–02.
 
-With the shield only (15.80):
+Rebuilt back to 1986 with synthetic QLD and BIL calibrated against the real funds (daily
+correlation 0.996). 1986–2006 is a true out-of-sample test: none of it was looked at when
+Mark 15 was set. Shield and volatility scaling on, 2bp a side:
 
-| QLD/BIL | CAGR | worst fall | up days | up months | 1-day VaR95 | CVaR95 |
-|---|---|---|---|---|---|---|
-| 70/30 | 17.7% | 47.0% | 56% | 63% | −$240 | −$345 |
-| 50/50 | 13.4% | 35.6% | 56% | 63% | −$171 | −$246 |
-| **35/65** | **10.0%** | **25.7%** | **56%** | **64%** | **−$120** | **−$172** |
-| 25/75 | 7.6% | 18.4% | 56% | 66% | −$85 | −$122 |
-| 15/85 | 5.1% | 10.5% | 56% | 67% | −$51 | −$73 |
+| 1986–2026 | QLD 35 / BIL 65 (15.80) | **QQQ 40 / SPY 40 / BIL 20** | QQQ 35 / SPY 35 / BIL 30 |
+|---|---|---|---|
+| return per year | 9.5% | **9.4%** | 8.7% |
+| worst drawdown | 28.6% (Oct 2002) | **22.9%** | 19.0% |
+| worst 12 months | −16.8% | **−13.7%** | −11.4% |
+| longest below a high | 5.4 years | **3.9 years** | 3.5 years |
+| Sharpe, 1986–2006 / 2006–2026 | 0.52 / 0.80 | **0.57 / 0.79** | 0.57 / 0.80 |
+| dot-com, 2000–02 | −28.5% | **−22.7%** | −18.9% |
+| 2008 / COVID / 2022 | −10.2 / −7.4 / −11.1% | −11.0 / −7.9 / −9.8% | −9.4 / −6.9 / −8.6% |
 
-And 35/65 with volatility scaling added (15.81), 2008–2026:
+The middle column keeps 15.80's return with a smaller worst case. The right-hand column is
+the lower-risk setting: every crash smaller than 15.80, for about 0.7%/yr less.
 
-| | shield only | + volatility scaling |
-|---|---|---|
-| CAGR | 10.1% | 9.3% |
-| worst drawdown | 20.8% | **14.2%** |
-| worst year | −20.5% | **−13.4%** |
-| Sharpe | 0.78 | 0.82 |
-| 2008 / COVID / 2022 | 13.3% / 11.2% / 20.5% | **9.9% / 6.7% / 13.3%** |
+**Both protections held up on the 20 years they never saw.** On 1986–2006 the shield took
+the recommended core's worst fall from 58.9% to 29.8%, and volatility scaling took it to
+22.9%. But be clear about what volatility scaling is: **insurance**. It improved Sharpe only
+in the era it was found in. Over 40 years, return per unit of risk is the same with or
+without it (0.67). What it buys is a worst 12 months of −13.7% instead of −22.0%, for about
+1.4%/yr.
 
-Better on drawdown and Sharpe in both halves of the history (2008–17 and 2017–26).
+These figures include the 2009–2021 zero-rate era, when T-bills paid ~0%. Pre-1993 S&P
+and pre-1999 Nasdaq returns are the index plus an estimated dividend (3.3% and 0.7%/yr).
 
-The CAGR columns include the 2009–2021 zero-rate era, when T-bills paid ~0%. At today's
-~4.5% short rate the low-QLD rows earn noticeably more than shown.
+**Up days do not move.** They sit at ~56% for every mix: no blend of equities and T-bills
+changes how often a day is green, only how large the red days are. Up *months* and up
+*years* move. Check monthly.
 
-**The up-days column is the important one.** It sits at ~56% for every row. No mix of
-equities and T-bills changes how often a day is green — only how large the red days are.
-Up *months* do move, from 63% to 67%+. Check monthly.
+**SHY is no longer treated as cash (15.82).** It holds 1–3 year notes, duration ~1.9. It
+lost 3.9% in 2022 while BIL gained 1.4%: the one year bonds fell with stocks. If you set
+`CASH_EQUIVALENTS` yourself, keep it to T-bill and floating-rate funds.
+
+**The basket challenger's bar is t ≥ 3 (15.82).** It re-reads the same t-statistic every
+day, and with no real edge t ≥ 2 shows up by luck 16% of the time within three years. At 3
+that falls to about 2%.
 
 ### Verifying
 
 ```
-[CORE] ⚖️  Explicit weights in force: QLD 35% · BIL 65%
+[CORE] ⚖️  Explicit weights in force: QQQ 40% · SPY 40% · BIL 20%
 [SHIELD] 🛡  Regime shield ON — ... the core keeps 30% of its risky weight and moves the rest INTO its T-bills
 [VOL] 🌡  Volatility scaling ON (cut-only) — ... Active.
-[VOL] 🌡  QLD 20-day volatility N% against a normal M% — ...
-[RISK] 📐 QLD 35% · BIL 65% over N sessions ... 1-day VaR95 is -$...
+[VOL] 🌡  QQQ+SPY 20-day volatility N% against a normal M% — ...
+[RISK] 📐 QQQ 40% · SPY 40% · BIL 20% over N sessions ... 1-day VaR95 is -$...
+[RISK] 📐 Pain: worst fall N%, worst 12 months -N%, longest below a high N sessions. Sortino N, Calmar N. ...
 [AUDIT] 🔍 Mark 14 auditor ON — ...
 ```
+
+If the auditor prints `LEVERAGE_BESIDE_CASH`, the core still holds a leveraged fund beside
+T-bills. It names the unlevered swap; change `CORE_HOLD_SYMBOLS` and `CORE_WEIGHTS` to it.
 
 `/api/risk` answers "is a loss this size normal?" in dollars. `/api/audit` answers "is the
 machine misbehaving?". Those two, not the balance, are what to check.

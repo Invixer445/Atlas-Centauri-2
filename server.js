@@ -3316,8 +3316,27 @@ function recordBasketProposal(prop) {
     log.push({ at: new Date().toISOString(), basket: prop.basket,
                sectors: prop.sectors || {}, reasoning: prop.reasoning || '',
                control: [...CORE_HOLD_SYMBOLS] });
-    fs.writeFileSync(BASKET_LOG, JSON.stringify(log.slice(-400), null, 2));
+    fs.writeFileSync(BASKET_LOG, JSON.stringify(trimProposalLog(log, 400), null, 2));
   } catch (e) { console.warn(`[VENUS] could not record basket proposal: ${e.message}`); }
+}
+
+// The one entry evaluateBasketChallenger scores. Shared, so the cap below and the
+// evaluator can never disagree about which proposal that is.
+function isScorableProposal(e) {
+  return !!(e && Array.isArray(e.basket) && e.basket.length && Array.isArray(e.control) && e.control.length);
+}
+
+// THE CHALLENGER'S PROPOSAL MUST SURVIVE THE CAP (15.82). The challenger scores the
+// FIRST proposal in this file and nothing else: one pick, fixed in advance, one test.
+// A plain slice(-400) drops that entry after 400 proposals — one a day, so a little over
+// a year — and from then on "the first proposal" is a different basket every day. That
+// is a fresh test daily, the data-snooping the single fixed pick exists to avoid.
+function trimProposalLog(log, max = 400) {
+  if (!Array.isArray(log)) return [];
+  if (log.length <= max) return log;
+  const idx = log.findIndex(isScorableProposal);
+  if (idx < 0 || idx >= log.length - max) return log.slice(-max);
+  return [log[idx], ...log.slice(-(max - 1))];
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3345,9 +3364,25 @@ function recordBasketProposal(prop) {
 //  60 sessions the two baskets differ by several percent on noise alone. The switch also
 //  costs real money — the spread on every name in and out — so a coin-flip margin is not
 //  worth paying for.
+//
+//  AND THE BAR IS 3, NOT 2, BECAUSE IT IS READ EVERY DAY (15.82). t >= 2 is a 2.3% false
+//  alarm for ONE look. This test is re-read daily from session 60 and wins the first
+//  time it clears the bar, so the luck accumulates. Simulated with zero real alpha:
+//
+//      checked daily for     t >= 2     t >= 2.5     t >= 3
+//      1 year                 11.0%       3.7%        1.1%
+//      3 years                16.0%       6.1%        1.9%
+//      5 years                17.8%       6.8%        2.0%
+//
+//  Fat-tailed days (Student t, 3 d.f.) give the same table to within a point. At 3 the
+//  daily re-read is back near the 2.3% a single look at 2 was meant to have; it is also
+//  the bar Harvey, Liu & Zhu proposed for new factors, for the same reason. The price is
+//  speed: a real 20%/yr edge at 15% tracking error is caught within three years 39% of
+//  the time instead of 79%. At 2, a basket with no edge "won" one run in six, and the
+//  index has beaten stock picking on every measurement above — most wins would be luck.
 const BASKET_CHALLENGER_ON = (process.env.BASKET_CHALLENGER || 'on').toLowerCase() !== 'off';
 const CHALLENGER_MIN_DAYS = Math.max(20, parseInt(process.env.CHALLENGER_MIN_DAYS || '60', 10));
-const CHALLENGER_MIN_T    = Math.max(1, parseFloat(process.env.CHALLENGER_MIN_T || '2.0'));
+const CHALLENGER_MIN_T    = Math.max(1, parseFloat(process.env.CHALLENGER_MIN_T || '3.0'));
 // Reporting is free and always on. ACTING on it is opt-in, because switching the basket
 // sells everything held and buys sixteen new names — an expensive, visible action that
 // an operator should choose rather than discover.
@@ -3406,8 +3441,7 @@ async function evaluateBasketChallenger() {
     let log = [];
     try { log = JSON.parse(fs.readFileSync(BASKET_LOG, 'utf8')); } catch {}
     if (!Array.isArray(log) || !log.length) return null;
-    const first = log.find(e => e && Array.isArray(e.basket) && e.basket.length
-                              && Array.isArray(e.control) && e.control.length);
+    const first = log.find(isScorableProposal);
     if (!first) return null;
     const since = Date.parse(first.at);
     if (!Number.isFinite(since)) return null;
@@ -6514,20 +6548,44 @@ function riskProfile(returns, rfAnnual = RISK_FREE_RATE) {
   const mean = r.reduce((a, b) => a + b, 0) / n;
   const sd = Math.sqrt(r.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1));
   const rfDaily = (1 + rfAnnual) ** (1 / 252) - 1;
-  let eq = 1, peak = 1, maxDD = 0;
+  let eq = 1, peak = 1, maxDD = 0, peakAt = -1, longest = 0;
   const path = [];
-  for (const x of r) { eq *= (1 + x); path.push(eq); if (eq > peak) peak = eq; else maxDD = Math.max(maxDD, 1 - eq / peak); }
+  for (let i = 0; i < n; i++) {
+    eq *= (1 + r[i]); path.push(eq);
+    if (eq > peak) { longest = Math.max(longest, i - peakAt); peak = eq; peakAt = i; }
+    else maxDD = Math.max(maxDD, 1 - eq / peak);
+  }
+  longest = Math.max(longest, n - 1 - peakAt);                // still below the high at the end counts
   const sorted = [...r].sort((a, b) => a - b);
   const q05 = quantileSorted(sorted, 0.05), q01 = quantileSorted(sorted, 0.01);
   const tail = sorted.filter(x => x <= q05);
   const z = sd > 0 ? r.map(x => (x - mean) / sd) : r.map(() => 0);
   let upM = 0, nM = 0;
   for (let i = 21; i < path.length; i += 21) { nM++; if (path[i] > path[i - 21]) upM++; }
+  // THE PAIN MEASURES (15.82). Sharpe counts an up-swing as risk; Sortino counts only the
+  // days below the risk-free line. Calmar is return per unit of the worst fall. And the
+  // gap between "the average day, compounded" and what actually compounded is the
+  // volatility drag — geometric ~ arithmetic - sigma^2/2 — the reason +50% then -50%
+  // loses 25%, and the reason a shallower crash is worth more than it looks.
+  const downside = Math.sqrt(r.reduce((a, x) => a + Math.min(0, x - rfDaily) ** 2, 0) / n);
+  const annualReturn = eq ** (252 / n) - 1;
+  const arithmeticAnnual = (1 + mean) ** 252 - 1;
+  let worst12m = null;
+  for (let i = 251; i < n; i++) {
+    const g = path[i] / (i >= 252 ? path[i - 252] : 1) - 1;
+    if (worst12m === null || g < worst12m) worst12m = g;
+  }
   return {
     sessions: n,
-    annualReturn: eq ** (252 / n) - 1,
+    annualReturn,
     annualVol: sd * Math.sqrt(252),
     sharpe: sd > 0 ? ((mean - rfDaily) / sd) * Math.sqrt(252) : null,
+    sortino: downside > 0 ? ((mean - rfDaily) / downside) * Math.sqrt(252) : null,
+    calmar: maxDD > 0 ? annualReturn / maxDD : null,
+    arithmeticAnnual,
+    volatilityDrag: arithmeticAnnual - annualReturn,
+    worst12m,
+    longestUnderwater: longest,
     var95: -q05,                                             // positive = a loss
     var99: -q01,
     cvar95: tail.length ? -(tail.reduce((a, b) => a + b, 0) / tail.length) : null,
@@ -6616,6 +6674,12 @@ async function refreshRiskProfile() {
       `1-in-100 -${usd(R.var99Dollars)}. Sharpe ${R.sharpe.toFixed(2)} vs ${pct(R.riskFree)} risk-free, ` +
       `beta ${R.beta != null ? R.beta.toFixed(2) : 'n/a'}, skew ${R.skew.toFixed(2)}, excess kurtosis ` +
       `${R.excessKurtosis.toFixed(1)}. Up days ${pct(R.pUpDay)}, up months ${R.pUpMonth != null ? pct(R.pUpMonth) : 'n/a'}.`);
+    const f2 = x => (x != null && Number.isFinite(x)) ? x.toFixed(2) : 'n/a';
+    console.log(`[RISK] 📐 Pain: worst fall ${pct(R.maxDrawdown)}, worst 12 months ` +
+      `${R.worst12m != null ? pct(R.worst12m) : 'n/a (under a year of data)'}, longest below a high ` +
+      `${R.longestUnderwater} sessions. Sortino ${f2(R.sortino)}, Calmar ${f2(R.calmar)}. Volatility drag ` +
+      `${pct(R.volatilityDrag)}/yr: the average day compounds to ${pct(R.arithmeticAnnual)}, what actually ` +
+      `compounded was ${pct(R.annualReturn)}.`);
     return _riskReport;
   } catch (e) {
     console.warn(`[RISK] profile failed: ${e.message}`);
@@ -6651,8 +6715,14 @@ function regimeShieldStatus(now = Date.now()) {
 
 // SYMBOLS THAT ARE ALREADY THE SAFE SIDE OF THE TRADE. T-bill and ultra-short
 // treasury funds move so little that "de-risking" out of them is not de-risking.
+//
+// SHY IS NOT ON IT (15.82). It holds 1-3 year notes, duration ~1.9: a 1-point rise in
+// rates costs it ~1.9%. From 2021-08 to 2022-10 it fell 5.7% with distributions
+// reinvested, and lost 3.9% in 2022 — the year the S&P fell 18.2% and BIL GAINED 1.4%.
+// That is the stock-bond correlation turning positive, and it is exactly when the
+// shield would have been moving money into it. Cash is what holds still in that year.
 const CASH_EQUIVALENT_SYMBOLS = new Set(
-  String(process.env.CASH_EQUIVALENTS || 'BIL,SGOV,SHV,BILS,USFR,TFLO,XHLF,SHY')
+  String(process.env.CASH_EQUIVALENTS || 'BIL,SGOV,SHV,BILS,USFR,TFLO,XHLF')
     .split(',').map(x => x.trim().toUpperCase()).filter(Boolean));
 
 // The asset whose daily return IS the risk-free rate for alpha and Sharpe. A T-bill
@@ -6852,10 +6922,10 @@ function coreWeightMap(symbols = CORE_HOLD_SYMBOLS, conv = CORE_CONVICTION) {
 //  its weight, and the rest moves into the T-bills. Twice its usual volatility, half
 //  the weight. At or below normal, nothing happens — on ~57% of days this IS Mark 15.
 //
-//  WHY IT HAS A MECHANICAL REASON TO WORK. QLD rebalances daily, so it decays in
-//  proportion to VARIANCE. When volatility spikes, holding it is both riskier and more
-//  expensive, and volatility clusters — a violent week predicts a violent next week far
-//  better than any return predicts the next return.
+//  WHY IT HAS A MECHANICAL REASON TO WORK. Volatility clusters — a violent week predicts
+//  a violent next week far better than any return predicts the next return — and the
+//  volatility drag (geometric ~ arithmetic - sigma^2/2) grows with the square of it, so
+//  the days it cuts are the days that compound worst.
 //
 //  WHY AN EARLIER TEST SAID IT DID NOT. Volatility targeting was tested in v13.68 on 339
 //  sessions of 2025-26 with a worst drawdown of 8.4% — no crash in the window, so there
@@ -6875,6 +6945,21 @@ function coreWeightMap(symbols = CORE_HOLD_SYMBOLS, conv = CORE_CONVICTION) {
 //  are calm. In-sample it earned more; walk-forward it did not (Sharpe 0.80 vs 0.84 out
 //  of sample), and only 12 of 20 settings beat the static mix. Cut-only passed; that is
 //  why this can never return more than 1.
+//
+//  WHAT THE LONGER HISTORY SAYS (15.82) — and it corrects the Sharpe line above. Rebuilt
+//  to 1986 on the index series, on QQQ 40 / SPY 40 / BIL 20 with the shield:
+//
+//                          shield only    + this    | 1986-2006, never tuned on
+//      CAGR                   10.8%         9.4%    |   11.8%  ->  10.2%
+//      worst drawdown         29.8%        22.9%    |   29.8%  ->  22.9%
+//      worst 12 months       -22.0%       -13.7%    |
+//      longest below a high   5.3 yrs      3.9 yrs  |
+//      Sharpe                  0.67         0.67    |    0.59  ->   0.57
+//
+//  Smaller drawdowns in BOTH eras, every time. Better Sharpe only in the era it was found
+//  in. Over 40 years it is INSURANCE: return per unit of risk unchanged, about 1.4%/yr
+//  paid for a worst year 8 points shallower. Kept on, because that is the trade this
+//  account asked for — but it is not free return, and nothing here should say it is.
 //
 //  FAIL OPEN, like the shield: no data, too little data, or a reading older than 48h
 //  returns 1 — exactly Mark 15. It never de-risks on a failed fetch.
@@ -8161,6 +8246,47 @@ const median = (a) => {
   return x.length % 2 ? x[(x.length - 1) / 2] : (x[x.length/2 - 1] + x[x.length/2]) / 2;
 };
 
+// ── LEVERAGE BESIDE CASH (15.82) ────────────────────────────────────────────
+// A k-times daily fund reaches k-times by BORROWING inside the fund, at about the
+// T-bill rate plus a spread. Held beside T-bills, the account is borrowing and lending
+// the same money at once and paying the spread on it. Whenever the bills can cover it,
+// the plain index at k-times the weight is the same exposure with no loan at all.
+// Measured on QLD 2006-2026: 24.6%/yr against 32.5% for twice the Nasdaq-100 — the
+// sigma^2 volatility drag (~4.9%/yr at 22% index vol), the T-bill rate, and 1.6%/yr on
+// top. At QLD 35 / BIL 65 that is ~0.55%/yr against QQQ 70 / BIL 30 for the same
+// drawdowns: 9.5% against 10.1% across 1986-2026, Sharpe lower in BOTH halves.
+// Only broad index funds are listed. A leveraged single stock has no unlevered twin the
+// core could hold instead, so flagging it would be advice with nothing to act on.
+function parseLeveragedEtfs(raw) {
+  const out = new Map();
+  for (const part of String(raw || '').split(',')) {
+    const [sym, under, k] = part.split(':').map(x => String(x || '').trim().toUpperCase());
+    const f = parseFloat(k);
+    if (/^[A-Z.]{1,6}$/.test(sym) && /^[A-Z.]{1,6}$/.test(under) && f > 1 && f <= 5) out.set(sym, { under, k: f });
+  }
+  return out;
+}
+const LEVERAGED_ETFS = parseLeveragedEtfs(process.env.LEVERAGED_ETFS ||
+  'QLD:QQQ:2,TQQQ:QQQ:3,SSO:SPY:2,UPRO:SPY:3,SPXL:SPY:3,SPUU:SPY:2,DDM:DIA:2,UDOW:DIA:3,UWM:IWM:2,TNA:IWM:3,URTY:IWM:3');
+
+// Pure. The unlevered swap the core's cash-equivalents can fund, or null when there is
+// none — no leveraged fund, or too few bills for the leverage to be avoidable.
+function unleveredEquivalent(weights, cashSet = CASH_EQUIVALENT_SYMBOLS, levMap = LEVERAGED_ETFS) {
+  const w = weights || {};
+  let cash = 0;
+  for (const [k, v] of Object.entries(w)) if (cashSet.has(k) && v > 0) cash += v;
+  const swaps = [];
+  for (const [sym, v] of Object.entries(w)) {
+    const L = levMap.get(sym);
+    if (!L || !(v > 0)) continue;
+    const need = v * (L.k - 1);                  // the bills the unlevered fund would replace
+    if (need > cash + 1e-9) continue;            // not enough bills: the leverage is doing real work
+    cash -= need;
+    swaps.push({ from: sym, fromWeight: v, to: L.under, toWeight: v * L.k, k: L.k });
+  }
+  return swaps.length ? { swaps, cashAfter: cash } : null;
+}
+
 // Every check is independent and wrapped, so one throwing cannot silence the rest —
 // an auditor that dies on its first bad input is worse than none, because it looks fine.
 function atlasAudit(now = Date.now()) {
@@ -8302,6 +8428,23 @@ function atlasAudit(now = Date.now()) {
         `has no measured skill, so nothing it produces can move money. Its basket proposals still ` +
         `feed the challenger, which is the part that is actually being scored.`);
     }
+  });
+
+  // 8. BORROWING AND LENDING AT THE SAME TIME (15.82). See unleveredEquivalent.
+  safe(() => {
+    if (!CORE_HOLD_ON) return;
+    const base = coreBaseWeightMap();
+    const eq = unleveredEquivalent(base);
+    if (!eq) return;
+    const p = x => (x * 100).toFixed(0) + '%';
+    const what = eq.swaps.map(s => `${s.from} (${s.k}x ${s.to})`).join(', ');
+    const swap = eq.swaps.map(s => `${s.from} ${p(s.fromWeight)} -> ${s.to} ${p((base[s.to] || 0) + s.toWeight)}`).join(', ');
+    add('LEVERAGE_BESIDE_CASH', 'warn',
+      `${what} ${eq.swaps.length > 1 ? 'are' : 'is'} held beside T-bills: the fund borrows to reach its ` +
+      `multiple while the bills lend the same money back at the T-bill rate, and the account pays the ` +
+      `spread between the two. The same exposure with no loan: ${swap}, T-bills ${p(eq.cashAfter)}. ` +
+      `Measured 1986-2026, QLD 35 / BIL 65 returned 9.5%/yr against 10.1% for QQQ 70 / BIL 30, with the ` +
+      `same drawdowns.`);
   });
 
   return out;
@@ -12423,7 +12566,12 @@ app.get('/api/risk', (req, res) => {
       sharpe: 'return per unit of risk, over the RISK-FREE rate (not the market return)',
       beta: 'covariance with SPY over SPY variance — correlation times relative volatility',
       excessKurtosis: '0 for a normal curve; above 0 means extreme days are more common than a bell curve predicts',
-      pUpDay: 'share of days that closed up — for any portfolio with real equity exposure this sits near 55%'
+      pUpDay: 'share of days that closed up — for any portfolio with real equity exposure this sits near 55%',
+      sortino: 'like Sharpe, but only days below the risk-free line count as risk — an up-swing is not a danger',
+      calmar: 'annual return divided by the worst fall: how much each point of drawdown paid',
+      worst12m: 'the worst return over any 12 months in the window — the year you would have wanted to quit',
+      longestUnderwater: 'the most sessions spent below a previous high before getting back to it',
+      volatilityDrag: 'the average day compounded, minus what actually compounded — about sigma^2/2; the cost of the swings themselves'
     },
     caveat: 'Historical simulation cannot see a crash that is not in its window. That blind spot is ' +
             'exactly what the kurtosis figure measures, which is why CVaR is reported beside VaR.'
@@ -12936,8 +13084,9 @@ if (require.main === module) app.listen(PORT, async () => {
     const hasSafe = coreDefensiveWeight() > 0;
     console.log(`[VOL] 🌡  Volatility scaling ON (cut-only) — each day the risky sleeve keeps ` +
                 `min(1, its normal volatility / its ${CORE_VOL_LOOKBACK}-day volatility now) of its weight, ` +
-                `the rest in T-bills. Measured 2008-2026 on QLD/BIL 35/65 with the shield: worst drawdown ` +
-                `20.8% -> 14.2%, worst year -20.5% -> -13.4%, every crash shallower; it costs about 0.8%/yr. ` +
+                `the rest in T-bills. Measured 1986-2026 with the shield: worst 12 months -22.0% -> -13.7%, ` +
+                `worst drawdown 29.8% -> 22.9% (also on 1986-2006, which it was never tuned on). It is ` +
+                `insurance, not extra return: about 1.4%/yr, with return per unit of risk unchanged. ` +
                 (hasSafe ? `Active.` : `INACTIVE: the core has no T-bill leg to move weight into — add BIL.`) +
                 ` CORE_VOL_SCALING=off disables it.`);
   }
@@ -13308,7 +13457,8 @@ module.exports = {
     CORE_WEIGHT_OVERRIDE, CORE_WEIGHTS_ON, unpriceableCoreNames, reportUnpriceableCoreNames,
     atrPctPerMinute, DECISION_BAR_MINUTES,
     basketDailyReturns, evaluateBasketChallenger, challengerVerdict, basketChallengerTick,
-    challengerWins,
+    challengerWins, trimProposalLog, isScorableProposal,
+    parseLeveragedEtfs, unleveredEquivalent, LEVERAGED_ETFS,
     BASKET_CHALLENGER_ON, CHALLENGER_MIN_DAYS, CHALLENGER_MIN_T, CHALLENGER_AUTO_SWITCH,
     tradingTrackRecord, tradingRecordMultiplier, TRADING_RECORD_MIN_TRADES,
     TRADING_RECORD_PROBE, TRADING_RECORD_FULL_T, TRADING_RECORD_GATE_ON,

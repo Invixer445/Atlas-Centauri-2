@@ -6255,6 +6255,9 @@ check('the cash-equivalent list is a real list, and the shift is pure arithmetic
   ok(I.CASH_EQUIVALENT_SYMBOLS.has('SGOV'), 'and SGOV');
   ok(!I.CASH_EQUIVALENT_SYMBOLS.has('QQQ') && !I.CASH_EQUIVALENT_SYMBOLS.has('QLD'),
      'equity funds, levered or not, are emphatically not cash-equivalents');
+  ok(!I.CASH_EQUIVALENT_SYMBOLS.has('SHY'),
+     'and neither is SHY: duration ~1.9, -3.9% in 2022 while BIL gained 1.4% — the shield ' +
+     'would have been moving money INTO it during the one year bonds fell with stocks');
   // the shift itself, directly
   const out = I.applyRegimeShift({ QLD: 0.35, BIL: 0.65 }, true, 0.30);
   ok(Math.abs(out.QLD + out.BIL - 1) < 1e-12, 'weights must still sum to 1 after the shift');
@@ -8381,6 +8384,133 @@ check('a rung never sells more than the lot holds', () => {
   ok(I.rungSellQty(0, 0.4) === 0, 'an empty lot sells nothing');
   ok(I.rungSellQty(NaN, 0.4) === 0, 'a non-finite lot sells nothing, never NaN');
   ok(I.rungSellQty(2, NaN) === 0, 'a non-finite fraction sells nothing, never NaN');
+});
+
+// ── 15.82: the finance notes, turned into checks ────────────────────────────
+// A generator that does not cycle: knownNormal's float LCG loses its low bits past 2^53
+// and repeats every ~10k draws, which is fine for a closed-form tolerance and not for
+// counting rare events across thousands of runs.
+function mulberry(seed) {
+  let a = seed >>> 0;
+  return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+
+check('Sortino tells apart two returns streams that Sharpe cannot', () => {
+  // Mirror a stream about its own mean: same mean, same SD, so the same Sharpe — but the
+  // big days flip from gains to losses. Only a measure of DOWNSIDE can see the difference.
+  const up = knownNormal(5000, 0.0003, 0.006, 11).map((x, i) => (i % 40 === 0 ? x + 0.04 : x));
+  const m = up.reduce((a, b) => a + b, 0) / up.length;
+  const down = up.map(x => 2 * m - x);
+  const pu = I.riskProfile(up, 0.04), pd = I.riskProfile(down, 0.04);
+  ok(Math.abs(pu.sharpe - pd.sharpe) < 1e-9, `Sharpe must be identical, got ${pu.sharpe} vs ${pd.sharpe}`);
+  ok(pu.sortino > pd.sortino * 1.3,
+     `Sortino must prefer the stream whose big days are gains: ${pu.sortino.toFixed(2)} vs ${pd.sortino.toFixed(2)}`);
+  eq(I.riskProfile(Array(60).fill(0.001), 0.04).sortino, null,
+     'no day below the risk-free line means no downside to divide by — null, not Infinity');
+});
+
+check('Calmar is return per point of the worst fall, and the drag is the notes\' sigma^2/2', () => {
+  const p = I.riskProfile(knownNormal(2000, 0.0004, 0.012, 5), 0.04);
+  ok(Math.abs(p.calmar - p.annualReturn / p.maxDrawdown) < 1e-12, 'Calmar = annual return / worst fall');
+  eq(I.riskProfile(Array(60).fill(0.001), 0.04).calmar, null, 'and no fall at all is null, not Infinity');
+  // +50% then -50%, thirty times: the average day is exactly zero and the money is gone
+  const coin = Array.from({ length: 60 }, (_, i) => (i % 2 ? -0.5 : 0.5));
+  const c = I.riskProfile(coin, 0);
+  ok(Math.abs(c.arithmeticAnnual) < 1e-12, 'the average day is exactly zero');
+  ok(c.annualReturn < -0.99 && c.volatilityDrag > 0.99,
+     `each pair loses 25%, so nearly all of it is drag: return ${c.annualReturn}, drag ${c.volatilityDrag}`);
+  ok(Math.abs(I.riskProfile(Array(60).fill(0.0004), 0).volatilityDrag) < 1e-12, 'no swings, no drag');
+  const n = I.riskProfile(knownNormal(20000, 0.0004, 0.01, 7), 0);
+  const half = n.annualVol ** 2 / 2;
+  ok(n.volatilityDrag > 0.8 * half && n.volatilityDrag < 1.3 * half,
+     `for an ordinary market the drag is about sigma^2/2: ${n.volatilityDrag.toFixed(4)} vs ${half.toFixed(4)}`);
+});
+
+check('the worst 12 months and the longest time below a high are measured exactly', () => {
+  // ten days up 1%, one day down 10%, then up 1% a day: 0.9 x 1.01^11 = 1.0041 clears
+  // the old high on the eleventh up day, so peak (day 9) to recovery (day 21) is 12
+  eq(I.riskProfile([...Array(10).fill(0.01), -0.10, ...Array(30).fill(0.01)], 0).longestUnderwater, 12, 'recovered');
+  // never recovered: the stretch runs to the last session
+  eq(I.riskProfile([...Array(30).fill(0.01), -0.20, ...Array(9).fill(0.001)], 0).longestUnderwater, 10,
+     'a fall still unrecovered at the end must count — it is the one the operator is living through');
+  // the fall comes FIRST, so the very first window is the worst one: skipping it (an
+  // off-by-one at the loop start) must give a different answer, not the same one
+  const s = [...Array(100).fill(-0.002), ...Array(200).fill(0.001)];
+  const eqv = [1]; for (const x of s) eqv.push(eqv[eqv.length - 1] * (1 + x));
+  let worst = Infinity; for (let j = 252; j < eqv.length; j++) worst = Math.min(worst, eqv[j] / eqv[j - 252] - 1);
+  ok(Math.abs(I.riskProfile(s, 0).worst12m - worst) < 1e-12, 'worst 12 months must match a brute-force scan');
+  eq(I.riskProfile(s.slice(0, 251), 0).worst12m, null, 'under a year of data there is no 12-month figure');
+});
+
+check('a leveraged index fund beside T-bills is answered with the unlevered swap', () => {
+  const r = I.unleveredEquivalent({ QLD: 0.35, BIL: 0.65 });
+  eq(r.swaps.length, 1, 'one swap');
+  eq(r.swaps[0].to, 'QQQ', 'QLD is twice the Nasdaq-100');
+  ok(Math.abs(r.swaps[0].toWeight - 0.70) < 1e-12 && Math.abs(r.cashAfter - 0.30) < 1e-12,
+     `QLD 35 / BIL 65 is QQQ 70 / BIL 30 with no loan, got ${JSON.stringify(r)}`);
+  eq(I.unleveredEquivalent({ QQQ: 0.70, BIL: 0.30 }), null, 'nothing levered, nothing to say');
+  eq(I.unleveredEquivalent({ QLD: 0.60, QQQ: 0.40 }), null, 'no bills: the leverage is the only way to that exposure');
+  eq(I.unleveredEquivalent({ TQQQ: 0.30, BIL: 0.40 }), null, '3x at 30% needs 60% of bills to undo; 40% cannot');
+  const two = I.unleveredEquivalent({ QLD: 0.20, SSO: 0.20, BIL: 0.60 });
+  ok(two && two.swaps.map(x => x.to).sort().join(',') === 'QQQ,SPY' && Math.abs(two.cashAfter - 0.20) < 1e-12,
+     `two levered funds, both undone: ${JSON.stringify(two)}`);
+  eq(I.unleveredEquivalent(null), null, 'no weights, no finding');
+  eq([...I.parseLeveragedEtfs('QLD:QQQ:2, bad, Q!D:QQQ:2, ABC:DEF:9, SSO:SPY:x, TQQQ:QQQ:3').keys()].join(','),
+     'QLD,TQQQ', 'malformed entries are dropped one by one');
+});
+
+check('the auditor flags the Mark 15.80 core and not the one that replaces it', () => {
+  const run = (syms, w) => auditProbe({ ...CORE_ENV, CORE_HOLD_SYMBOLS: syms, CORE_WEIGHTS: w }, `
+    I.detectStartingCapital(10000);
+    const f = I.atlasAudit();
+    console.log(JSON.stringify({ codes: f.map(x => x.code), hit: f.find(x => x.code === 'LEVERAGE_BESIDE_CASH') || null }));`);
+  const a = run('QLD,BIL', 'QLD:0.35,BIL:0.65');
+  ok(a.hit, `QLD 35 / BIL 65 must be flagged, got ${a.codes}`);
+  eq(a.hit.severity, 'warn', 'a cost, not a fault');
+  ok(/QLD 35% -> QQQ 70%/.test(a.hit.detail) && /T-bills 30%/.test(a.hit.detail),
+     `and it must say exactly what to hold instead, got: ${a.hit.detail}`);
+  const b = run('QQQ,SPY,BIL', 'QQQ:0.40,SPY:0.40,BIL:0.20');
+  ok(!b.codes.includes('LEVERAGE_BESIDE_CASH'), `the recommended core must not be flagged, got ${b.codes}`);
+});
+
+check('the challenger bar is 3, because the same t-statistic is re-read every day', () => {
+  eq(I.CHALLENGER_MIN_T, 3, 'default bar');
+  eq(I.challengerWins(2.9, 500), false, '2.9 is inside what daily re-reading produces by luck');
+  eq(I.challengerWins(3.0, 500), true, 'and 3 with the sample wins');
+  // the reason, measured: zero real edge, the t-stat re-read daily for two years
+  const SIMS = 2000, D = I.CHALLENGER_MIN_DAYS; let at2 = 0, at3 = 0;
+  for (let k = 0; k < SIMS; k++) {
+    const rnd = mulberry(9000 + k); let s = 0, s2 = 0, h2 = false, h3 = false;
+    for (let n = 1; n <= 504; n++) {
+      let u = 0; while (!u) u = rnd();
+      const x = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rnd());
+      s += x; s2 += x * x;
+      if (n >= D) { const m = s / n, t = m / Math.sqrt((s2 - n * m * m) / (n - 1) / n); if (t >= 2) h2 = true; if (t >= 3) h3 = true; }
+    }
+    if (h2) at2++; if (h3) at3++;
+  }
+  ok(at2 / SIMS > 0.08, `re-read daily, t >= 2 must show its luck problem: ${(at2 / SIMS * 100).toFixed(1)}% false wins`);
+  ok(at3 / SIMS < 0.035, `and t >= 3 must hold it near the single-look 2.3%: ${(at3 / SIMS * 100).toFixed(1)}%`);
+});
+
+check('the proposal the challenger scores survives the 400-entry cap', () => {
+  const mk = (i, scorable = true) => ({ at: `d${i}`, basket: scorable ? ['A'] : [], control: ['QQQ'] });
+  const log = Array.from({ length: 500 }, (_, i) => mk(i));
+  const t = I.trimProposalLog(log, 400);
+  eq(t.length, 400, 'still capped');
+  eq(t[0].at, 'd0', 'the scored proposal is still first — otherwise a different basket is tested every day');
+  eq(t[1].at, 'd101', 'followed by the most recent 399');
+  eq(t[399].at, 'd499', 'ending with the newest');
+  const late = [...Array.from({ length: 450 }, (_, i) => mk(i, false)), ...Array.from({ length: 50 }, (_, i) => mk(450 + i))];
+  eq(I.trimProposalLog(late, 400)[0].at, 'd100', 'a scored entry already inside the window is not duplicated');
+  eq(I.trimProposalLog(log.slice(0, 10), 400).length, 10, 'under the cap nothing changes');
+  eq(I.trimProposalLog(null, 400).length, 0, 'and garbage is an empty log, not a throw');
+  const src = require('fs').readFileSync(SRV, 'utf8');
+  ok(/trimProposalLog\(log, 400\)/.test(src.slice(src.indexOf('function recordBasketProposal'), src.indexOf('function isScorableProposal'))),
+     'recordBasketProposal must cap through trimProposalLog');
+  ok(/log\.find\(isScorableProposal\)/.test(src.slice(src.indexOf('async function evaluateBasketChallenger'), src.indexOf('function challengerVerdict'))),
+     'and the evaluator must choose with the same predicate the cap protects');
 });
 
 // ════════════════════════════════════════════════════════════════════════════
