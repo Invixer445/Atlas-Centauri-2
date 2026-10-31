@@ -16,8 +16,12 @@ process.env.CORE_HOLD_FRACTION = '0.5';
 process.env.LIVE_TRADING = 'false';
 const I = require('/Users/bredl/Downloads/ATLAS/server.js')._internals;
 
-let R = 12345;
-const rnd = () => (R = (R * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+// mulberry32. The float LCG this used, (R * 1103515245 + 12345) & 0x7fffffff, overflows
+// 2^53 and falls into a 10,466-draw loop; at ~2,000 draws a tick, 3,000 ticks replayed
+// about five ticks' worth of "hostile" data. A soak is only as wide as its randomness.
+let R = 12345 >>> 0;
+const rnd = () => { R = (R + 0x6D2B79F5) | 0; let t = Math.imul(R ^ (R >>> 15), 1 | R);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
 const pick = a => a[Math.floor(rnd() * a.length)];
 
 const SYMS = [...I.WATCHLISTS.nasdaq, ...I.WATCHLISTS.nyse].slice(0, 26);

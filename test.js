@@ -5718,8 +5718,19 @@ check('mercurySkillLevel no longer takes a bare maximum', () => {
 //  statistic is tested against a distribution whose answer is known in closed form,
 //  and the three formulas the source notes got wrong are pinned to the right version.
 // ════════════════════════════════════════════════════════════════════════════
+// A 32-bit generator that does not cycle (mulberry32). This file used to share a float
+// LCG, (s * 1103515245 + 12345) & 0x7fffffff, whose product passes 2^53 and loses its
+// low bits before the mask: every seed fell into one 10,466-draw loop (seed 9 into a
+// 220-draw one). "20,000 normal days" were ~5,000 values used four times, and the
+// "independent" series from seeds 11 and 13 were shifted copies of the same loop.
+function mulberry(seed) {
+  let a = seed >>> 0;
+  return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+
 function knownNormal(n, mu, sigma, seed = 7) {
-  let s = seed; const rnd = () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const rnd = mulberry(seed);
   const out = [];
   for (let i = 0; i < n; i++) {
     let u = 0, v = 0; while (!u) u = rnd(); while (!v) v = rnd();
@@ -5729,7 +5740,8 @@ function knownNormal(n, mu, sigma, seed = 7) {
 }
 
 check('VaR and CVaR match the closed-form answers for a normal distribution', () => {
-  const p = I.riskProfile(knownNormal(20000, 0.0004, 0.01), 0.04);
+  const sample = knownNormal(20000, 0.0004, 0.01);
+  const p = I.riskProfile(sample, 0.04);
   // VaR95 = 1.645 sigma - mu ; CVaR95 = sigma * phi(1.645) / 0.05 - mu
   ok(Math.abs(p.var95 - (1.645 * 0.01 - 0.0004)) < 0.0006, `VaR95 ${p.var95.toFixed(5)} vs 0.01605`);
   ok(Math.abs(p.cvar95 - (0.01 * 2.0627 - 0.0004)) < 0.0007, `CVaR95 ${p.cvar95.toFixed(5)} vs 0.02023`);
@@ -5737,6 +5749,17 @@ check('VaR and CVaR match the closed-form answers for a normal distribution', ()
   ok(p.cvar95 > p.var95, 'CVaR must exceed VaR — it is the average of the losses PAST the VaR line');
   ok(Math.abs(p.skew) < 0.08 && Math.abs(p.excessKurtosis) < 0.15,
      `a normal curve has skew 0 and excess kurtosis 0, got ${p.skew.toFixed(3)} / ${p.excessKurtosis.toFixed(3)}`);
+  // AND EXACTLY, against the sample's own order statistics. The closed form carries the
+  // sample's error: on this seed, VaR read at the 6th percentile instead of the 5th lands
+  // 0.00058 from 0.01605 and passes the check above. The sample's own 5th percentile has
+  // no error for a wrong percentile to hide in.
+  const srt = [...sample].sort((a, b) => a - b);
+  const pctl = q => { const h = (srt.length - 1) * q, lo = Math.floor(h); return srt[lo] + (h - lo) * (srt[lo + 1] - srt[lo]); };
+  ok(Math.abs(p.var95 + pctl(0.05)) < 1e-12, `VaR95 must be the sample's 5th percentile exactly: ${p.var95} vs ${-pctl(0.05)}`);
+  ok(Math.abs(p.var99 + pctl(0.01)) < 1e-12, `and VaR99 its 1st: ${p.var99} vs ${-pctl(0.01)}`);
+  const past = srt.filter(x => x <= pctl(0.05));
+  ok(Math.abs(p.cvar95 + past.reduce((a, b) => a + b, 0) / past.length) < 1e-12,
+     'and CVaR95 the average of every day at or past that line');
 });
 
 check('kurtosis actually detects fat tails', () => {
@@ -6164,11 +6187,15 @@ check('one horizon cannot be reset for ever', () => {
 
 check('a reset horizon no longer re-trips the corruption bar', () => {
   // The regression, in arithmetic. Score a flat-0.5 model and a base-rate-seeded model
-  // against the same 12%-up stream and compare to the -1.0 reset bar.
-  const run = (p0, n, rate) => {
+  // against the same 12%-up streams and compare to the -1.0 reset bar.
+  //
+  // OVER MANY STREAMS, NOT ONE. This used to score a single 42-draw stream, and on 42
+  // draws the premise is a coin flip: a flat-0.5 model trips the bar on ~50% of streams
+  // (its expected score is -1.20 at 42 draws, -1.37 in the limit). The one stream it used
+  // happened to give -2.72; the same seed on a sound generator gives -0.61 and the
+  // premise "failed" with no change to anything it was testing.
+  const run = (p0, n, rate, rnd) => {
     let s = { n: 0, brier: 0, brierBase: 0, ups: 0 };
-    let seed = 12345;
-    const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
     for (let i = 0; i < n; i++) {
       const up = rnd() < rate ? 1 : 0;
       const base = s.n >= 20 ? Math.max(0.001, Math.min(0.999, s.ups / s.n)) : 0.30;
@@ -6176,12 +6203,19 @@ check('a reset horizon no longer re-trips the corruption bar', () => {
     }
     return 1 - s.brier / s.brierBase;
   };
-  const flat = run(0.50, 42, 0.12);
-  const seeded = run(0.12, 42, 0.12);
-  ok(flat < -1.0, `premise: a flat-0.5 model trips the -1.0 reset bar (got ${flat.toFixed(3)})`);
-  ok(seeded > -1.0,
-     `a model seeded at the base rate must NOT trip it (got ${seeded.toFixed(3)}) — this is ` +
-     'the loop, broken at the cause rather than the symptom');
+  const STREAMS = 500;
+  let flatSum = 0, seededTrips = 0, seededWorst = Infinity;
+  for (let k = 0; k < STREAMS; k++) {
+    flatSum += run(0.50, 42, 0.12, mulberry(1 + k));
+    const g = run(0.12, 42, 0.12, mulberry(1 + k));          // the SAME stream as the flat model's
+    if (g <= -1.0) seededTrips++;
+    seededWorst = Math.min(seededWorst, g);
+  }
+  ok(flatSum / STREAMS < -1.0,
+     `premise: on average a flat-0.5 model trips the -1.0 reset bar (mean ${(flatSum / STREAMS).toFixed(3)})`);
+  eq(seededTrips, 0,
+     `a model seeded at the base rate must NOT trip it on any of ${STREAMS} streams (worst ${seededWorst.toFixed(3)}) — ` +
+     'this is the loop, broken at the cause rather than the symptom');
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -8387,15 +8421,6 @@ check('a rung never sells more than the lot holds', () => {
 });
 
 // ── 15.82: the finance notes, turned into checks ────────────────────────────
-// A generator that does not cycle: knownNormal's float LCG loses its low bits past 2^53
-// and repeats every ~10k draws, which is fine for a closed-form tolerance and not for
-// counting rare events across thousands of runs.
-function mulberry(seed) {
-  let a = seed >>> 0;
-  return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
-}
-
 check('Sortino tells apart two returns streams that Sharpe cannot', () => {
   // Mirror a stream about its own mean: same mean, same SD, so the same Sharpe — but the
   // big days flip from gains to losses. Only a measure of DOWNSIDE can see the difference.
