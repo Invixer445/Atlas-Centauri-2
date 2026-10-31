@@ -3596,6 +3596,162 @@ const MIN_FRACTIONAL_NOTIONAL = Math.max(1, parseFloat(process.env.MIN_FRACTIONA
 const isFractionalQty = (q) => Number.isFinite(q) && q > 0 && Math.abs(q - Math.round(q)) > 1e-9;
 // Stale-data guard: don't trade a symbol whose price hasn't updated in >90s
 const MAX_PRICE_AGE_MS   = 90000;
+
+// ════════════════════════════════════════════════════════════════════════════
+//  IMPLAUSIBLE PRICES (15.83) — one bad print must never move money
+// ════════════════════════════════════════════════════════════════════════════
+//  The feed accepted any finite positive print and everything downstream trusted it.
+//  Driven with real randomness (the soak's generator looped until 8af9b36), a hostile
+//  $1e12 tick made the take-profit ladder sell 30% of a position "at" $997 billion; the
+//  simulator booked $199B of profit, the vault locked 30% of it, and the account read
+//  $5.8 TRILLION. Broker fills would have been real — but the DECISIONS were not:
+//    • a high print sets a lot's highestPnL for good, and a big enough one clears the
+//      99R trail-arm bar, so the next honest tick closes the WHOLE position;
+//    • one bad QQQ print makes the core read QQQ as overweight and sell most of it.
+//
+//  TWO LAYERS.
+//   1. At the feed (screenPrint). A print more than PRINT_JUMP_MAX from the last
+//      ACCEPTED price is held back and the old price stands. It becomes the price only
+//      when PRINT_CONFIRM_N prints agree on the new level, within PRINT_CONFIRM_BAND of
+//      each other, across at least PRINT_CONFIRM_MS. A real gap, a halt reopening, a
+//      split: through in seconds. A lone bad print: never. While a jump is unconfirmed
+//      the price ages, and nothing acts on a price older than MAX_PRICE_AGE_MS — so
+//      holding a print back can never itself sell anything.
+//   2. Where money moves (plausiblePrice). Exits, simulated fills, entries and core
+//      trims/top-ups refuse a price more than PRICE_SANITY_X from EVERY independent
+//      reference: the last decision bar's close, the previous close, the session open.
+//      Valuation marks such a price at the reference instead (markPrice), so no
+//      phantom equity, peak or drawdown can form. Wide on purpose — it is the backstop
+//      for state that is wrong however it got there, not a second print filter.
+const PRINT_JUMP_MAX     = Math.max(0.05, Math.min(1, parseFloat(process.env.PRINT_JUMP_MAX || '0.25')));
+const PRINT_CONFIRM_N    = Math.max(2, Math.min(20, parseInt(process.env.PRINT_CONFIRM_N || '3', 10)));
+const PRINT_CONFIRM_BAND = 0.02;
+const PRINT_CONFIRM_MS   = Math.max(0, parseInt(process.env.PRINT_CONFIRM_MS || '5000', 10));
+const PRICE_SANITY_X     = Math.max(1.5, Math.min(100, parseFloat(process.env.PRICE_SANITY_X || '3')));
+
+// Pure. `last` is the last ACCEPTED price; `q` is what is being watched for this symbol
+// ({ price, n, since } or null). Returns { accept, q } and the caller stores q.
+function screenPrint(last, price, ts, q = null) {
+  if (!Number.isFinite(price) || price <= 0) return { accept: false, q, reason: 'not a price' };
+  if (!(last > 0)) return { accept: true, q: null };                  // nothing to judge it against
+  if (Math.abs(Math.log(price / last)) <= Math.log(1 + PRINT_JUMP_MAX)) return { accept: true, q: null };
+  // A jump. Does it agree with the one already being watched?
+  const agrees = !!(q && q.price > 0 && Math.abs(price / q.price - 1) <= PRINT_CONFIRM_BAND);
+  const nq = agrees ? { price: q.price, n: q.n + 1, since: q.since } : { price, n: 1, since: ts };
+  if (nq.n >= PRINT_CONFIRM_N && ts - nq.since >= PRINT_CONFIRM_MS) return { accept: true, q: null, confirmed: nq };
+  return { accept: false, q: nq, reason: 'unconfirmed jump' };
+}
+
+// The engine's own reads of where a symbol trades, none of them from the tick being
+// judged: the decision bar's close (REST bars), the previous close and the session
+// open (the snapshot).
+function priceReferences(sym) {
+  const refs = [];
+  const bars = candleData[sym]?.m1;
+  const bar = Array.isArray(bars) && bars.length ? bars[bars.length - 1] : null;
+  if (bar && Number.isFinite(bar.c) && bar.c > 0) refs.push(bar.c);
+  const md = marketData[sym] || {};
+  for (const v of [md.prevClose, md.dayOpen]) if (Number.isFinite(v) && v > 0) refs.push(v);
+  return refs;
+}
+
+// Pure. Plausible = within maxX of at least ONE reference, so one corrupt reference
+// cannot veto a good price. No reference at all, no verdict: a symbol nothing else has
+// priced yet is judged by the feed screen alone.
+function isPlausiblePrice(price, refs, maxX = PRICE_SANITY_X) {
+  if (!Number.isFinite(price) || price <= 0) return false;
+  const r = (refs || []).filter(x => Number.isFinite(x) && x > 0);
+  if (!r.length) return true;
+  return r.some(x => Math.max(price / x, x / price) <= maxX);
+}
+
+const _implausibleLogAt = Object.create(null);
+function plausiblePrice(sym, price = marketData[sym]?.price, what = 'nothing acted on') {
+  const refs = priceReferences(sym);
+  if (isPlausiblePrice(price, refs)) return true;
+  const now = Date.now();
+  if (now - (_implausibleLogAt[sym] || 0) > 600000) {
+    _implausibleLogAt[sym] = now;
+    const why = (Number.isFinite(price) && price > 0)
+      ? `$${price.toPrecision(6)} is more than ${PRICE_SANITY_X}x from every reference ($${refs.map(x => x.toFixed(2)).join(', $')})`
+      // Infinity passes a bare `if (!price)` — it is truthy — and it reached the exit sweep
+      // that way, where highestPnL = Infinity armed the trailing stop for good.
+      : `${price} is not a price at all`;
+    console.warn(`[PRICE] 🚫 ${sym} at ${why} — ${what}. Nothing is bought, sold or booked on a price the ` +
+                 `engine does not believe.`);
+  }
+  return false;
+}
+
+// Valuation's price. The live price when plausible; the nearest reference when not, so
+// one bad print can make neither this name nor the rest of the book look mis-weighted.
+// A MISSING price returns null and keeps each caller's own fallback exactly as before.
+function markPrice(sym) {
+  const p = marketData[sym]?.price;
+  if (!(Number.isFinite(p) && p > 0)) return null;
+  const refs = priceReferences(sym);
+  return isPlausiblePrice(p, refs) ? p : refs[0];
+}
+
+// Every trade print from the feed comes through here (see the 't' branch of the data
+// socket). Exported so the screen is tested on the real path, not a copy of it.
+const _printWatch = Object.create(null);
+const _printLogAt = Object.create(null);
+function applyTradePrint(symbol, price, ts = Date.now()) {
+  if (!symbol || !Number.isFinite(price) || price <= 0) return false;
+  // SPY IS THE BENCHMARK **AND**, SINCE v13.72, A HOLDABLE CORE NAME.
+  // This used to `continue` unconditionally, so SPY's ticks updated the benchmark and
+  // never reached marketData. Nothing noticed for months because SPY had only ever been
+  // the yardstick. The moment it was put in the basket, mostUnderweightCore() — which
+  // skips any symbol without a fresh marketData price — skipped it on every pass,
+  // forever. Live on 2026-10-06: the core bought its 70% of QQQ, never bought SPY at
+  // all, and sat 31% in cash reading "1/2 names" with no error anywhere.
+  if (symbol === 'SPY') {
+    const b = screenPrint(spyData.price, price, ts, _printWatch.__benchmark);
+    _printWatch.__benchmark = b.q;
+    if (b.accept) spyData.price = price;
+    // Only when it is actually held, so a configuration that does not hold SPY behaves
+    // exactly as it did before.
+    if (!(CORE_HOLD_ON && CORE_HOLD_SYMBOLS.includes('SPY'))) return b.accept;
+  }
+  const ex = marketData[symbol];
+  if (ex && ts < ex.lastTradeTime) return false;                     // out of order
+  const s = screenPrint(ex?.price, price, ts, _printWatch[symbol]);
+  _printWatch[symbol] = s.q;
+  if (!s.accept) {
+    const now = Date.now();
+    if (s.q && now - (_printLogAt[symbol] || 0) > 60000) {
+      _printLogAt[symbol] = now;
+      console.warn(`[PRICE] ⏸  ${symbol} print $${price.toPrecision(6)} is ${((price / ex.price - 1) * 100).toFixed(1)}% ` +
+                   `from the last accepted $${ex.price.toFixed(2)} — held back until ${PRINT_CONFIRM_N} prints agree on it ` +
+                   `over ${(PRINT_CONFIRM_MS / 1000).toFixed(0)}s (${s.q.n} so far). The old price stands.`);
+    }
+    return false;
+  }
+  if (s.confirmed && ex) {
+    console.log(`[PRICE] ✅ ${symbol} ${((price / ex.price - 1) * 100).toFixed(1)}% move confirmed by ${s.confirmed.n} ` +
+                `prints over ${((ts - s.confirmed.since) / 1000).toFixed(0)}s — accepted at $${price.toFixed(2)}`);
+  }
+  if (!ex) {
+    marketData[symbol] = {
+      price, prevClose: price, high: price, low: price,
+      dailyVolume: 0,
+      lastUpdate: Date.now(), lastTradeTime: ts, history: [price]
+    };
+  } else {
+    ex.price = price;
+    ex.high  = Math.max(ex.high, price);
+    ex.low   = Math.min(ex.low,  price);
+    ex.lastUpdate    = Date.now();
+    ex.lastTradeTime = ts;
+    // history is NOT a tick buffer. It is the indicator series, and it is rebuilt from
+    // decision-timeframe bar closes on every candle refresh. Appending ticks here made
+    // EMA/RSI span ~80 seconds instead of the bar window the strategy was designed and
+    // backtested on. Live price still updates above; only the indicator input is kept
+    // bar-clean.
+  }
+  return true;
+}
 // Don't trade in the first 5 or last 5 minutes of a session (high noise)
 const SESSION_BUFFER_MIN = 5;
 // Gap handling thresholds
@@ -4259,46 +4415,8 @@ function connectWebSocket() {
 
       // ── Trade tick ──────────────────────────────────────────────────────
       if (T === 't') {
-        const symbol = m.S;
-        const price  = m.p;
-        const ts     = m.t ? new Date(m.t).getTime() : Date.now();   // RFC3339 → ms
-        if (!symbol || !Number.isFinite(price) || price <= 0) continue;
-
-        // SPY IS THE BENCHMARK **AND**, SINCE v13.72, A HOLDABLE CORE NAME.
-        // This line used to `continue` unconditionally, so SPY's ticks updated the
-        // benchmark and never reached marketData. Nothing noticed for months because
-        // SPY had only ever been the yardstick. The moment it was put in the basket,
-        // mostUnderweightCore() — which skips any symbol without a fresh marketData
-        // price — skipped it on every pass, forever. Live on 2026-10-06: the core
-        // bought its 70% of QQQ, never bought SPY at all, and sat 31% in cash reading
-        // "1/2 names" with no error anywhere.
-        if (symbol === 'SPY') {
-          spyData.price = price;
-          // Only when it is actually held, so a configuration that does not hold SPY
-          // behaves exactly as it did before.
-          if (!(CORE_HOLD_ON && CORE_HOLD_SYMBOLS.includes('SPY'))) continue;
-        }
-
-        const ex = marketData[symbol];
-        if (!ex) {
-          marketData[symbol] = {
-            price, prevClose: price, high: price, low: price,
-            dailyVolume: 0,
-            lastUpdate: Date.now(), lastTradeTime: ts, history: [price]
-          };
-        } else {
-          if (ts < ex.lastTradeTime) continue;
-          ex.price = price;
-          ex.high  = Math.max(ex.high, price);
-          ex.low   = Math.min(ex.low,  price);
-          ex.lastUpdate    = Date.now();
-          ex.lastTradeTime = ts;
-          // history is NOT a tick buffer. It is the indicator series, and it is
-          // rebuilt from decision-timeframe bar closes on every candle refresh.
-          // Appending ticks here made EMA/RSI span ~80 seconds instead of the bar
-          // window the strategy was designed and backtested on. Live price still
-          // updates above; only the indicator input is kept bar-clean.
-        }
+        // Screened, not trusted: see applyTradePrint and IMPLAUSIBLE PRICES.
+        applyTradePrint(m.S, m.p, m.t ? new Date(m.t).getTime() : Date.now());   // RFC3339 → ms
         continue;
       }
     }
@@ -6124,15 +6242,17 @@ function getTotalValue() {
   // computes off total value (risk sizing, drawdown, exposure) is wrong the moment
   // a core position exists.
   value += coreHoldingValue();
+  // markPrice, not the raw tick: one implausible print must not become equity, a peak,
+  // or a drawdown (see IMPLAUSIBLE PRICES).
   Object.entries(portfolio.longPositions).forEach(([ticker, positions]) => {
-    const price = marketData[ticker]?.price;
+    const price = markPrice(ticker);
     positions.forEach(pos => {
       const p = Number(price || pos.entryPrice) || 0;
       value += p * (pos.qty || 0);
     });
   });
   Object.entries(portfolio.shortPositions).forEach(([ticker, positions]) => {
-    const price = marketData[ticker]?.price;
+    const price = markPrice(ticker);
     positions.forEach(pos => {
       const ep  = Number(pos.entryPrice) || 0;
       const p   = Number(price || ep) || ep;
@@ -6825,7 +6945,7 @@ function coreHoldingValue() {
   let v = 0;
   for (const [sym, lot] of Object.entries(h)) {
     if (!lot || !(lot.qty > 0)) continue;
-    const px = marketData[sym]?.price;
+    const px = markPrice(sym);                                       // see IMPLAUSIBLE PRICES
     v += (Number.isFinite(px) && px > 0) ? lot.qty * px : (lot.investedCash || 0);
   }
   return v;
@@ -7271,6 +7391,7 @@ function mostUnderweightCore() {
     if (!Number.isFinite(px) || px <= 0) continue;
     const upd = marketData[sym].lastUpdate;
     if (upd && (Date.now() - upd) > MAX_PRICE_AGE_MS) continue;   // never buy on a stale price
+    if (!plausiblePrice(sym, px, 'core top-up skipped')) continue; // nor on one it does not believe
     const lot = h[sym];
     const val = lot && lot.qty > 0 ? lot.qty * px : 0;
     // Each name is measured against ITS OWN slice, so a high-conviction name is
@@ -7319,6 +7440,7 @@ function mostOverweightCore(totalValue, band = CORE_TRIM_BAND) {
     if (!Number.isFinite(px) || px <= 0) continue;
     const upd = marketData[sym].lastUpdate;
     if (upd && (Date.now() - upd) > MAX_PRICE_AGE_MS) continue;   // never sell on a stale price
+    if (!plausiblePrice(sym, px, 'core trim skipped')) continue;   // nor on one it does not believe
     const val = lot.qty * px;
     // A holding that is no longer part of the basket has a target of ZERO, so it is
     // trimmed all the way out rather than parked at target weight forever. Without
@@ -9183,6 +9305,9 @@ function terraValidateTrade(plan) {
   // balance in hand and is never looser than the old constant when fractional is off.
   const priceCeiling = affordableMaxPrice();
   if (entryPrice > priceCeiling)                                  return reject(`price $${entryPrice.toFixed(2)} above the $${priceCeiling.toFixed(2)} this account can size`);
+  // Within the limits is not the same as believable: a $50 name printing $500 passes
+  // both bounds above on a large account (see IMPLAUSIBLE PRICES).
+  if (!plausiblePrice(ticker, entryPrice, 'entry refused'))      return reject(`price $${entryPrice.toFixed(2)} is implausible against ${ticker}'s own references`);
 
   // RULE 3 — Jupiter must have produced a real size
   // Size must be a real, tradeable quantity. With fractional sizing on, anything at or
@@ -9390,6 +9515,8 @@ function closeLong(ticker, stopLoss = false, opts = {}) {
 
   const rawPrice = opts.brokerFill ? opts.fillPrice : marketData[ticker]?.price;
   if (!Number.isFinite(rawPrice) || rawPrice <= 0) return;
+  // A simulated fill is BOOKED at this price, so it must be one the engine believes.
+  if (!opts.brokerFill && !plausiblePrice(ticker, rawPrice, 'no simulated fill booked')) return;
 
   // Real broker fill = use as-is; simulation = modeled slippage as before
   const exitPrice = opts.brokerFill ? opts.fillPrice : simulateFillPrice(rawPrice, 'sell', ticker);
@@ -9436,6 +9563,8 @@ function closeShort(ticker, stopLoss = false, opts = {}) {
 
   const rawPrice = opts.brokerFill ? opts.fillPrice : marketData[ticker]?.price;
   if (!Number.isFinite(rawPrice) || rawPrice <= 0) return;
+  // A simulated fill is BOOKED at this price, so it must be one the engine believes.
+  if (!opts.brokerFill && !plausiblePrice(ticker, rawPrice, 'no simulated fill booked')) return;
 
   const exitPrice = opts.brokerFill ? opts.fillPrice : simulateFillPrice(rawPrice, 'buy', ticker);
 
@@ -9590,6 +9719,8 @@ function partialClose(ticker, direction, fraction, rung, opts = {}) {
 
   const rawPrice = opts.brokerFill ? opts.fillPrice : marketData[ticker]?.price;
   if (!Number.isFinite(rawPrice) || rawPrice <= 0) return;
+  // A simulated fill is BOOKED at this price, so it must be one the engine believes.
+  if (!opts.brokerFill && !plausiblePrice(ticker, rawPrice, 'no simulated fill booked')) return;
 
   const exitPrice = opts.brokerFill ? opts.fillPrice
     : (direction === 'LONG'
@@ -11684,6 +11815,7 @@ function mercuryExitPass() {
       if (lots.some(p => p._exiting || p._pendingRung != null)) continue;
       const px = marketData[ticker]?.price;
       if (!(px > 0)) continue;
+      if (!plausiblePrice(ticker, px, 'Mercury exit held')) continue;
       let q = 0, c = 0, opened = Infinity;
       for (const p of lots) { q += p.qty; c += p.entryPrice * p.qty; opened = Math.min(opened, p.openedAt || Infinity); }
       if (!(q > 0)) continue;
@@ -11798,6 +11930,10 @@ function evaluateAndTrade() {
   Object.keys(portfolio.longPositions).forEach(ticker => {
     const price = marketData[ticker]?.price;
     if (!price) return;
+    // BEFORE the high-water mark below, not after. highestPnL is persisted on the lot,
+    // so one implausible print recorded there would arm the trailing stop for good and
+    // close the whole position on the next honest tick (see IMPLAUSIBLE PRICES).
+    if (!plausiblePrice(ticker, price, 'exits held this cycle')) return;
     const positions = portfolio.longPositions[ticker];
     if (!positions?.length) return;
     let totQty = 0, totCost = 0;
@@ -11824,6 +11960,7 @@ function evaluateAndTrade() {
   Object.keys(portfolio.shortPositions).forEach(ticker => {
     const price = marketData[ticker]?.price;
     if (!price) return;
+    if (!plausiblePrice(ticker, price, 'exits held this cycle')) return;   // as for longs
     const positions = portfolio.shortPositions[ticker];
     if (!positions?.length) return;
     let totQty = 0, totCost = 0;
@@ -13459,6 +13596,9 @@ module.exports = {
     basketDailyReturns, evaluateBasketChallenger, challengerVerdict, basketChallengerTick,
     challengerWins, trimProposalLog, isScorableProposal,
     parseLeveragedEtfs, unleveredEquivalent, LEVERAGED_ETFS,
+    screenPrint, applyTradePrint, priceReferences, isPlausiblePrice, plausiblePrice, markPrice,
+    PRINT_JUMP_MAX, PRINT_CONFIRM_N, PRINT_CONFIRM_BAND, PRINT_CONFIRM_MS, PRICE_SANITY_X,
+    _resetPrintWatch: () => { for (const k of Object.keys(_printWatch)) delete _printWatch[k]; },
     BASKET_CHALLENGER_ON, CHALLENGER_MIN_DAYS, CHALLENGER_MIN_T, CHALLENGER_AUTO_SWITCH,
     tradingTrackRecord, tradingRecordMultiplier, TRADING_RECORD_MIN_TRADES,
     TRADING_RECORD_PROBE, TRADING_RECORD_FULL_T, TRADING_RECORD_GATE_ON,

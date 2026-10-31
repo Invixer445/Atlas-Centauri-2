@@ -456,6 +456,22 @@ that falls to about 2%.
 If the auditor prints `LEVERAGE_BESIDE_CASH`, the core still holds a leveraged fund beside
 T-bills. It names the unlevered swap; change `CORE_HOLD_SYMBOLS` and `CORE_WEIGHTS` to it.
 
+**Price lines (15.83).** These mean the price screen is working, not that anything broke:
+
+```
+[PRICE] ⏸  XYZ print $N is -40.0% from the last accepted $N — held back until 3 prints agree on it over 5s (1 so far). The old price stands.
+[PRICE] ✅ XYZ -40.0% move confirmed by 3 prints over 5s — accepted at $N
+[PRICE] 🚫 XYZ at $N is more than 3x from every reference (...) — exits held this cycle. ...
+```
+
+`⏸` and `✅` are normal on a volatile stock at the open. On QQQ, SPY or BIL they should
+be rare. `🚫` means a price far from everything else the engine knows about that
+symbol reached a decision, and the decision was refused. Nothing is ever sold because a
+price was held back. The knobs are `PRINT_JUMP_MAX` (0.25), `PRINT_CONFIRM_N` (3),
+`PRINT_CONFIRM_MS` (5000) and `PRICE_SANITY_X` (3). For scale: the S&P 500's worst day
+since 1985 was −20.47% (19 October 1987), close to close, so between two prints seconds
+apart a 25% band only ever catches bad data on the core.
+
 `/api/risk` answers "is a loss this size normal?" in dollars. `/api/audit` answers "is the
 machine misbehaving?". Those two, not the balance, are what to check.
 

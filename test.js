@@ -6536,13 +6536,15 @@ check('a core name with no price is reported, not silently skipped', () => {
 
 check('SPY reaches marketData when it is HELD, and only then', () => {
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
-  // the websocket trade tick
+  // the websocket trade tick — every print goes through applyTradePrint since 15.83
   const ws = src.slice(src.indexOf("if (symbol === 'SPY') {"),
                        src.indexOf("if (symbol === 'SPY') {") + 600);
   ok(/spyData\.price = price;/.test(ws), 'the benchmark must still be updated');
   ok(/CORE_HOLD_ON && CORE_HOLD_SYMBOLS\.includes\('SPY'\)/.test(ws),
      'and the bail-out must be CONDITIONAL on SPY not being a core holding');
-  ok(/continue;/.test(ws), 'with the original skip preserved for the not-held case');
+  ok(/return b\.accept;/.test(ws), 'with the original skip preserved for the not-held case');
+  ok(/if \(T === 't'\) \{\s*\/\/[^\n]*\n\s*applyTradePrint\(m\.S, m\.p,/.test(src),
+     'and the socket must hand every trade print to applyTradePrint, not update prices itself');
   // the snapshot loader
   const snap = src.slice(src.indexOf("if (sym === 'SPY') {"),
                          src.indexOf("if (sym === 'SPY') {") + 600);
@@ -8536,6 +8538,168 @@ check('the proposal the challenger scores survives the 400-entry cap', () => {
      'recordBasketProposal must cap through trimProposalLog');
   ok(/log\.find\(isScorableProposal\)/.test(src.slice(src.indexOf('async function evaluateBasketChallenger'), src.indexOf('function challengerVerdict'))),
      'and the evaluator must choose with the same predicate the cap protects');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  15.83 — IMPLAUSIBLE PRICES. Driven with real randomness, the soak made the take-
+//  profit ladder sell 30% of a position "at" $997 billion, and the account read $5.8
+//  trillion. Two layers now: a screen at the feed, and a check wherever money moves.
+// ════════════════════════════════════════════════════════════════════════════
+check('the feed screen holds back a lone jump and lets a confirmed one through', () => {
+  const J = I.PRINT_JUMP_MAX, N = I.PRINT_CONFIRM_N, MS = I.PRINT_CONFIRM_MS;
+  let r = I.screenPrint(100, 101, 0);
+  ok(r.accept && r.q === null, 'an ordinary print is accepted');
+  ok(I.screenPrint(null, 5000, 0).accept, 'with nothing to compare against, the first print is accepted');
+  ok(!I.screenPrint(100, NaN, 0).accept && !I.screenPrint(100, 0, 0).accept && !I.screenPrint(100, -3, 0).accept,
+     'nothing non-finite or non-positive');
+  ok(I.screenPrint(100, 100 * (1 + J) * 0.999, 0).accept && I.screenPrint(100, 100 / (1 + J) * 1.001, 0).accept,
+     'a move just inside the band is ordinary, in both directions');
+  r = I.screenPrint(100, 1e12, 0);
+  ok(!r.accept && r.q && r.q.n === 1, 'a $1e12 print is held back and watched');
+  const back = I.screenPrint(100, 100.2, 10, r.q);
+  ok(back.accept && back.q === null, 'and the next honest print is accepted and the watch dropped');
+  let q = null, acc = false;
+  for (let k = 0; k < N; k++) { const s = I.screenPrint(100, 60 + k * 0.1, k * MS / (N - 1), q); q = s.q; acc = s.accept; }
+  ok(acc, `a real -40% gap, ${N} agreeing prints across ${MS}ms, is accepted`);
+  q = null; acc = false;
+  for (let k = 0; k < N; k++) { const s = I.screenPrint(100, 60, k, q); q = s.q; acc = s.accept; }
+  ok(!acc, 'the same prints inside a few milliseconds are not enough: a burst of bad prints is still one event');
+  const other = I.screenPrint(100, 160, MS, I.screenPrint(100, 60, 0).q);
+  ok(!other.accept && other.q.n === 1 && other.q.price === 160, 'a jump to a different level restarts the count');
+});
+
+check('a price is believable when ANY independent reference agrees with it', () => {
+  const X = I.PRICE_SANITY_X;
+  ok(I.isPlausiblePrice(100, [98, 101]), 'near both references');
+  ok(!I.isPlausiblePrice(1e12, [98, 101]) && !I.isPlausiblePrice(1e-9, [98, 101]), 'the soak\'s two finite absurdities are not');
+  ok(I.isPlausiblePrice(100, [1e12, 99]), 'one corrupt reference cannot veto a good price');
+  ok(I.isPlausiblePrice(100 * X * 0.99, [100]) && !I.isPlausiblePrice(100 * X * 1.01, [100]), `the edge is ${X}x above`);
+  ok(I.isPlausiblePrice(100 / X * 1.01, [100]) && !I.isPlausiblePrice(100 / X * 0.99, [100]), 'and below');
+  ok(I.isPlausiblePrice(42, []) && I.isPlausiblePrice(42, [NaN, 0, -1]), 'no usable reference, no verdict');
+  ok(!I.isPlausiblePrice(NaN, [100]) && !I.isPlausiblePrice(0, [100]), 'but a non-price is never plausible');
+});
+
+check('the screen runs on the real trade path, and a held-back print changes nothing', () => {
+  I._resetPrintWatch();
+  const S = 'ZZPRT', T0 = 1000000;
+  delete I.marketData[S];
+  try {
+    ok(I.applyTradePrint(S, 50, T0), 'first print accepted');
+    const before = { ...I.marketData[S] };
+    ok(!I.applyTradePrint(S, 5e11, T0 + 10), 'a $5e11 print is held back');
+    eq(I.marketData[S].price, 50, 'the old price stands');
+    eq(I.marketData[S].high, before.high, 'the session high is not polluted by it');
+    eq(I.marketData[S].lastUpdate, before.lastUpdate,
+       'and it does not refresh the price, so a run of them ages into the staleness guard instead');
+    ok(I.applyTradePrint(S, 50.1, T0 + 20), 'the next honest print is accepted');
+    let last = false;
+    for (let k = 0; k < I.PRINT_CONFIRM_N; k++)
+      last = I.applyTradePrint(S, 25 + k * 0.05, T0 + 100 + k * I.PRINT_CONFIRM_MS / (I.PRINT_CONFIRM_N - 1));
+    ok(last && Math.abs(I.marketData[S].price - 25.1) < 1e-9, `a confirmed halving becomes the price, got ${I.marketData[S].price}`);
+  } finally { delete I.marketData[S]; I._resetPrintWatch(); }
+});
+
+check('valuation marks an implausible price at the reference, not at the print', () => {
+  const savedCash = I.portfolio.cash;
+  try {
+    resetBook();
+    seedSymbol('ZZVAL', 100);
+    I.portfolio.longPositions.ZZVAL = [{ lotId: 'V1', qty: 2, entryPrice: 100, highestPnL: 0,
+      openedAt: Date.now(), atrFrac: 0.02, partialsTaken: {} }];
+    const v0 = I.getTotalValue();
+    I.marketData.ZZVAL.price = 1e12;
+    const vHi = I.getTotalValue();
+    I.marketData.ZZVAL.price = 1e-9;
+    const vLo = I.getTotalValue();
+    const ref = I.priceReferences('ZZVAL')[0];
+    ok(Math.abs(vHi - (v0 + 2 * (ref - 100))) < 1e-6,
+       `a $1e12 print must not become equity: ${vHi} vs ${v0 + 2 * (ref - 100)} marked at the reference`);
+    ok(Math.abs(vLo - vHi) < 1e-6, 'nor a $0.000000001 print a loss');
+    I.marketData.ZZVAL.price = 104;
+    ok(Math.abs(I.getTotalValue() - (v0 + 8)) < 1e-6, 'and a believable price is used exactly as before');
+  } finally { resetBook(); delete I.marketData.ZZVAL; delete I.candleData.ZZVAL; I.portfolio.cash = savedCash; }
+});
+
+check('a simulated fill is never booked at a price the engine does not believe', () => {
+  const savedCash = I.portfolio.cash;
+  try {
+    resetBook();
+    seedSymbol('ZZFIL', 100);
+    I.portfolio.longPositions.ZZFIL = [{ lotId: 'F1', qty: 2, entryPrice: 100, highestPnL: 0,
+      openedAt: Date.now() - 7200000, atrFrac: 0.02, partialsTaken: {} }];
+    const cash0 = I.portfolio.cash;
+    I.marketData.ZZFIL.price = 1e12;
+    I.partialClose('ZZFIL', 'LONG', 0.30, 'tp2');
+    I.closeLong('ZZFIL', false);
+    eq(I.portfolio.cash, cash0, 'not a cent booked at $1e12 — the soak booked $199 billion here');
+    ok(I.portfolio.longPositions.ZZFIL && I.portfolio.longPositions.ZZFIL[0].qty === 2, 'and the position is untouched');
+    I.marketData.ZZFIL.price = 101;
+    I.closeLong('ZZFIL', false);
+    ok(!I.portfolio.longPositions.ZZFIL || !I.portfolio.longPositions.ZZFIL.length, 'at $101 the close goes through');
+    ok(I.portfolio.cash > cash0 + 190, 'and is booked as before');
+  } finally { resetBook(); delete I.marketData.ZZFIL; delete I.candleData.ZZFIL; I.portfolio.cash = savedCash; }
+});
+
+check('the core never trims or tops up on a price it does not believe', () => {
+  const r = weightProbe({ CORE_BASKET_SOURCE: 'fixed', CORE_HOLD_SYMBOLS: 'QQQ,SPY',
+                          CORE_WEIGHTS: 'QQQ:0.70,SPY:0.30', CORE_HOLD_FRACTION: '0.9' }, `
+    I.detectStartingCapital(10000);
+    const now = Date.now();
+    I.marketData.QQQ = { price: 500, prevClose: 498, dayOpen: 499, lastUpdate: now };
+    I.marketData.SPY = { price: 600, prevClose: 598, dayOpen: 599, lastUpdate: now };
+    I.portfolio.coreHolding = { QQQ: { qty: 12.6, avgPrice: 500, investedCash: 6300 },
+                                SPY: { qty: 4.5,  avgPrice: 600, investedCash: 2700 } };
+    I.portfolio.cash = 1000;
+    const pick = (f) => { const p = f(); return p ? p.sym : null; };
+    const out = { sane: pick(() => I.mostOverweightCore(I.getTotalValue())) };
+    I.marketData.QQQ.price = 1e12;
+    out.hiTrim = pick(() => I.mostOverweightCore(I.getTotalValue()));
+    I.marketData.QQQ.price = 1e-9;
+    out.loTrim = pick(() => I.mostOverweightCore(I.getTotalValue()));
+    out.loTopUp = pick(() => I.mostUnderweightCore());
+    console.log(JSON.stringify(out));`);
+  eq(r.sane, null, 'premise: at real prices nothing is past the trim band');
+  eq(r.hiTrim, null, 'a $1e12 QQQ print must not make QQQ "overweight" — that sold most of it');
+  eq(r.loTrim, null, 'a $0.000000001 QQQ print must not make SPY "overweight" either');
+  ok(r.loTopUp !== 'QQQ', `nor make QQQ the name to buy at a billionth of a dollar, got ${r.loTopUp}`);
+});
+
+check('Terra refuses an entry its own references do not support', () => {
+  const p = { ...basePlan(), shares: 10 };
+  p.entryPrice = p.entryPrice * 3.5;                  // 3.5x every PLTR reference, inside the absolute bounds
+  p.stop = { price: p.entryPrice * 0.97, frac: 0.03 };
+  const v = I.terraValidateTrade(p);
+  eq(v.approved, false, 'not approved');
+  ok(/implausible/i.test(v.reason), `and refused for the price, not something else: ${v.reason}`);
+});
+
+check('SPY prints are screened, and still reach the core only when SPY is held', () => {
+  const body = `
+    I._resetPrintWatch(); delete I.marketData.SPY;
+    const a = I.applyTradePrint('SPY', 700, 1000);
+    const held = !!I.marketData.SPY, px = held ? I.marketData.SPY.price : null;
+    const bad = I.applyTradePrint('SPY', 7e9, 2000);
+    console.log(JSON.stringify({ a, held, px, bench: I.spyData.price, bad,
+                                 after: held ? I.marketData.SPY.price : null }));`;
+  const y = weightProbe({ CORE_BASKET_SOURCE: 'fixed', CORE_HOLD_SYMBOLS: 'QQQ,SPY', CORE_HOLD_FRACTION: '0.9' }, body);
+  ok(y.held && y.px === 700 && y.bench === 700, `held: both copies take the print, got ${JSON.stringify(y)}`);
+  ok(!y.bad && y.after === 700 && y.bench === 700, 'and both refuse the bad one');
+  const n = weightProbe({ CORE_BASKET_SOURCE: 'fixed', CORE_HOLD_SYMBOLS: 'QQQ,BIL', CORE_HOLD_FRACTION: '0.9' }, body);
+  ok(!n.held && n.bench === 700, `not held: the benchmark only, as before, got ${JSON.stringify(n)}`);
+});
+
+check('the exit sweep checks the price BEFORE it moves the high-water mark', () => {
+  const src = require('fs').readFileSync(SRV, 'utf8');
+  for (const book of ['longPositions', 'shortPositions']) {
+    const at = src.indexOf(`Object.keys(portfolio.${book}).forEach(ticker => {`);
+    const fn = src.slice(at, at + 1400);
+    const iCheck = fn.indexOf("plausiblePrice(ticker, price, 'exits held this cycle')");
+    const iMark = fn.indexOf('p.highestPnL = Math.max');
+    ok(at > 0 && iCheck > 0 && iMark > iCheck,
+       `${book}: highestPnL is persisted, so one implausible print recorded first arms the trailing stop for good`);
+  }
+  const ora = src.slice(src.indexOf("if (lots.some(p => p._exiting || p._pendingRung != null)) continue;"));
+  ok(/plausiblePrice\(ticker, px, 'Mercury exit held'\)/.test(ora.slice(0, 400)), 'and Mercury\'s re-evaluation does the same');
 });
 
 // ════════════════════════════════════════════════════════════════════════════

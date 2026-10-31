@@ -27,10 +27,14 @@ const pick = a => a[Math.floor(rnd() * a.length)];
 const SYMS = [...I.WATCHLISTS.nasdaq, ...I.WATCHLISTS.nyse].slice(0, 26);
 const HOSTILE = [0, -1, NaN, Infinity, -Infinity, 1e-9, 1e12, null, undefined];
 
+// Where each symbol REALLY trades this tick, before any hostile field is written over it.
+const TRUE_PRICE = {};
+
 function seed(sym, hostile) {
   const n = 70;
   const path = []; let p = 20 + rnd() * 400;
   for (let i = 0; i < n; i++) { p *= 1 + (rnd() - 0.5) * 0.02; path.push(p); }
+  TRUE_PRICE[sym] = path[n - 1];
   const md = {
     price: path[n - 1], prevClose: path[30], high: Math.max(...path), low: Math.min(...path),
     dailyVolume: Math.floor(rnd() * 2e7), lastUpdate: Date.now() - Math.floor(rnd() * 300000),
@@ -72,6 +76,31 @@ const note = (where, e) => {
 const TICKS = parseInt(process.argv[2] || '3000', 10);
 let maxOpen = 0, maxDecisions = 0;
 
+// ABSURD BUT FINITE. scanNaN only sees non-finite numbers, and the worst thing this soak
+// ever found was finite: a take-profit booked at $997B and a $5.8T vault went straight
+// past it. Nothing here can legitimately reach $10M — cash is reset under $9.3k every
+// tick and the biggest possible book is ~$260k — so anything past it is the engine
+// believing a price it should not have.
+const ABSURD_USD = 1e7;
+const absurd = {};
+function checkAbsurd(tick) {
+  const vals = {
+    'capitalSystem.reserveCash': I.capitalSystem.reserveCash,
+    'capitalSystem.tradingCapital': I.capitalSystem.tradingCapital,
+    'capitalSystem.profitVault': I.capitalSystem.profitVault,
+    'portfolio.cash': I.portfolio.cash,
+    'getTotalValue()': I.getTotalValue(),
+  };
+  for (const t of I.portfolio.closedTrades.slice(-5)) vals[`booked PnL (${t.ticker})`] = t.pnl;
+  for (const [k, v] of Object.entries(vals)) {
+    if (!(typeof v === 'number' && Math.abs(v) > ABSURD_USD)) continue;
+    const key = k.replace(/ \(.*\)$/, '');
+    if (!absurd[key]) absurd[key] = { tick, first: v, worst: v, n: 0 };
+    absurd[key].n++;
+    if (Math.abs(v) > Math.abs(absurd[key].worst)) absurd[key].worst = v;
+  }
+}
+
 for (let tick = 0; tick < TICKS; tick++) {
   global.__advance(2000);
   const hostile = tick % 3 === 0;
@@ -79,9 +108,12 @@ for (let tick = 0; tick < TICKS; tick++) {
   I.spyData.price = hostile && rnd() < 0.2 ? pick(HOSTILE) : 400 + rnd() * 100;
   I.spyData.prevClose = 400 + rnd() * 100;
 
-  // Randomly open and close positions so the exit paths get exercised.
+  // Randomly open and close positions so the exit paths get exercised. At the TRUE
+  // price, not marketData's: Terra and the simulator refuse an entry at a price the
+  // engine does not believe (15.83), so a lot opened at a hostile $1e12 is a state the
+  // engine can no longer produce — and closing one booked -$10 trillion in this soak.
   if (rnd() < 0.3) {
-    const s = pick(SYMS); const px = I.marketData[s]?.price;
+    const s = pick(SYMS); const px = TRUE_PRICE[s];
     if (px > 0 && !I.portfolio.longPositions[s]) {
       I.portfolio.longPositions[s] = [{
         qty: +(rnd() * 20).toFixed(4), entryPrice: px * (0.8 + rnd() * 0.4),
@@ -111,6 +143,7 @@ for (let tick = 0; tick < TICKS; tick++) {
 
   maxOpen = Math.max(maxOpen, Object.keys(I.mercury.getOpen()).length);
   maxDecisions = Math.max(maxDecisions, I.getMercuryDecisions().length);
+  try { checkAbsurd(tick); } catch (e) { note('checkAbsurd', e); }
 
   if (tick % 500 === 499) {
     let blob = null;
@@ -133,6 +166,12 @@ const blob = typeof I.buildStateObject==="function"&&I.buildStateObject();
 console.log(`  state size                    : ${(JSON.stringify(blob).length / 1024).toFixed(1)} KB`);
 const bad = scanNaN(blob);
 console.log(`  non-finite numbers in state   : ${bad.length}${bad.length ? ' -> ' + bad.slice(0, 6).join(' | ') : ''}`);
+const absurdKeys = Object.keys(absurd);
+console.log(`  absurd values (past $${(ABSURD_USD / 1e6).toFixed(0)}M)     : ${absurdKeys.length ? absurdKeys.length + ' field(s)' : 'none'}`);
+for (const k of absurdKeys) {
+  const a = absurd[k];
+  note('ABSURD', new Error(`${k} first $${a.first.toExponential(2)} at tick ${a.tick}, worst $${a.worst.toExponential(2)}, ${a.n} tick(s)`));
+}
 console.log(`\n  DISTINCT ERRORS: ${errors.size}`);
 for (const [k, n] of [...errors.entries()].sort((a, b) => b[1] - a[1])) console.log(`    x${n}  ${k}`);
 typeof I.cancelPendingSave==="function"&&I.cancelPendingSave();
