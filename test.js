@@ -8565,7 +8565,81 @@ check('the feed screen holds back a lone jump and lets a confirmed one through',
   for (let k = 0; k < N; k++) { const s = I.screenPrint(100, 60, k, q); q = s.q; acc = s.accept; }
   ok(!acc, 'the same prints inside a few milliseconds are not enough: a burst of bad prints is still one event');
   const other = I.screenPrint(100, 160, MS, I.screenPrint(100, 60, 0).q);
-  ok(!other.accept && other.q.n === 1 && other.q.price === 160, 'a jump to a different level restarts the count');
+  ok(!other.accept && other.q.n === 1 && other.q.price === 160, 'a jump to the OTHER side restarts the count');
+  // THE 15.83 STALL. Confirmation used to need prints within 2% of each other, and a
+  // halt reopening prints a scatter: every print more than 2% off restarted the count,
+  // so the gap — and the stop loss on that stock — was held back for as long as it lasted.
+  q = null; acc = false;
+  [50, 53, 47.5].forEach((p, k) => { const s = I.screenPrint(100, p, k * MS / 2, q); q = s.q; acc = s.accept; });
+  ok(acc, 'a -50% reopening that prints 50, 53, 47.5 across the window is confirmed');
+  const wild = I.screenPrint(100, 20, MS, I.screenPrint(100, 50, 0).q);
+  ok(!wild.accept && wild.q.n === 1, 'but a print far outside the band of the one before still restarts it');
+});
+
+check('a corrupt sole reference cannot become the valuation', () => {
+  // A symbol's first tick becomes its prevClose until a snapshot lands. If that tick was
+  // bad, a GOOD live price reads implausible against it — and 15.83 then valued the
+  // position at the corrupt reference, the very failure the backstop exists to stop.
+  const savedCash = I.portfolio.cash;
+  try {
+    resetBook();
+    I.marketData.ZZREF = { price: 100, prevClose: 1e12, lastUpdate: Date.now() };
+    delete I.candleData.ZZREF;
+    I.portfolio.longPositions.ZZREF = [{ lotId: 'R1', qty: 2, entryPrice: 100, highestPnL: 0,
+      openedAt: Date.now(), atrFrac: 0.02, partialsTaken: {} }];
+    eq(I.markPrice('ZZREF', 100), 100, 'marked at what was paid, not at $1e12');
+    const v = I.getTotalValue();
+    ok(v < I.portfolio.cash + 1000, `and the account does not read $2e12, got ${v}`);
+    I.marketData.ZZREF.prevClose = 101;
+    I.marketData.ZZREF.price = 1e12;
+    eq(I.markPrice('ZZREF', 100), 101, 'while a reference that agrees with the basis is still used');
+  } finally { resetBook(); delete I.marketData.ZZREF; I.portfolio.cash = savedCash; }
+  // And the CORE, which is where the money is. Its valuation passes the lot's own basis.
+  const savedCore = I.portfolio.coreHolding;
+  try {
+    I.portfolio.coreHolding = { ZZCOR: { qty: 10, avgPrice: 100, investedCash: 1000 } };
+    I.marketData.ZZCOR = { price: 100, prevClose: 1e12, lastUpdate: Date.now() };
+    delete I.candleData.ZZCOR;
+    eq(I.coreHoldingValue(), 1000, 'a core lot is valued at its basis, not at a corrupt sole reference');
+  } finally { I.portfolio.coreHolding = savedCore; delete I.marketData.ZZCOR; }
+});
+
+check('a fresh minute bar lets a genuine crash through the backstop within minutes', () => {
+  // The decision bar is hourly and the snapshot six-hourly; a real -75% crash would sit
+  // outside both for up to an hour, stop loss included. The minute bar refreshes every
+  // five minutes in session, and one at the new level is independent corroboration.
+  try {
+    seedSymbol('ZZCR', 100);
+    I.marketData.ZZCR.price = 25;
+    ok(!I.plausiblePrice('ZZCR', 25), 'premise: -75% is outside every hourly and snapshot reference');
+    I.candleData.ZZCR.raw1m = [{ t: 1, o: 26, h: 26, l: 24.5, c: 25.2, v: 900 }];
+    ok(I.plausiblePrice('ZZCR', 25), 'and a minute bar printing there makes it believable');
+  } finally { delete I.marketData.ZZCR; delete I.candleData.ZZCR; }
+});
+
+check('a malformed timestamp cannot poison the feed screen', () => {
+  I._resetPrintWatch();
+  try {
+    delete I.marketData.ZZNAN;
+    ok(I.applyTradePrint('ZZNAN', 50, NaN), 'the print is still taken');
+    ok(Number.isFinite(I.marketData.ZZNAN.lastTradeTime),
+       'but lastTradeTime is the arrival time, not NaN — NaN would also make every jump unconfirmable');
+  } finally { delete I.marketData.ZZNAN; I._resetPrintWatch(); }
+});
+
+check('the growth sleeve\'s disaster exit never fires on a price it does not believe', () => {
+  // It sells the WHOLE position and retires the name for good; 15.83 left it unguarded.
+  const r = weightProbe({ CORE_BASKET_SOURCE: 'fixed', CORE_HOLD_SYMBOLS: 'QQQ', CORE_HOLD_FRACTION: '0.9',
+                          GROWTH_SLEEVE_FRACTION: '0.7', GROWTH_POOL: 'ZZG' }, `
+    const now = Date.now();
+    I.portfolio.coreHolding = { ZZG: { qty: 10, avgPrice: 100, investedCash: 1000 } };
+    I.marketData.ZZG = { price: 1e-9, prevClose: 100, dayOpen: 99, lastUpdate: now };
+    const bad = I.growthDisasterPick();
+    I.marketData.ZZG.price = 50;
+    const real = I.growthDisasterPick();
+    console.log(JSON.stringify({ bad, real: real && real.sym }));`);
+  eq(r.bad, null, 'a $0.000000001 print is not a catastrophe');
+  eq(r.real, 'ZZG', 'a real -50% still is');
 });
 
 check('a price is believable when ANY independent reference agrees with it', () => {

@@ -459,7 +459,7 @@ T-bills. It names the unlevered swap; change `CORE_HOLD_SYMBOLS` and `CORE_WEIGH
 **Price lines (15.83).** These mean the price screen is working, not that anything broke:
 
 ```
-[PRICE] ⏸  XYZ print $N is -40.0% from the last accepted $N — held back until 3 prints agree on it over 5s (1 so far). The old price stands.
+[PRICE] ⏸  XYZ print $N is -40.0% from the last accepted $N — held back until 3 prints in a row confirm the move over 5s (1 so far). The old price stands.
 [PRICE] ✅ XYZ -40.0% move confirmed by 3 prints over 5s — accepted at $N
 [PRICE] 🚫 XYZ at $N is more than 3x from every reference (...) — exits held this cycle. ...
 ```

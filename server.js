@@ -3612,47 +3612,66 @@ const MAX_PRICE_AGE_MS   = 90000;
 //  TWO LAYERS.
 //   1. At the feed (screenPrint). A print more than PRINT_JUMP_MAX from the last
 //      ACCEPTED price is held back and the old price stands. It becomes the price only
-//      when PRINT_CONFIRM_N prints agree on the new level, within PRINT_CONFIRM_BAND of
-//      each other, across at least PRINT_CONFIRM_MS. A real gap, a halt reopening, a
-//      split: through in seconds. A lone bad print: never. While a jump is unconfirmed
-//      the price ages, and nothing acts on a price older than MAX_PRICE_AGE_MS — so
-//      holding a print back can never itself sell anything.
+//      when PRINT_CONFIRM_N prints in a row land on the same side of the old price, each
+//      within PRINT_JUMP_MAX of the one before, across at least PRINT_CONFIRM_MS. A real
+//      gap, a halt reopening, a split: through in seconds. A lone bad print: never.
+//      While a jump is unconfirmed the price ages, and nothing acts on a price older
+//      than MAX_PRICE_AGE_MS — so holding a print back can never itself sell anything.
 //   2. Where money moves (plausiblePrice). Exits, simulated fills, entries and core
 //      trims/top-ups refuse a price more than PRICE_SANITY_X from EVERY independent
-//      reference: the last decision bar's close, the previous close, the session open.
-//      Valuation marks such a price at the reference instead (markPrice), so no
-//      phantom equity, peak or drawdown can form. Wide on purpose — it is the backstop
-//      for state that is wrong however it got there, not a second print filter.
+//      reference: the last minute bar and decision bar (REST, refreshed every five
+//      minutes in session), the session open, the previous close. Valuation marks such
+//      a price at a reference that agrees with what was PAID (markPrice), so no phantom
+//      equity, peak or drawdown can form. Wide on purpose — it is the backstop for state
+//      that is wrong however it got there, not a second print filter.
 const PRINT_JUMP_MAX     = Math.max(0.05, Math.min(1, parseFloat(process.env.PRINT_JUMP_MAX || '0.25')));
 const PRINT_CONFIRM_N    = Math.max(2, Math.min(20, parseInt(process.env.PRINT_CONFIRM_N || '3', 10)));
-const PRINT_CONFIRM_BAND = 0.02;
 const PRINT_CONFIRM_MS   = Math.max(0, parseInt(process.env.PRINT_CONFIRM_MS || '5000', 10));
 const PRICE_SANITY_X     = Math.max(1.5, Math.min(100, parseFloat(process.env.PRICE_SANITY_X || '3')));
 
-// Pure. `last` is the last ACCEPTED price; `q` is what is being watched for this symbol
-// ({ price, n, since } or null). Returns { accept, q } and the caller stores q.
+// Pure. `last` is the last ACCEPTED price; `q` is the jump being watched for this symbol
+// ({ side, n, since, price } or null). Returns { accept, q } and the caller stores q.
 function screenPrint(last, price, ts, q = null) {
   if (!Number.isFinite(price) || price <= 0) return { accept: false, q, reason: 'not a price' };
   if (!(last > 0)) return { accept: true, q: null };                  // nothing to judge it against
-  if (Math.abs(Math.log(price / last)) <= Math.log(1 + PRINT_JUMP_MAX)) return { accept: true, q: null };
-  // A jump. Does it agree with the one already being watched?
-  const agrees = !!(q && q.price > 0 && Math.abs(price / q.price - 1) <= PRINT_CONFIRM_BAND);
-  const nq = agrees ? { price: q.price, n: q.n + 1, since: q.since } : { price, n: 1, since: ts };
+  const band = Math.log(1 + PRINT_JUMP_MAX), lr = Math.log(price / last);
+  if (Math.abs(lr) <= band) return { accept: true, q: null };
+  // A jump. It is confirmed by prints that keep saying the old price is GONE — the same
+  // side of it, each within the band of the one before — not by prints that agree with
+  // each other to 2%. That was the first version of this rule, and a halt reopening
+  // prints a scatter (50, 53, 47.5, 51...): every print more than 2% off restarted the
+  // count, so a real gap stayed held back for as long as the scatter lasted, and the
+  // stop loss on exactly that kind of crashing stock with it.
+  const side = lr > 0 ? 1 : -1;
+  const continues = !!(q && q.side === side && q.price > 0 && Math.abs(Math.log(price / q.price)) <= band);
+  const nq = continues ? { side, n: q.n + 1, since: q.since, price } : { side, n: 1, since: ts, price };
   if (nq.n >= PRINT_CONFIRM_N && ts - nq.since >= PRINT_CONFIRM_MS) return { accept: true, q: null, confirmed: nq };
   return { accept: false, q: nq, reason: 'unconfirmed jump' };
 }
 
 // The engine's own reads of where a symbol trades, none of them from the tick being
-// judged: the decision bar's close (REST bars), the previous close and the session
-// open (the snapshot).
+// judged, freshest first: the last minute bar and the last decision bar (REST, every five
+// minutes in session), the session open, the previous close (the snapshot). The minute
+// bar is what lets a genuine crash past PRICE_SANITY_X be acted on within minutes
+// instead of waiting for the hourly bar. Core ETFs have no candles; the snapshot covers them.
 function priceReferences(sym) {
   const refs = [];
-  const bars = candleData[sym]?.m1;
-  const bar = Array.isArray(bars) && bars.length ? bars[bars.length - 1] : null;
-  if (bar && Number.isFinite(bar.c) && bar.c > 0) refs.push(bar.c);
+  const cd = candleData[sym] || {};
+  for (const bars of [cd.raw1m, cd.m1]) {
+    const bar = Array.isArray(bars) && bars.length ? bars[bars.length - 1] : null;
+    if (bar && Number.isFinite(bar.c) && bar.c > 0) refs.push(bar.c);
+  }
   const md = marketData[sym] || {};
-  for (const v of [md.prevClose, md.dayOpen]) if (Number.isFinite(v) && v > 0) refs.push(v);
+  for (const v of [md.dayOpen, md.prevClose]) if (Number.isFinite(v) && v > 0) refs.push(v);
   return refs;
+}
+
+// What was actually paid for a ticker's lots, quantity-weighted. markPrice's anchor: it
+// came from booked fills, so no feed can corrupt it after the fact.
+function lotBasis(lots) {
+  let q = 0, c = 0;
+  for (const l of lots || []) if (l && l.qty > 0 && l.entryPrice > 0) { q += l.qty; c += l.qty * l.entryPrice; }
+  return q > 0 ? c / q : null;
 }
 
 // Pure. Plausible = within maxX of at least ONE reference, so one corrupt reference
@@ -3683,14 +3702,21 @@ function plausiblePrice(sym, price = marketData[sym]?.price, what = 'nothing act
   return false;
 }
 
-// Valuation's price. The live price when plausible; the nearest reference when not, so
-// one bad print can make neither this name nor the rest of the book look mis-weighted.
-// A MISSING price returns null and keeps each caller's own fallback exactly as before.
-function markPrice(sym) {
+// Valuation's price. The live price when plausible, so one bad print can make neither
+// this name nor the rest of the book look mis-weighted. A MISSING price returns null and
+// keeps each caller's own fallback exactly as before.
+function markPrice(sym, basis = null) {
   const p = marketData[sym]?.price;
   if (!(Number.isFinite(p) && p > 0)) return null;
   const refs = priceReferences(sym);
-  return isPlausiblePrice(p, refs) ? p : refs[0];
+  if (isPlausiblePrice(p, refs)) return p;
+  // NOT SIMPLY THE FIRST REFERENCE (15.83 did that). A reference can be the bad number:
+  // a symbol's first tick becomes its prevClose until a snapshot lands, and a good live
+  // price against a corrupt sole reference reads "implausible" — after which the
+  // position was valued AT the corrupt number, the exact failure this exists to stop.
+  // Trust a reference only if it agrees with what was paid; failing that, the basis.
+  if (Number.isFinite(basis) && basis > 0) return refs.find(r => isPlausiblePrice(r, [basis])) ?? basis;
+  return refs[0];
 }
 
 // Every trade print from the feed comes through here (see the 't' branch of the data
@@ -3699,6 +3725,9 @@ const _printWatch = Object.create(null);
 const _printLogAt = Object.create(null);
 function applyTradePrint(symbol, price, ts = Date.now()) {
   if (!symbol || !Number.isFinite(price) || price <= 0) return false;
+  // A malformed timestamp would make every jump unconfirmable (NaN never clears the
+  // time test) and poison lastTradeTime for the ordering check. Use arrival time instead.
+  if (!Number.isFinite(ts)) ts = Date.now();
   // SPY IS THE BENCHMARK **AND**, SINCE v13.72, A HOLDABLE CORE NAME.
   // This used to `continue` unconditionally, so SPY's ticks updated the benchmark and
   // never reached marketData. Nothing noticed for months because SPY had only ever been
@@ -3723,8 +3752,8 @@ function applyTradePrint(symbol, price, ts = Date.now()) {
     if (s.q && now - (_printLogAt[symbol] || 0) > 60000) {
       _printLogAt[symbol] = now;
       console.warn(`[PRICE] ⏸  ${symbol} print $${price.toPrecision(6)} is ${((price / ex.price - 1) * 100).toFixed(1)}% ` +
-                   `from the last accepted $${ex.price.toFixed(2)} — held back until ${PRINT_CONFIRM_N} prints agree on it ` +
-                   `over ${(PRINT_CONFIRM_MS / 1000).toFixed(0)}s (${s.q.n} so far). The old price stands.`);
+                   `from the last accepted $${ex.price.toFixed(2)} — held back until ${PRINT_CONFIRM_N} prints in a row ` +
+                   `confirm the move over ${(PRINT_CONFIRM_MS / 1000).toFixed(0)}s (${s.q.n} so far). The old price stands.`);
     }
     return false;
   }
@@ -6245,14 +6274,14 @@ function getTotalValue() {
   // markPrice, not the raw tick: one implausible print must not become equity, a peak,
   // or a drawdown (see IMPLAUSIBLE PRICES).
   Object.entries(portfolio.longPositions).forEach(([ticker, positions]) => {
-    const price = markPrice(ticker);
+    const price = markPrice(ticker, lotBasis(positions));
     positions.forEach(pos => {
       const p = Number(price || pos.entryPrice) || 0;
       value += p * (pos.qty || 0);
     });
   });
   Object.entries(portfolio.shortPositions).forEach(([ticker, positions]) => {
-    const price = markPrice(ticker);
+    const price = markPrice(ticker, lotBasis(positions));
     positions.forEach(pos => {
       const ep  = Number(pos.entryPrice) || 0;
       const p   = Number(price || ep) || ep;
@@ -6945,7 +6974,8 @@ function coreHoldingValue() {
   let v = 0;
   for (const [sym, lot] of Object.entries(h)) {
     if (!lot || !(lot.qty > 0)) continue;
-    const px = markPrice(sym);                                       // see IMPLAUSIBLE PRICES
+    const basis = lot.avgPrice > 0 ? lot.avgPrice : (lot.investedCash > 0 ? lot.investedCash / lot.qty : null);
+    const px = markPrice(sym, basis);                                // see IMPLAUSIBLE PRICES
     v += (Number.isFinite(px) && px > 0) ? lot.qty * px : (lot.investedCash || 0);
   }
   return v;
@@ -7655,6 +7685,9 @@ function growthDisasterPick() {
     if (!Number.isFinite(px) || !(px > 0)) continue;
     const upd = marketData[sym]?.lastUpdate;
     if (upd && (Date.now() - upd) > MAX_PRICE_AGE_MS) continue;   // never act on a stale price
+    // Nor an implausible one. This exit sells the WHOLE position and retires the name for
+    // good, so a single bad low print here would be the most expensive one in the engine.
+    if (!plausiblePrice(sym, px, 'growth disaster exit held')) continue;
     const down = 1 - (px / lot.avgPrice);
     if (down >= GROWTH_DISASTER_STOP) return { sym, px, qty: lot.qty, down };
   }
@@ -13596,8 +13629,8 @@ module.exports = {
     basketDailyReturns, evaluateBasketChallenger, challengerVerdict, basketChallengerTick,
     challengerWins, trimProposalLog, isScorableProposal,
     parseLeveragedEtfs, unleveredEquivalent, LEVERAGED_ETFS,
-    screenPrint, applyTradePrint, priceReferences, isPlausiblePrice, plausiblePrice, markPrice,
-    PRINT_JUMP_MAX, PRINT_CONFIRM_N, PRINT_CONFIRM_BAND, PRINT_CONFIRM_MS, PRICE_SANITY_X,
+    screenPrint, applyTradePrint, priceReferences, isPlausiblePrice, plausiblePrice, markPrice, lotBasis,
+    PRINT_JUMP_MAX, PRINT_CONFIRM_N, PRINT_CONFIRM_MS, PRICE_SANITY_X,
     _resetPrintWatch: () => { for (const k of Object.keys(_printWatch)) delete _printWatch[k]; },
     BASKET_CHALLENGER_ON, CHALLENGER_MIN_DAYS, CHALLENGER_MIN_T, CHALLENGER_AUTO_SWITCH,
     tradingTrackRecord, tradingRecordMultiplier, TRADING_RECORD_MIN_TRADES,

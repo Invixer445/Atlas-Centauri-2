@@ -24,7 +24,7 @@ experiment, and it stays locked until the core has earned the money to fund it.
 | **Phase gate** | The trading engine opens **nothing** until the account is up `TRADING_UNLOCK_PCT` (10%). After that it trades only with the profit, and locks again if the account falls back to +5% | once |
 | **Basket challenger** | Scores the research AI's proposed basket against the live one. It needs 60 sessions and an alpha t-stat of 3 (it is re-read daily, so 2 would let luck through) before it can switch, and switches by itself only with `BASKET_CHALLENGER_AUTO=on` | months |
 | **Auditor, risk profile** | Idle cash, cost drift, unreachable gates, a leveraged fund held beside T-bills (every 15 min); Sharpe, Sortino, Calmar, VaR, CVaR, worst 12 months and time below a high, against the real T-bill rate (daily) | — |
-| **Price screen** | A trade print more than 25% from the last accepted price is held back until 3 prints agree on it over 5 seconds. Nothing is bought, sold, booked or valued at a price more than 3× from the symbol's own references (15.83) | every print |
+| **Price screen** | A trade print more than 25% from the last accepted price is held back until 3 prints in a row confirm the move over 5 seconds. Nothing is bought, sold or booked at a price more than 3× from the symbol's own references, and valuation then uses a reference that agrees with what was paid (15.83, 15.85) | every print |
 
 Nothing closes at the bell, on purpose. On SPY from 2003 to 2026, $10,000 held only from
 each open to each close grew to about $20,000 before costs. Held through the nights as
