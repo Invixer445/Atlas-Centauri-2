@@ -3,7 +3,38 @@
 *(The running version comes from `package.json` and is printed in the boot banner —
 this file deliberately does not restate it, because it was stuck at v11.18 for 46 releases.)*
 
-A news-intelligent, two-engine adaptive day-trading bot for **US equities (NASDAQ + NYSE)**. Lumen = ATLAS Solar + a two-engine AI architecture (a researcher that scans the web/13F/news and a trader that sizes, acts, and learns) + a volatility-normalized strategy rewrite.
+A **position trader** for US-listed stocks and ETFs. The money sits in a core basket that
+is held for months at a time and has a written exit rule. The AI trading engine is an
+experiment, and it stays locked until the core has earned the money to fund it.
+
+> **Default mode is a paper-trading simulator.** It models slippage, spread, market
+> impact, partial fills, margin and borrow fees against live market prices but does
+> **not** place real orders unless you explicitly enable live trading.
+> This build is paper-only by design: broker-authoritative execution against a LIVE
+> Alpaca endpoint is refused at boot and the process exits. See
+> **`RAILWAY_DEPLOY_GUIDE.md`** to deploy it.
+
+## What runs the money (Mark 15)
+
+| Part | What it does | How often it acts |
+|---|---|---|
+| **Core basket** | Holds `CORE_HOLD_SYMBOLS` at `CORE_WEIGHTS` (Mark 15: QLD 35%, BIL 65%), and trims any name that outgrows its slice by more than the trim band | rarely |
+| **Regime shield** | While SPY is below its 200-day average, the risky names keep 30% of their weight and the rest moves to T-bills | about 5 switches a year (2008–2026) |
+| **Volatility scaling** | The risky names keep (their 5-year normal volatility ÷ the last 20 days') of their weight, capped at 100%, so it can only cut | re-measured daily |
+| **Phase gate** | The trading engine opens **nothing** until the account is up `TRADING_UNLOCK_PCT` (10%). After that it trades only with the profit, and locks again if the account falls back to +5% | once |
+| **Basket challenger** | Scores the research AI's proposed basket against the live one. It needs 60 sessions and an alpha t-stat of 2 before it can switch, and switches by itself only with `BASKET_CHALLENGER_AUTO=on` | months |
+| **Auditor, risk profile** | Idle cash, cost drift and unreachable gates (every 15 min); Sharpe, VaR, CVaR and drawdown against the real T-bill rate (daily) | — |
+
+Nothing closes at the bell, on purpose. On SPY from 2003 to 2026, $10,000 held only from
+each open to each close grew to about $20,000 before costs. Held through the nights as
+well, it grew to about $128,000. The configuration is in `RAILWAY_DEPLOY_GUIDE.md` §10.
+
+## The trading engine (locked during phase 1)
+
+This section describes the engine that came before the core. It still runs every exit,
+risk gate and kill switch, but it opens nothing while the phase gate is shut.
+
+A news-intelligent, two-engine adaptive trading engine for **US equities (NASDAQ + NYSE)**. Lumen = ATLAS Solar + a two-engine AI architecture (a researcher that scans the web/13F/news and a trader that sizes, acts, and learns) + a volatility-normalized strategy rewrite.
 
 - 🌍 **Terra** — the **execution engine** (the part of the unified `server.js` dedicated to carrying out Venus & Jupiter's decisions: order routing, fills, position lifecycle, strategy gate, full risk pipeline). Its supporting infrastructure (market-data feed, indicators, persistence, dashboard server) lives alongside it
 
@@ -25,14 +56,10 @@ each position with its validated stop. No trade opens without a stop loss.
 
 *This narrative stops at v11.18 and the repo is well past it — `git log` is the authoritative history. Every release since carries its reasoning in the commit message and in the comment block beside the code it changed.*
 
-> **Default mode is a paper-trading simulator.** It models slippage, spread, market
-> impact, partial fills, margin and borrow fees against live market prices but does
-> **not** place real orders unless you explicitly enable live trading.
-> This build is paper-only by design: broker-authoritative execution against a LIVE
-> Alpaca endpoint is refused at boot and the process exits. See
-> **`RAILWAY_DEPLOY_GUIDE.md`** to deploy it.
+### What the engine does
 
-## Core capabilities
+*Written before the core existed. Where it disagrees with "What runs the money" above,
+that table is current.*
 
 | Layer | What it does |
 |-------|--------------|
@@ -71,6 +98,11 @@ the logs — no real orders are possible in this mode.
 - `GET  /api/venus` — analysis engine: provider, per-catalyst calibration, recent learnings
 - `GET  /api/jupiter` — trading engine: live signals, measured edge, dynamic watchlist
 - `GET  /api/oracle` — ☿ Mercury: multi-horizon forecasts, out-of-sample Brier skill score, allocation and preservation state
+- `GET  /api/shield` — the regime shield and volatility scaling: SPY against its 200-day average, and the cut in force
+- `GET  /api/risk` — Sharpe against the realised T-bill rate, VaR, CVaR, skew, kurtosis, beta, drawdown
+- `GET  /api/audit` — the auditor's findings, and realised against modelled fill cost
+- `GET  /api/challenger` — the basket challenger's verdict on the research AI's proposed basket
+- `GET  /api/signal` — whether the move since the basket was bought is signal or noise, in units of its own normal swing
 - `GET  /api/broker` — broker status, account, positions, recent live orders
 - `POST /api/aplus?enable=true|false` — toggle A+ mode (top ~10% signals only)
 - `POST /api/emergency?stop=true|false` — emergency halt / resume
