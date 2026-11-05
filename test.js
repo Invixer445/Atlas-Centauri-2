@@ -6798,6 +6798,157 @@ check('a short bar history refuses to de-risk', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+//  v15.86 — THE SHIELD AND THE VOLATILITY SCALING READ FINISHED SESSIONS ONLY
+//  Alpaca builds today's daily bar live, and the bars endpoint's `end` defaults to now.
+//  So a mid-session refresh (every deploy reboots, and both timers run from boot) ended
+//  its daily series in a bar whose "close" was the live price. The shield was measured
+//  on the PREVIOUS close against the average through that close.
+// ════════════════════════════════════════════════════════════════════════════
+// New York midnight of a calendar day, which is how Alpaca stamps a daily bar: 04:00Z in
+// daylight time, 05:00Z in standard time. Worked out here with Intl, NOT with the helper
+// under test, so a broken helper cannot also build the fixtures it is checked against.
+const _nyHourFmt = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York',
+  hour: '2-digit', hourCycle: 'h23' });
+function nyMidnightISO(day) {
+  for (const h of ['04', '05']) {
+    const iso = `${day}T${h}:00:00Z`;
+    if (parseInt(_nyHourFmt.format(new Date(iso)), 10) % 24 === 0) return iso;
+  }
+  throw new Error(`no New York midnight found for ${day}`);
+}
+// The n weekdays strictly before `day`, oldest first.
+function weekdaysBefore(day, n) {
+  const out = [];
+  for (let ms = Date.parse(`${day}T12:00:00Z`) - 86400000; out.length < n; ms -= 86400000) {
+    const wd = new Date(ms).getUTCDay();
+    if (wd !== 0 && wd !== 6) out.unshift(new Date(ms).toISOString().slice(0, 10));
+  }
+  return out;
+}
+// A child process with the bars endpoint faked and the clock pinned. `series` maps
+// symbol -> [{ t: ISO stamp, c: close }]. `body` is async: at(iso) sets the clock, LOG
+// holds what the engine logged, and OUT(obj) reports back.
+function fakeBarsProbe(env, series, body) {
+  return weightProbe(env, `
+    const https = require('https'), { EventEmitter } = require('events');
+    const SERIES = ${JSON.stringify(series)};
+    https.request = (opts, cb) => {
+      const q = new URLSearchParams(String(opts.path).split('?')[1] || '');
+      const bars = {};
+      for (const s of (q.get('symbols') || '').split(','))
+        if (SERIES[s]) bars[s] = SERIES[s].map(b => ({ t: b.t, o: b.c, h: b.c, l: b.c, c: b.c, v: 1000 }));
+      const req = new EventEmitter();
+      req.end = () => setImmediate(() => {
+        const res = new EventEmitter(); res.statusCode = 200; cb(res);
+        res.emit('data', JSON.stringify({ bars, next_page_token: null })); res.emit('end');
+      });
+      req.destroy = () => {};
+      return req;
+    };
+    const LOG = [];
+    console.log = (...a) => { LOG.push(a.join(' ')); };
+    const at = (iso) => { const ms = Date.parse(iso); Date.now = () => ms; };
+    const OUT = (o) => process.stdout.write(JSON.stringify(o) + '\\n', () => process.exit(0));
+    (async () => { ${body} })().catch(e => OUT({ error: String((e && e.stack) || e) }));`);
+}
+
+check('a daily bar is counted only once its session is finished', () => {
+  const sec = iso => Date.parse(iso) / 1000;
+  const bars = [
+    { t: sec('2026-10-30T04:00:00Z'), c: 101 },    // Fri, daylight time
+    { t: sec('2026-11-02T05:00:00Z'), c: 102 },    // Mon, standard time (DST ended Nov 1)
+    { t: sec('2026-11-03T05:00:00Z'), c: 90 },     // Tue, the session in question
+  ];
+  const kept = (nowIso, list = bars) => I.completedDailyBars(list, Date.parse(nowIso)).bars.map(b => b.c).join(',');
+  // The calendar first: a bar's day is its New York date, on both sides of DST.
+  eq(I.nyDayHour(Date.parse('2026-10-30T04:00:00Z')).date, '2026-10-30', 'daylight-time midnight');
+  eq(I.nyDayHour(Date.parse('2026-11-03T05:00:00Z')).date, '2026-11-03', 'standard-time midnight');
+  const lateMon = I.nyDayHour(Date.parse('2026-11-03T04:59:00Z'));
+  ok(lateMon.date === '2026-11-02' && lateMon.hour === 23, `04:59Z on the 3rd is 23:59 ET on the 2nd, got ${JSON.stringify(lateMon)}`);
+  // Mid-session, Tuesday's bar is still forming: its "close" is the 11:00 print.
+  const mid = I.completedDailyBars(bars, Date.parse('2026-11-03T16:00:00Z'));
+  eq(mid.bars.map(b => b.c).join(','), '101,102', "11:00 ET: today's forming bar must be set aside");
+  eq(mid.setAside, 1, 'and reported as set aside');
+  eq(mid.today, '2026-11-03', 'today is the New York date');
+  // Closed but before 20:00 ET it still waits, by NEW YORK hours, not UTC ones.
+  eq(kept('2026-11-03T23:00:00Z'), '101,102', '18:00 ET is 23:00 UTC: still not counted');
+  eq(kept('2026-11-04T00:30:00Z'), '101,102', '19:30 ET: still not counted, though UTC is already on the 4th');
+  // From 20:00 ET it counts, so a late-evening refresh carries Tuesday's close into Wednesday.
+  eq(kept('2026-11-04T01:30:00Z'), '101,102,90', '20:30 ET: the finished bar must be counted');
+  eq(kept('2026-11-04T14:00:00Z'), '101,102,90', 'next morning: yesterday is simply yesterday');
+  // Before the open there is nothing of today to set aside.
+  const pre = I.completedDailyBars(bars.slice(0, 2), Date.parse('2026-11-03T13:00:00Z'));
+  ok(pre.bars.length === 2 && pre.setAside === 0, '08:00 ET: every finished bar is kept and nothing is set aside');
+  // A bar stamped after today cannot be finished, whatever the hour.
+  eq(kept('2026-11-03T03:00:00Z'), '101,102', '22:00 ET on the 2nd: the 2nd counts, a bar stamped the 3rd does not');
+  // Rubbish in, nothing thrown; the input is never modified.
+  eq(I.completedDailyBars(null).bars.length, 0, 'no bars in, no bars out');
+  eq(kept('2026-11-03T16:00:00Z', [{ t: NaN, c: 1 }]), '', 'an undated bar cannot be shown to be finished');
+  eq(bars.length, 3, 'the input array is untouched');
+  eq(I.DAILY_BAR_FINAL_HOUR_ET, 20, 'the cut-off is 20:00 ET, when after-hours ends');
+});
+
+check("mid-session, the shield reads yesterday's close, not the live price", () => {
+  // 230 finished sessions to Monday 2026-11-02, flat at 100 with Monday at 100.5, then
+  // Tuesday's bar still forming at 90. Read correctly the shield is risk-on: 100.5
+  // against an average of 100.0025. Counting the forming bar gives 90 against 99.9525,
+  // which is RISK-OFF on one intraday print, with the oldest finished bar pushed out.
+  const days = weekdaysBefore('2026-11-03', 230);
+  const spy = days.map((d, i) => ({ t: nyMidnightISO(d), c: i === days.length - 1 ? 100.5 : 100 }));
+  spy.push({ t: nyMidnightISO('2026-11-03'), c: 90 });
+  const r = fakeBarsProbe({ REGIME_SHIELD: 'on', REGIME_SHIELD_SYMBOL: 'SPY', REGIME_SHIELD_DAYS: '200' },
+    { SPY: spy }, `
+    at('2026-11-03T16:00:00Z');                       // Tuesday 11:00 ET
+    const okMid = await I.refreshRegimeShield();
+    const mid = I.regimeShieldStatus();
+    const midLog = LOG.filter(l => l.startsWith('[SHIELD]')).pop() || '';
+    at('2026-11-04T01:30:00Z');                       // Tuesday 20:30 ET, the bar is final
+    const okEve = await I.refreshRegimeShield();
+    OUT({ okMid, mid, midLog, okEve, eve: I.regimeShieldStatus() });`);
+  ok(!r.error, r.error);
+  eq(r.okMid, true, 'the mid-session refresh must publish a reading');
+  eq(r.mid.price, 100.5, "the price is Monday's close, not the 11:00 print");
+  near(r.mid.ma, (199 * 100 + 100.5) / 200, 1e-9, 'the average runs through Monday, over 200 finished sessions');
+  eq(r.mid.riskOff, false, 'so one intraday drop does not move the weights');
+  eq(r.mid.closeDate, '2026-11-02', 'and the status says which close it used');
+  ok(/\$100\.50 at the 2026-11-02 close/.test(r.midLog) && /2026-11-03 bar is not counted/.test(r.midLog),
+     `the log must name the close used and the bar set aside, got "${r.midLog}"`);
+  // After 20:00 ET the same bar is finished, so Tuesday's close is what Wednesday opens on.
+  eq(r.okEve, true, 'the evening refresh must publish a reading');
+  eq(r.eve.price, 90, "after 20:00 ET Tuesday's finished close is the reading");
+  eq(r.eve.closeDate, '2026-11-03', 'dated Tuesday');
+  eq(r.eve.riskOff, true, 'and a finished close below the average is acted on');
+});
+
+check('volatility scaling measures finished sessions: a forming bar is not a day', () => {
+  // QLD alternating +1% / -1% for 200 sessions: every 20-day window has the same
+  // volatility, so "now" equals "normal" and nothing is cut. Then Tuesday's bar is still
+  // forming, 15% down. Counted as a day, that partial move alone takes the 20-day
+  // volatility from about 16% to about 56% and cuts the sleeve to about 29% of its weight.
+  const days = weekdaysBefore('2026-11-03', 200);
+  let px = 100;
+  const qld = days.map((d, i) => {
+    if (i) px *= (i % 2 ? 1.01 : 0.99);
+    return { t: nyMidnightISO(d), c: px };
+  });
+  qld.push({ t: nyMidnightISO('2026-11-03'), c: px * 0.85 });
+  const env = { CORE_VOL_SCALING: 'on', CORE_BASKET_SOURCE: 'fixed', CORE_HOLD_SYMBOLS: 'QLD,BIL',
+                CORE_WEIGHTS: 'QLD:0.35,BIL:0.65', CORE_HOLD_FRACTION: '0.9',
+                CORE_VOL_NORMAL_DAYS: '120', CORE_VOL_LOOKBACK: '20' };
+  const r = fakeBarsProbe(env, { QLD: qld }, `
+    at('2026-11-03T16:00:00Z');                       // Tuesday 11:00 ET
+    const v = await I.refreshSleeveVol();
+    OUT({ v, mult: I.sleeveVolMultiplier(), log: LOG.filter(l => l.startsWith('[VOL]')).pop() || '' });`);
+  ok(!r.error, r.error);
+  ok(r.v && r.v.now > 0, `the refresh must produce a reading, got ${JSON.stringify(r.v)}`);
+  near(r.v.now, r.v.normal, 1e-9, 'the 20-day volatility through Monday equals its normal');
+  ok(r.mult > 0.999, `so the sleeve keeps its full weight, got ${r.mult}`);
+  eq(r.v.closeDate, '2026-11-02', "the reading is dated Monday's close");
+  ok(/through the 2026-11-02 close/.test(r.log) && /2026-11-03 bar is not counted/.test(r.log),
+     `the log must name the close used, got "${r.log}"`);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 //  v13.70 — THE TRADING SLEEVE MUST PAY FOR ITS OWN CAPITAL
 //  The ramp asked only "can Mercury forecast?" and never "does this layer keep money
 //  after costs?". Measured: -2.8% pooled across seven independent 60-day windows,

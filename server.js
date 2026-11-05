@@ -4729,6 +4729,57 @@ async function fetchBars(symbols, timeframe, startISO, keepPerSymbol, adjustment
   return out;
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+//  FINISHED DAILY BARS ONLY (15.86)
+// ════════════════════════════════════════════════════════════════════════════
+//  Alpaca builds TODAY's daily bar while the session trades. Its streaming docs say
+//  daily bars "contain all trades until the time they were emitted"; the bars endpoint's
+//  `end` defaults to now on a real-time feed (iex is one); and a daily bar is stamped at
+//  the left edge of its day, midnight New York, which is earlier than "now" all day. So
+//  a daily fetch at 11:00 ET ends in a bar whose "close" is the 11:00 price.
+//
+//  The regime shield and the volatility scaling were measured on FINISHED sessions: the
+//  previous close against the average through that close. Read mid-session (a deploy
+//  reboots the engine at any hour, and both refresh timers run from boot), the shield
+//  compared a live price instead. One intraday move could cut the risky weights to 30%,
+//  and the 200-bar window lost its oldest finished bar to the unfinished one.
+//
+//  THE RULE. A bar dated today in New York is set aside until 20:00 ET, and a bar dated
+//  after today is always set aside. Alpaca's trade-condition table lets extended-hours
+//  trades change a daily bar's VOLUME only, never its open, high, low or close, so the
+//  bar is final at the close and certainly once after-hours ends at 20:00. Keeping it
+//  from then on is not a nicety: dropping it at a 22:00 refresh would leave the shield
+//  one session stale into the next open, until the refresh after that.
+//
+//  Taken from the docs, not reproduced live (the local keys were refused). If Alpaca
+//  never sends an unfinished bar, this sets nothing aside mid-session, so it is correct
+//  either way.
+const DAILY_BAR_FINAL_HOUR_ET = 20;
+const _nyDayHourFmt = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York',
+  year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23' });
+
+// New York calendar date ('YYYY-MM-DD') and hour (0-23) of an epoch-MILLISECONDS instant.
+function nyDayHour(ms) {
+  const p = {};
+  for (const x of _nyDayHourFmt.formatToParts(new Date(ms))) p[x.type] = x.value;
+  return { date: `${p.year}-${p.month}-${p.day}`, hour: parseInt(p.hour, 10) % 24 };
+}
+
+// Pure. `bars` in fetchBars' shape ({ t: epoch SECONDS, c, ... }). Returns the bars of
+// finished sessions in their original order, how many were set aside, and today's New
+// York date, so the caller can say which close it used.
+function completedDailyBars(bars, nowMs = Date.now()) {
+  const list = Array.isArray(bars) ? bars : [];
+  const now = nyDayHour(nowMs);
+  const kept = list.filter(b => {
+    if (!b || !Number.isFinite(b.t)) return false;     // undated: cannot be shown to be finished
+    const day = nyDayHour(b.t * 1000).date;
+    if (day > now.date) return false;                  // stamped after today
+    return !(day === now.date && now.hour < DAILY_BAR_FINAL_HOUR_ET);
+  });
+  return { bars: kept, setAside: list.length - kept.length, today: now.date };
+}
+
 let _candleFetchInProgress = false;
 
 // Candle fetch window: allow from 9:00 AM ET (30 min pre-open) so gaps, uptick ratio,
@@ -6611,7 +6662,7 @@ function profitFloorCash(totalValue = getTotalValue()) {
 }
 
 // ── THE REGIME SHIELD: state, refresh and reading ──────────────────────────
-let _regimeShield = { price: null, ma: null, asOf: 0, bars: 0, lastRiskOff: null, flips: 0 };
+let _regimeShield = { price: null, ma: null, closeDate: null, asOf: 0, bars: 0, lastRiskOff: null, flips: 0 };
 
 // Pull daily closes for the shield symbol and recompute the average. Called at boot
 // and once a day; cheap (one request, a few hundred bars).
@@ -6623,10 +6674,15 @@ async function refreshRegimeShield() {
     // N would return ~0.69N bars and the average would be computed over the wrong
     // window, silently and with no error.
     const need = REGIME_SHIELD_DAYS + 10;
-    const startISO = new Date(Date.now() - Math.ceil(need * 1.55) * 86400000).toISOString();
+    const nowMs = Date.now();
+    const startISO = new Date(nowMs - Math.ceil(need * 1.55) * 86400000).toISOString();
     const bars = await fetchBars([REGIME_SHIELD_SYMBOL], '1Day', startISO, need);
-    const arr = (bars && bars[REGIME_SHIELD_SYMBOL]) || [];
-    const closes = arr.map(b => b.c).filter(c => Number.isFinite(c) && c > 0);
+    // FINISHED SESSIONS ONLY (15.86). Mid-session the newest bar is today's, still
+    // forming: its "close" is the live price, and the rule was never measured on that.
+    // See completedDailyBars.
+    const fin = completedDailyBars((bars && bars[REGIME_SHIELD_SYMBOL]) || [], nowMs);
+    const done = fin.bars.filter(b => Number.isFinite(b.c) && b.c > 0);
+    const closes = done.map(b => b.c);
     if (closes.length < REGIME_SHIELD_DAYS) {
       console.warn(`[SHIELD] ⚠️  Only ${closes.length} daily bars for ${REGIME_SHIELD_SYMBOL}, need ` +
                    `${REGIME_SHIELD_DAYS}. The shield stays OPEN (fully invested) until it has enough ` +
@@ -6636,17 +6692,20 @@ async function refreshRegimeShield() {
     const window = closes.slice(-REGIME_SHIELD_DAYS);
     const ma = window.reduce((a, b) => a + b, 0) / window.length;
     const price = closes[closes.length - 1];
+    const closeDate = nyDayHour(done[done.length - 1].t * 1000).date;
     if (!(ma > 0) || !(price > 0)) return false;
     const wasRiskOff = _regimeShield.lastRiskOff;
     const nowRiskOff = price < ma;
     if (wasRiskOff !== null && wasRiskOff !== nowRiskOff) _regimeShield.flips++;
-    _regimeShield = { price, ma, asOf: Date.now(), bars: closes.length,
+    _regimeShield = { price, ma, closeDate, asOf: Date.now(), bars: closes.length,
                       lastRiskOff: nowRiskOff, flips: _regimeShield.flips };
-    console.log(`[SHIELD] 🛡  ${REGIME_SHIELD_SYMBOL} $${price.toFixed(2)} vs its ${REGIME_SHIELD_DAYS}-day ` +
-                `average $${ma.toFixed(2)} (${((price / ma - 1) * 100).toFixed(2)}%) — ` +
+    console.log(`[SHIELD] 🛡  ${REGIME_SHIELD_SYMBOL} $${price.toFixed(2)} at the ${closeDate} close vs its ` +
+                `${REGIME_SHIELD_DAYS}-day average $${ma.toFixed(2)} through that close ` +
+                `(${((price / ma - 1) * 100).toFixed(2)}%) — ` +
                 (nowRiskOff
                   ? `RISK-OFF. The core steps down to ${(REGIME_SHIELD_FLOOR * 100).toFixed(0)}%.`
-                  : `risk-on, fully invested.`));
+                  : `risk-on, fully invested.`) +
+                (fin.setAside ? ` Today's ${fin.today} bar is not counted until ${DAILY_BAR_FINAL_HOUR_ET}:00 ET.` : ''));
     return true;
   } catch (e) {
     console.warn(`[SHIELD] refresh failed: ${e.message} — staying fully invested.`);
@@ -6844,7 +6903,8 @@ function riskReport() { return _riskReport; }
 // The asymmetry is not close, so every uncertain path resolves to "stay invested".
 function regimeShieldStatus(now = Date.now()) {
   const base = { enabled: REGIME_SHIELD_ON, riskOff: false, price: _regimeShield.price,
-                 ma: _regimeShield.ma, asOf: _regimeShield.asOf, stale: false,
+                 ma: _regimeShield.ma, closeDate: _regimeShield.closeDate || null,
+                 asOf: _regimeShield.asOf, stale: false,
                  flips: _regimeShield.flips, floor: REGIME_SHIELD_FLOOR };
   if (!REGIME_SHIELD_ON) return { ...base, reason: 'shield off (REGIME_SHIELD=on to enable)' };
   if (!(_regimeShield.price > 0) || !(_regimeShield.ma > 0))
@@ -7117,7 +7177,7 @@ const CORE_VOL_SCALING = (process.env.CORE_VOL_SCALING || 'on').toLowerCase() !=
 const CORE_VOL_LOOKBACK = Math.max(5, Math.min(120, parseInt(process.env.CORE_VOL_LOOKBACK || '20', 10)));
 const CORE_VOL_NORMAL_DAYS = Math.max(120, Math.min(2520, parseInt(process.env.CORE_VOL_NORMAL_DAYS || '1260', 10)));
 const CORE_VOL_MAX_AGE_MS = 48 * 3600 * 1000;
-let _sleeveVol = { now: null, normal: null, asOf: 0, symbols: [] };
+let _sleeveVol = { now: null, normal: null, closeDate: null, asOf: 0, symbols: [] };
 
 // Pure: the multiplier from two volatility readings. Exported so the rule is tested by
 // what it returns, not by the text around it.
@@ -7153,10 +7213,19 @@ async function refreshSleeveVol() {
     if (!syms.some(k => CASH_EQUIVALENT_SYMBOLS.has(k))) return null;   // nowhere to move it
     const risky = syms.filter(k => !CASH_EQUIVALENT_SYMBOLS.has(k) && base[k] > 0);
     if (!risky.length) return null;
-    const startISO = new Date(Date.now() - Math.ceil((CORE_VOL_NORMAL_DAYS + CORE_VOL_LOOKBACK + 20) * 1.55) * 86400000).toISOString();
+    const nowMs = Date.now();
+    const startISO = new Date(nowMs - Math.ceil((CORE_VOL_NORMAL_DAYS + CORE_VOL_LOOKBACK + 20) * 1.55) * 86400000).toISOString();
     const bars = await fetchBars(risky, '1Day', startISO, CORE_VOL_NORMAL_DAYS + CORE_VOL_LOOKBACK + 20, 'all');
+    // FINISHED SESSIONS ONLY (15.86), as for the shield. Mid-session the newest bar is
+    // today's, and its "return" is a few hours of movement counted as a whole day of the
+    // 20-day window. See completedDailyBars.
     const close = {};
-    for (const k of risky) close[k] = new Map(((bars && bars[k]) || []).map(b => [b.t, b.c]));
+    let setAside = 0, today = null;
+    for (const k of risky) {
+      const fin = completedDailyBars((bars && bars[k]) || [], nowMs);
+      close[k] = new Map(fin.bars.map(b => [b.t, b.c]));
+      setAside += fin.setAside; today = fin.today;
+    }
     let ts = [...close[risky[0]].keys()];
     for (const k of risky) ts = ts.filter(t => close[k].has(t));
     ts.sort((a, b) => a - b);
@@ -7176,15 +7245,17 @@ async function refreshSleeveVol() {
     const past = vols.slice(0, -1).sort((a, b) => a - b);
     const normal = past[Math.floor(past.length / 2)];
     if (!(now > 0) || !(normal > 0)) return null;
-    _sleeveVol = { now, normal, asOf: Date.now(), symbols: risky };
+    const closeDate = nyDayHour(ts[ts.length - 1] * 1000).date;
+    _sleeveVol = { now, normal, closeDate, asOf: Date.now(), symbols: risky };
     const mult = volMultiplierFrom(normal, now);
     const riskyBase = risky.reduce((a, k) => a + base[k], 0);
     console.log(`[VOL] 🌡  ${risky.join('+')} ${CORE_VOL_LOOKBACK}-day volatility ${(now * 100).toFixed(0)}% ` +
-      `against a normal ${(normal * 100).toFixed(0)}% — ` +
+      `through the ${closeDate} close, against a normal ${(normal * 100).toFixed(0)}% — ` +
       (mult >= 0.999
         ? `at or below normal, full weight (${(riskyBase * 100).toFixed(0)}% of the core).`
         : `running hot, holding ${(mult * 100).toFixed(0)}% of it: ${(riskyBase * mult * 100).toFixed(1)}% of the core ` +
-          `instead of ${(riskyBase * 100).toFixed(0)}%, the rest in T-bills.`));
+          `instead of ${(riskyBase * 100).toFixed(0)}%, the rest in T-bills.`) +
+      (setAside ? ` Today's ${today} bar is not counted until ${DAILY_BAR_FINAL_HOUR_ET}:00 ET.` : ''));
     return _sleeveVol;
   } catch (e) {
     console.warn(`[VOL] refresh failed: ${e.message} — staying at full weight`);
@@ -12761,6 +12832,7 @@ app.get('/api/shield', (req, res) => {
       enabled: CORE_VOL_SCALING,
       sleeve: _sleeveVol.symbols,
       volNow: _sleeveVol.now, volNormal: _sleeveVol.normal,
+      closeDate: _sleeveVol.closeDate || null,
       multiplier: sleeveVolMultiplier(),
       asOf: _sleeveVol.asOf || null,
       note: 'the risky sleeve keeps min(1, normal / now) of its weight — cut-only, never above 1'
@@ -13617,6 +13689,7 @@ module.exports = {
     _getFillCostSamples: () => _fillCostSamples,
     _resetFillCostSamples: () => { _fillCostSamples = []; _auditLastLogged = {}; },
     regimeShieldStatus, regimeShieldCeiling, refreshRegimeShield,
+    completedDailyBars, nyDayHour, DAILY_BAR_FINAL_HOUR_ET,
     coreDefensiveWeight, CASH_EQUIVALENT_SYMBOLS, applyRegimeShift, coreBaseWeightMap,
     volMultiplierFrom, sleeveVolMultiplier, refreshSleeveVol, rollingVol, CORE_VOL_SCALING,
     CORE_VOL_LOOKBACK, CORE_VOL_NORMAL_DAYS, _sleeveVolPoke: (v) => { _sleeveVol = { ..._sleeveVol, ...v }; },
