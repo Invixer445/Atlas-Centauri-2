@@ -6438,19 +6438,27 @@ check('the challenger reports by default and does NOT act', () => {
   ok(I.CHALLENGER_MIN_T >= 1, `and a real margin, got t=${I.CHALLENGER_MIN_T}`);
 });
 
+// Daily bars as fetchBars returns them: a close and an epoch-SECONDS stamp, one bar a day
+// from Mon 2026-01-05. Since 15.87 returns are matched on these dates, so a fixture
+// without them would test nothing.
+function datedBars(closes, from = 0) {
+  return closes.map((c, k) => ({ t: Date.UTC(2026, 0, 5 + from + k, 5) / 1000, c }));
+}
+
 check('basket returns are equal-weight unless weights are given', () => {
   // A rises 10% a day, B is flat, so the two weightings MUST differ — a test where both
   // names move identically would pass against a function that ignored weights entirely.
-  const bars = { A: [{ c: 100 }, { c: 110 }, { c: 121 }], B: [{ c: 50 }, { c: 50 }, { c: 50 }] };
+  const bars = { A: datedBars([100, 110, 121]), B: datedBars([50, 50, 50]) };
   const eqw = I.basketDailyReturns(['A', 'B'], bars);
-  eq(+eqw[0].toFixed(4), 0.05, 'equal weight averages the two');
+  eq(+eqw[0].r.toFixed(4), 0.05, 'equal weight averages the two');
   const w = I.basketDailyReturns(['A', 'B'], bars, { A: 0.7, B: 0.3 });
-  eq(+w[0].toFixed(4), 0.07, '70/30 leans toward A');
-  ok(eqw[0] !== w[0], 'and the two must actually differ');
+  eq(+w[0].r.toFixed(4), 0.07, '70/30 leans toward A');
+  ok(eqw[0].r !== w[0].r, 'and the two must actually differ');
+  eq(eqw[0].date, '2026-01-06', 'and each return carries the session it belongs to');
 });
 
 check('a basket with too little coverage returns nothing rather than a guess', () => {
-  const bars = { A: [{ c: 100 }, { c: 110 }] };
+  const bars = { A: datedBars([100, 110]) };
   eq(I.basketDailyReturns(['A', 'X', 'Y'], bars), null,
      'one name of three is not a basket — scoring it would compare a single stock to an index');
   eq(I.basketDailyReturns([], {}), null, 'and an empty list is not a basket either');
@@ -6458,21 +6466,25 @@ check('a basket with too little coverage returns nothing rather than a guess', (
 
 check('ragged histories align to the shortest, not the longest', () => {
   // Otherwise whichever member happens to have more history silently dominates the
-  // comparison, and the "edge" is really a different measurement window.
-  const bars = { A: [{ c: 90 }, { c: 100 }, { c: 110 }, { c: 121 }],
-                 B: [{ c: 50 }, { c: 50 }, { c: 50 }] };
+  // comparison, and the "edge" is really a different measurement window. Since 15.87 the
+  // overlap is found by DATE: B's three bars are the last three sessions because their
+  // stamps say so, not because they are the last three entries.
+  const bars = { A: datedBars([90, 100, 110, 121]), B: datedBars([50, 50, 50], 1) };
   const r = I.basketDailyReturns(['A', 'B'], bars);
   eq(r.length, 2, `both must be truncated to the shorter span, got ${r.length}`);
-  eq(+r[0].toFixed(4), 0.05, 'and the overlap must be the one that is scored');
+  eq(+r[0].r.toFixed(4), 0.05, 'and the overlap must be the one that is scored');
+  eq(r[0].date, '2026-01-07', 'starting at the first session both names can return from');
 });
 
 check('hostile bar data cannot produce a number', () => {
-  const junk = { A: [{ c: NaN }, { c: 110 }], B: [{ c: 0 }, { c: -5 }] };
+  const junk = { A: datedBars([NaN, 110]), B: datedBars([0, -5]) };
   const r = I.basketDailyReturns(['A', 'B'], junk);
-  ok(r === null || r.every(x => Number.isFinite(x)),
+  ok(r === null || r.every(x => Number.isFinite(x.r)),
      'non-finite or non-positive closes must be dropped, never propagated');
-  eq(I.basketDailyReturns(['A'], { A: [{ c: 100 }] }), null,
+  eq(I.basketDailyReturns(['A'], { A: datedBars([100]) }), null,
      'a single bar yields no return and must not be read as zero');
+  eq(I.basketDailyReturns(['A'], { A: datedBars(['100', '110']) }), null,
+     'nor do closes that arrive as strings');
 });
 
 check('the win rule itself requires BOTH the sample and the margin', () => {
@@ -8925,6 +8937,370 @@ check('the exit sweep checks the price BEFORE it moves the high-water mark', () 
   }
   const ora = src.slice(src.indexOf("if (lots.some(p => p._exiting || p._pendingRung != null)) continue;"));
   ok(/plausiblePrice\(ticker, px, 'Mercury exit held'\)/.test(ora.slice(0, 400)), 'and Mercury\'s re-evaluation does the same');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  15.87 — THE BASKET CHALLENGER MATCHES RETURNS ON DATES, AND IS SCORED AGAINST THE
+//  CONTROL LOGGED WITH THE PROPOSAL. basketDailyReturns threw the bar dates away and
+//  lined names up by counting back from each one's newest bar, and the evaluator paired
+//  its three legs the same way, so one missing bar slid a whole history a session
+//  against the others. And the incumbent was today's core replayed over old sessions,
+//  so every core change silently rewrote the test.
+// ════════════════════════════════════════════════════════════════════════════
+
+// THE 15.85 CODE, FROZEN: the witness that the fixtures below can see the fault they
+// exist to catch. Never "fix" these two. If they ever score the levered market right,
+// the fixtures have gone blind.
+function oldBasketDailyReturns(names, barsBySym, weights = null) {
+  const series = [];
+  for (const sym of names) {
+    const b = barsBySym[sym];
+    if (!Array.isArray(b) || b.length < 2) continue;
+    series.push({ sym, closes: b.map(x => x.c).filter(c => Number.isFinite(c) && c > 0) });
+  }
+  if (!series.length) return null;
+  const n = Math.min(...series.map(x => x.closes.length));
+  if (!(n >= 2)) return null;
+  if (series.length < Math.ceil(names.length * 0.6)) return null;
+  const out = [];
+  for (let i = 1; i < n; i++) {
+    let r = 0, wsum = 0;
+    for (const x of series) {
+      const a = x.closes[x.closes.length - n + i - 1], c = x.closes[x.closes.length - n + i];
+      if (!(a > 0) || !(c > 0)) continue;
+      const w = weights && Number.isFinite(weights[x.sym]) ? weights[x.sym] : 1;
+      r += w * (c / a - 1); wsum += w;
+    }
+    out.push(wsum > 0 ? r / wsum : 0);
+  }
+  return out.length ? out : null;
+}
+function oldChallengerScore(entry, bars) {
+  const cR = oldBasketDailyReturns(entry.basket, bars), iR = oldBasketDailyReturns(entry.control, bars);
+  const rfR = oldBasketDailyReturns(['BIL'], bars);
+  const n = Math.min(cR.length, iR.length, rfR.length);
+  const cx = [], ix = [];
+  for (let i = 0; i < n; i++) {
+    const rf = rfR[rfR.length - n + i];
+    cx.push(cR[cR.length - n + i] - rf); ix.push(iR[iR.length - n + i] - rf);
+  }
+  const b = I.betaOf(cx, ix);
+  return { beta: b, alphaAnnual: cx.reduce((a, x, i) => a + x - b * ix[i], 0) / n * 252 };
+}
+
+// Weekdays from Mon 2026-01-05, stamped the way fetchBars stamps a daily bar: epoch
+// seconds at New York midnight.
+function weekdays(n) {
+  const out = [];
+  for (let d = Date.UTC(2026, 0, 5, 5); out.length < n; d += 86400000) {
+    const wd = new Date(d).getUTCDay();
+    if (wd >= 1 && wd <= 5) out.push(d / 1000);
+  }
+  return out;
+}
+const sessionOf = (t) => new Date(t * 1000).toISOString().slice(0, 10);
+
+// A market where the challenger (L1-L3) is EXACTLY the control (AAA-CCC) levered 2x over
+// T-bills, every session: c = rf + 2(m - rf) [+ alpha + noise]. With alpha = noise = 0
+// the true beta is 2 and the true alpha 0 to the last digit, so ONE return paired with
+// the wrong session shows. The control's names move identically, so a session scored
+// over two of the three is still the control's true move. QQQ and SPY wander on their
+// own, as a core that has nothing to do with the test.
+function leveredMarket(seed, sessions = 90, alpha = 0, noise = 0) {
+  const rnd = mulberry(seed), t = weekdays(sessions + 1);
+  const px = { AAA: [100], BBB: [80], CCC: [60], L1: [50], L2: [40], L3: [30],
+               BIL: [91.5], QQQ: [400], SPY: [500] };
+  for (let k = 1; k <= sessions; k++) {
+    const m = (rnd() - 0.5) * 0.04, rf = 0.00015 + (rnd() - 0.5) * 0.0001;
+    const c = rf + 2 * (m - rf) + alpha + noise * (rnd() - 0.5);
+    for (const s of ['AAA', 'BBB', 'CCC']) px[s].push(px[s][k - 1] * (1 + m));
+    for (const s of ['L1', 'L2', 'L3']) px[s].push(px[s][k - 1] * (1 + c));
+    px.BIL.push(px.BIL[k - 1] * (1 + rf));
+    px.QQQ.push(px.QQQ[k - 1] * (1 + (rnd() - 0.5) * 0.05));
+    px.SPY.push(px.SPY[k - 1] * (1 + (rnd() - 0.5) * 0.03));
+  }
+  const bars = {};
+  for (const s of Object.keys(px)) bars[s] = px[s].map((c, k) => ({ t: t[k], c }));
+  return { bars, t };
+}
+const LEVERED = { at: '2026-01-02T15:00:00.000Z', basket: ['L1', 'L2', 'L3'], control: ['AAA', 'BBB', 'CCC'] };
+
+check('one missing bar no longer slides a history against the others (15.87)', () => {
+  const core = ['AAA', 'BBB', 'CCC'];
+  const clean = I.scoreBasketChallenger(LEVERED, leveredMarket(11).bars, core);
+  near(clean.beta, 2, 1e-9, 'premise: the clean fixture is exactly 2x levered —');
+  near(clean.alphaAnnual, 0, 1e-9, 'premise: with no alpha —');
+  eq(clean.sessions, 90, 'premise: and every session is scored —');
+  const without = (b, s, t) => { b[s] = b[s].filter(x => x.t !== t); };
+  // A challenger STOCK that skips a session is held through it rather than dropped; that
+  // rule has its own check below ('a halted stock is held through the halt').
+  const gaps = {
+    'a control name skips a session':       [(b, t) => without(b, 'AAA', t[40]), 88],
+    'the T-bill leg skips a session':       [(b, t) => without(b, 'BIL', t[60]), 88],
+    'the WHOLE control skips a session':    [(b, t) => ['AAA', 'BBB', 'CCC'].forEach(s => without(b, s, t[50])), 88],
+    'a control name has no bar yet today':  [(b) => b.AAA.pop(), 89],
+    'the challenger has no bars yet today': [(b) => ['L1', 'L2', 'L3'].forEach(s => b[s].pop()), 89],
+  };
+  for (const [what, [gap, sessions]] of Object.entries(gaps)) {
+    const { bars, t } = leveredMarket(11);
+    gap(bars, t);
+    const v = I.scoreBasketChallenger(LEVERED, bars, core);
+    near(v.beta, 2, 1e-9, `${what}: beta`);
+    near(v.alphaAnnual, 0, 1e-9, `${what}: alpha`);
+    // The control needs every fund that carries weight, and a session counts only when
+    // the one before it does too: a session a leg did not see is dropped, along with the
+    // one after it — never folded into a two-day return.
+    eq(v.sessions, sessions, `${what}: sessions scored`);
+  }
+  // THE WITNESS. The same fixtures through the 15.85 code: it reads beta from -0.38 to
+  // 2.56 on these, where the truth is exactly 2. A mid-session check before the stocks
+  // printed (the last case) left it measuring nothing at all.
+  for (const what of ['a control name skips a session', 'the WHOLE control skips a session',
+                      'a control name has no bar yet today', 'the challenger has no bars yet today']) {
+    const gap = gaps[what][0];
+    const { bars, t } = leveredMarket(11);
+    gap(bars, t);
+    const o = oldChallengerScore(LEVERED, bars);
+    ok(Math.abs(o.beta - 2) > 0.1,
+       `premise: the 15.85 code must get "${what}" visibly wrong, or this fixture proves nothing — beta ${o.beta}`);
+  }
+});
+
+check('coverage is judged per session: a thin day is left out, not estimated (15.87)', () => {
+  const t = weekdays(8);
+  // Five names growing at different rates, so two of them do not average to all five.
+  const grow = (step) => t.map((tt, k) => ({ t: tt, c: 100 * (1 + step) ** k }));
+  const bars = { A: grow(0.01), B: grow(0.02), C: grow(0.03), D: grow(0.04), E: grow(0.05) };
+  // Session 3: only A and B printed. Session 6: D and E did not.
+  for (const s of ['C', 'D', 'E']) bars[s] = bars[s].filter(x => x.t !== t[3]);
+  for (const s of ['D', 'E']) bars[s] = bars[s].filter(x => x.t !== t[6]);
+  const r = I.basketDailyReturns(['A', 'B', 'C', 'D', 'E'], bars);
+  eq(r.map(x => x.date).join(','), [1, 2, 5, 6, 7].map(k => sessionOf(t[k])).join(','),
+     'two of five is under 60%: session 3 is left out, and so is session 4, because the ' +
+     'session before it was too thin to start from; three of five is 60%, so sessions 6 ' +
+     'and 7 count —');
+  near(r[0].r, 0.03, 1e-12, 'a full session averages all five');
+  // D and E did not print on session 6: they are held flat through it, and their two-day
+  // move lands on session 7, when they print again.
+  near(r[3].r, (0.01 + 0.02 + 0.03) / 5, 1e-12, 'names that missed a session are held flat through it');
+  near(r[4].r, (0.01 + 0.02 + 0.03 + (1.04 ** 2 - 1) + (1.05 ** 2 - 1)) / 5, 1e-12,
+       'and their move lands on the session they print again');
+});
+
+check('a bar that cannot be dated is left out, never counted by position (15.87)', () => {
+  const t = weekdays(4);
+  const bars = { A: t.map((tt, k) => ({ t: tt, c: 100 + k })), B: t.map((tt, k) => ({ t: tt, c: 50 + 2 * k })) };
+  // A millisecond stamp read as seconds lands ~56,000 years out, and a negative one in
+  // 1969: either would put a phantom session in the calendar. With two names the
+  // coverage rule happens to hide that, so the one-name basket is the real test.
+  const junk = [{ c: 999 }, { t: NaN, c: 5 }, { t: 'x', c: 6 }, { t: t[2] * 1000, c: 7 }, { t: -86400, c: 8 }];
+  const hostile = { A: [...bars.A.slice(0, 2), ...junk, ...bars.A.slice(2)], B: bars.B };
+  for (const names of [['A', 'B'], ['A']]) {
+    eq(JSON.stringify(I.basketDailyReturns(names, hostile)), JSON.stringify(I.basketDailyReturns(names, bars)),
+       `${names.join('+')}: a bar with no stamp, a junk stamp or a stamp not in seconds changes nothing —`);
+  }
+});
+
+check('the challenger is scored against its logged control, not the live core (15.87)', () => {
+  const { bars } = leveredMarket(23, 90, 0.001, 0.01);
+  const asLogged = I.scoreBasketChallenger(LEVERED, bars, ['AAA', 'BBB', 'CCC']);
+  const later    = I.scoreBasketChallenger(LEVERED, bars, ['QQQ', 'SPY', 'BIL']);
+  ok(asLogged.ready && later.ready, 'premise: both score');
+  eq(later.incumbent.join(','), 'AAA,BBB,CCC', 'scored against what was logged, not what is held now');
+  for (const k of ['sessions', 'beta', 'alphaAnnual', 't', 'challengerReturn', 'incumbentReturn', 'wins']) {
+    eq(later[k], asLogged[k], `${k} must not move when the live core does:`);
+  }
+  eq(asLogged.controlIsLive, true, 'logged and live agree');
+  eq(later.controlIsLive, false, 'and the verdict says so when they no longer do');
+  // LEVERED carries no weights, as every entry before 15.87: it may report, never switch.
+  eq(asLogged.switchBlocked, 'unlogged', 'an entry without logged weights reports only');
+  eq(later.switchBlocked, 'names', 'and a changed core is named as the reason when it is one');
+});
+
+check("the control is scored at its logged weights (15.87)", () => {
+  const { bars, t } = leveredMarket(31);
+  const ret = (s, k) => bars[s][k].c / bars[s][k - 1].c - 1;
+  let held = 1;
+  for (let k = 1; k < t.length; k++) held *= 1 + (0.8 * ret('QQQ', k) + 0.2 * ret('SPY', k));
+  const entry = { ...LEVERED, control: ['QQQ', 'SPY'], controlWeights: { QQQ: 0.8, SPY: 0.2 } };
+  const v = I.scoreBasketChallenger(entry, bars, ['QQQ', 'SPY']);
+  near(v.incumbentReturn, held - 1, 1e-12, 'the incumbent is 80/20, as logged');
+  eq(v.weightsLogged, true, 'and the verdict knows its weights were logged');
+});
+
+check("an entry without usable logged weights is scored at TODAY's rules, not equal weight (15.87)", () => {
+  // In this suite's own environment today's rules ARE equal weight for two names, so a
+  // fallback to plain equal weight would pass any check run here. The child has a real
+  // 70/30 allocation instead.
+  const r = weightProbe({ CORE_WEIGHTS: 'QQQ:0.7,SPY:0.3', GROWTH_SLEEVE_FRACTION: '0' }, `
+${mulberry}
+${weekdays}
+${leveredMarket}
+const { bars, t } = leveredMarket(31);
+const ret = (s, k) => bars[s][k].c / bars[s][k - 1].c - 1;
+const heldAt = (wq, ws) => { let g = 1; for (let k = 1; k < t.length; k++) g *= 1 + (wq * ret('QQQ', k) + ws * ret('SPY', k)) / (wq + ws); return g - 1; };
+const base = { at: '2026-01-02T15:00:00.000Z', basket: ['L1', 'L2', 'L3'], control: ['QQQ', 'SPY'] };
+const cases = [undefined, { QQQ: 0.8 }, { QQQ: 0.8, SPY: -0.2 }, { QQQ: NaN, SPY: 1 }, { QQQ: 0, SPY: 0 }, [0.8, 0.2], 'QQQ:0.8'];
+const rows = cases.map(w => {
+  const v = I.scoreBasketChallenger(w === undefined ? base : { ...base, controlWeights: w }, bars, ['QQQ', 'SPY']);
+  return { w: String(JSON.stringify(w)), logged: v.weightsLogged,
+           off: Math.abs(v.incumbentReturn - heldAt(0.7, 0.3)), offEqual: Math.abs(v.incumbentReturn - heldAt(0.5, 0.5)) };
+});
+I.cancelPendingSave();
+console.log(JSON.stringify({ today: I.coreBaseWeightMap(['QQQ', 'SPY']), rows }));
+process.exit(0);
+`);
+  near(r.today.QQQ, 0.7, 1e-9, "premise: today's rules in the child are 70/30 —");
+  eq(r.rows.length, 7, 'premise: every case ran');
+  for (const x of r.rows) {
+    eq(x.logged, false, `${x.w}: not a usable logged map —`);
+    ok(x.off < 1e-12, `${x.w}: scored at today's 70/30, but off by ${x.off}`);
+    ok(x.offEqual > 1e-4, `${x.w}: and visibly not at plain equal weight`);
+  }
+});
+
+check('with no T-bill series at all, the constant rate stands in for every session (15.87)', () => {
+  const { bars } = leveredMarket(41);
+  delete bars.BIL;
+  const v = I.scoreBasketChallenger(LEVERED, bars, ['AAA', 'BBB', 'CCC']);
+  ok(v.ready && v.sessions === 90, `no session is dropped for want of a T-bill bar when there are none, got ${v.sessions}`);
+  ok(/^constant /.test(v.riskFree), `and the verdict says which rate it used, got ${v.riskFree}`);
+});
+
+check('the guard compares risky sleeves: order, case and the T-bill fund do not count (15.87)', () => {
+  ok(I.sameRiskySleeve(['QQQ', 'SPY', 'BIL'], ['spy', 'QQQ', 'SGOV']), 'same indexes, another T-bill fund: same core');
+  ok(I.sameRiskySleeve(['QQQ', 'QQQ', 'SPY'], ['SPY', 'QQQ']), 'a repeat is not a difference');
+  ok(!I.sameRiskySleeve(['QQQ', 'SPY', 'BIL'], ['QQQ', 'BIL']), 'a dropped index is a different core');
+  ok(!I.sameRiskySleeve(['QQQ', 'BIL'], ['QQQ', 'SPY', 'BIL']), 'so is an added one');
+  ok(!I.sameRiskySleeve(['QLD', 'BIL'], ['QQQ', 'SPY', 'BIL']), 'and so is a replaced one');
+  ok(!I.sameRiskySleeve(['BIL'], ['BIL']) && !I.sameRiskySleeve([], []),
+     'a core of T-bills alone has no risky sleeve to hand over, so it never matches');
+});
+
+check('a halted stock is held through the halt, and its move lands when it trades again (15.87)', () => {
+  // Dropping a name's move across its own missing bars meant a stock halted for news
+  // that reopened far lower never touched the score at all. Stocks halt and index funds
+  // do not, so that error only ever flattered the challenger.
+  const t = weekdays(7);
+  const up = (step, upto = 7) => t.slice(0, upto).map((tt, k) => ({ t: tt, c: 100 * (1 + step) ** k }));
+  // H halts after session 2 and reopens 40% lower on session 5. D's bars stop after
+  // session 4 (delisted, or no bar yet today): past its last bar it is absent, not held.
+  const bars = { A: up(0.01), B: up(0.01), D: up(0.02, 5),
+                 H: [0, 1, 2].map(k => ({ t: t[k], c: 100 })).concat([5, 6].map(k => ({ t: t[k], c: 60 }))) };
+  const r = I.basketDailyReturns(['A', 'B', 'H', 'D'], bars);
+  const on = (k) => (r.find(x => x.date === sessionOf(t[k])) || {}).r;
+  near(on(3), (0.01 + 0.01 + 0 + 0.02) / 4, 1e-12, 'a halted name is held flat through the halt, not dropped —');
+  near(on(5), (0.01 + 0.01 - 0.4) / 3, 1e-12, 'its 40% fall lands on the day it reopens —');
+  near(on(6), (0.01 + 0.01 + 0) / 3, 1e-12, 'and a name whose bars have ended is absent, not held at 0% —');
+});
+
+check('the control needs every fund that carries weight on a session (15.87)', () => {
+  const { bars, t } = leveredMarket(51, 160);
+  const entry = { ...LEVERED, control: ['QQQ', 'SPY', 'BIL'], controlWeights: { QQQ: 0.4, SPY: 0.4, BIL: 0.2 } };
+  eq(I.scoreBasketChallenger(entry, bars, ['QQQ', 'SPY', 'BIL']).sessions, 160,
+     'premise: with every bar, every session is scored —');
+  // A bar fetch cut short (fetchBars keeps what it has when a later page fails) leaves
+  // SPY with only its newest bars. Under the 60% rule QQQ and BIL alone "covered" the
+  // early sessions, re-weighted 67/33: a different benchmark under the same name.
+  const cut = { ...bars, SPY: bars.SPY.slice(-100) };
+  const v = I.scoreBasketChallenger(entry, cut, ['QQQ', 'SPY', 'BIL']);
+  eq(v.sessions, 99, 'the window shortens to where every weighted fund has bars —');
+  eq(v.from, sessionOf(t[62]), 'starting at the first session SPY can return from —');
+  const gone = { ...bars };
+  delete gone.SPY;
+  eq(I.scoreBasketChallenger(entry, gone, ['QQQ', 'SPY', 'BIL']).ready, false,
+     'and with a weighted fund missing outright there is no benchmark, so no verdict');
+});
+
+check('a win may switch the core only when nothing about the core has changed (15.87)', () => {
+  const v = { challenger: ['L1', 'L2'], incumbent: ['QQQ', 'SPY', 'BIL'], weightsLogged: true,
+              controlWeights: { QQQ: 0.4, SPY: 0.4, BIL: 0.2 } };
+  const W = { QQQ: 0.4, SPY: 0.4, BIL: 0.2 };
+  const code = (x) => (x ? x.code : null);
+  eq(code(I.challengerSwitchBlock(v, ['QQQ', 'SPY', 'BIL'], W, false)), null, 'the same core may switch');
+  eq(code(I.challengerSwitchBlock(v, ['SPY', 'QQQ', 'SGOV'], { QQQ: 0.35, SPY: 0.35, SGOV: 0.3 }, false)), null,
+     'and so may one that only moved between T-bill funds or changed how much sits in them');
+  eq(code(I.challengerSwitchBlock(v, ['QQQ', 'SPY', 'BIL'], { QQQ: 0.56, SPY: 0.24, BIL: 0.2 }, false)), 'weights',
+     'the same names split 70/30 instead of 50/50 are another benchmark —');
+  eq(code(I.challengerSwitchBlock(v, ['QQQ', 'SPY', 'BIL'], { QQQ: 0.405, SPY: 0.395, BIL: 0.2 }, false)), null,
+     'but half a point of drift is not');
+  eq(code(I.challengerSwitchBlock({ ...v, incumbent: ['QQQ', 'BIL'], controlWeights: { QQQ: 0.8, BIL: 0.2 } },
+                                  ['QQQ', 'SPY', 'BIL'], W, false)), 'names', 'an added index is another core —');
+  eq(code(I.challengerSwitchBlock({ ...v, weightsLogged: false }, ['QQQ', 'SPY', 'BIL'], W, false)), 'unlogged',
+     'an entry logged without weights reports only —');
+  eq(code(I.challengerSwitchBlock(v, ['QQQ', 'SPY', 'BIL'], W, true)), 'growth',
+     'while the growth sleeve is on, nothing switches —');
+  eq(code(I.challengerSwitchBlock(v, ['BIL', 'L2', 'L1'], { BIL: 0.2, L1: 0.4, L2: 0.4 }, false)), 'already',
+     'and a core that already holds the basket is not told to archive anything');
+});
+
+check('a win switches the core only while its control is still the live core (15.87)', () => {
+  // The REAL tick, auto-switch on, offline: the proposal log and the bars are passed in,
+  // and every name the switch touches already has a price, so nothing is fetched. The
+  // data directory is a throwaway, so the proposal record and any state write land there.
+  const fs = require('fs'), os = require('os'), path = require('path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-challenger-'));
+  let r;
+  try {
+    r = weightProbe({ ATLAS_DATA_DIR: dir, BASKET_CHALLENGER: 'on', BASKET_CHALLENGER_AUTO: 'on',
+                      CHALLENGER_MIN_DAYS: '60', CHALLENGER_MIN_T: '3', RISK_FREE_PROXY: 'BIL',
+                      CASH_EQUIVALENTS: 'BIL,SGOV', CORE_WEIGHTS: '', GROWTH_SLEEVE_FRACTION: '0',
+                      CORE_BASKET_SOURCE: 'fixed' }, `
+${mulberry}
+${weekdays}
+${leveredMarket}
+// A real edge: 0.3%/day of alpha over the levered control, plus noise. t is about 24.
+const { bars } = leveredMarket(5, 90, 0.003, 0.004);
+for (const s of ['L1', 'L2', 'L3']) I.marketData[s] = { price: 100, prevClose: 100, lastUpdate: Date.now() };
+const control = ['AAA', 'BBB', 'BIL'];
+// Logged as 15.87 logs it: the names AND the weights the core had.
+const logged = { at: '2025-06-02T15:00:00.000Z', basket: ['L1', 'L2', 'L3'], control,
+                 controlWeights: I.coreBaseWeightMap(control) };
+const { controlWeights, ...older } = logged;
+const setCore = (xs) => { I.CORE_HOLD_SYMBOLS.length = 0; I.CORE_HOLD_SYMBOLS.push(...xs); };
+const tick = async (entry, core) => {
+  if (core) setCore(core);
+  const v = await I.basketChallengerTick({ log: [entry], bars });
+  return { wins: !!(v && v.wins), isLive: v ? v.controlIsLive : null,
+           blocked: v ? v.switchBlocked : 'no verdict', after: [...I.CORE_HOLD_SYMBOLS] };
+};
+(async () => {
+  const out = {};
+  out.live = await tick(logged, control);
+  out.already = await tick(logged, null);              // the next day: the core is the basket now
+  out.changed = await tick(logged, ['AAA', 'DDD', 'BIL']);
+  out.tbills = await tick(logged, ['BBB', 'AAA', 'SGOV']);
+  out.unlogged = await tick(older, control);
+  out.reweighted = await tick({ ...logged, controlWeights: { AAA: 0.6, BBB: 0.2, BIL: 0.2 } }, control);
+  setCore(control);
+  I.recordBasketProposal({ basket: ['L1', 'L2'] });
+  const log = JSON.parse(require('fs').readFileSync(require('path').join(process.env.ATLAS_DATA_DIR, 'atlas-basket-proposals.json'), 'utf8'));
+  out.logged = log[log.length - 1];
+  out.weights = I.coreBaseWeightMap();
+  I.cancelPendingSave();
+  console.log(JSON.stringify(out));
+  process.exit(0);
+})().catch(e => { I.cancelPendingSave(); console.log(JSON.stringify({ error: String((e && e.stack) || e) })); process.exit(0); });
+`);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  ok(!r.error, `the probe threw: ${r.error}`);
+  const cases = ['live', 'already', 'changed', 'tbills', 'unlogged', 'reweighted'];
+  ok(cases.every(k => r[k] && r[k].wins), `premise: the fixture must win every time, got ${JSON.stringify(r)}`);
+  eq(r.live.blocked, null, 'control still live, weights logged: nothing blocks the switch —');
+  eq(r.live.after.join(','), 'BIL,L1,L2,L3', 'so the risky sleeve is replaced and the T-bills kept —');
+  eq(r.already.blocked, 'already', 'the day after, the core is recognised as already switched —');
+  eq(r.already.after.join(','), 'BIL,L1,L2,L3', 'and left alone, with no advice to archive the log');
+  eq(r.changed.isLive, false, 'a changed risky sleeve is reported');
+  eq(r.changed.after.join(','), 'AAA,DDD,BIL',
+     'and NOT switched: the win was over a core the account no longer holds —');
+  eq(r.tbills.after.join(','), 'SGOV,L1,L2,L3',
+     'another T-bill fund is not another core, because the T-bill share drops out of the score —');
+  eq(r.unlogged.blocked, 'unlogged', 'an entry logged without weights is named as such —');
+  eq(r.unlogged.after.join(','), 'AAA,BBB,BIL', 'and reports only');
+  eq(r.reweighted.blocked, 'weights', 'the same names split 75/25 instead of 50/50 are another benchmark —');
+  eq(r.reweighted.after.join(','), 'AAA,BBB,BIL', 'so that win does not switch either');
+  eq(JSON.stringify(r.logged.control), JSON.stringify(['AAA', 'BBB', 'BIL']), 'each proposal logs its control');
+  eq(JSON.stringify(r.logged.controlWeights), JSON.stringify(r.weights), 'and, since 15.87, its weights');
 });
 
 // ════════════════════════════════════════════════════════════════════════════

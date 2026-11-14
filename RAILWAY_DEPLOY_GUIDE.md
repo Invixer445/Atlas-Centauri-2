@@ -441,6 +441,21 @@ lost 3.9% in 2022 while BIL gained 1.4%: the one year bonds fell with stocks. If
 day, and with no real edge t ≥ 2 shows up by luck 16% of the time within three years. At 3
 that falls to about 2%.
 
+**The challenger is scored against the core it was proposed against (15.87).** Each
+proposal now logs that core and its weights, and the challenger is scored against them
+rather than against today's core. Returns are matched on bar dates, so one missing bar
+can no longer shift a whole history by a day. A stock with no bars for some sessions (a
+halt) is held at its last price, so its move lands on the day it trades again.
+
+A win can switch the core only while the core still holds the logged non-T-bill names in
+the same proportions, to within 1 point. Moving between T-bill funds, or changing how much
+sits in them, doesn't matter. Changing the index or stock names, or the split between
+them, does. Two kinds of proposal only report and never switch: those logged before
+15.87, which carry no weights, and every proposal while the growth sleeve is on. To start
+a test that can switch, rename the proposal log, atlas-basket-proposals.json, in the data
+directory (it is written at run time and isn't part of the repository). The next proposal
+is then scored against the core as it is.
+
 ### Verifying
 
 ```

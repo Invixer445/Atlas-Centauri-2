@@ -3313,9 +3313,15 @@ function recordBasketProposal(prop) {
     let log = [];
     try { log = JSON.parse(fs.readFileSync(BASKET_LOG, 'utf8')); } catch {}
     if (!Array.isArray(log)) log = [];
+    // THE CONTROL'S WEIGHTS GO IN BESIDE ITS NAMES (15.87). The challenger is scored
+    // against this control, and "QQQ,SPY,BIL" is not a portfolio until it says how much
+    // of each. Taken on its own, so a weight map that throws cannot cost the proposal
+    // its record.
+    let controlWeights = null;
+    try { controlWeights = coreBaseWeightMap(); } catch {}
     log.push({ at: new Date().toISOString(), basket: prop.basket,
                sectors: prop.sectors || {}, reasoning: prop.reasoning || '',
-               control: [...CORE_HOLD_SYMBOLS] });
+               control: [...CORE_HOLD_SYMBOLS], controlWeights });
     fs.writeFileSync(BASKET_LOG, JSON.stringify(trimProposalLog(log, 400), null, 2));
   } catch (e) { console.warn(`[VENUS] could not record basket proposal: ${e.message}`); }
 }
@@ -3348,10 +3354,11 @@ function trimProposalLog(log, max = 400) {
 //    basket of the same size ... Money stays on the control until this says otherwise.
 //
 //  The proposals were being logged with timestamps the whole time and nothing ever read
-//  them back. This closes that loop. Venus's basket is the CHALLENGER; whatever the core
-//  actually holds is the INCUMBENT. The challenger is scored on bars that did not exist
-//  when it was proposed, so its picks cannot be tuned to the outcome, and it takes
-//  capital only if it genuinely wins.
+//  them back. This closes that loop. Venus's basket is the CHALLENGER; the core as it
+//  stood when the basket was proposed, logged beside it as `control`, is the INCUMBENT
+//  (15.87 — see scoreBasketChallenger for why not today's core). The challenger is
+//  scored on bars that did not exist when it was proposed, so its picks cannot be tuned
+//  to the outcome, and it takes capital only if it genuinely wins.
 //
 //  WHY IT IS NOT SIMPLY SWITCHED ON. Measured over 23.4 years, equal-weight stock
 //  picking returned 11.1%/yr with a 59.9% drawdown against 13.0% and 25.1% for a
@@ -3400,46 +3407,109 @@ function challengerWins(t, sessions) {
   return sessions >= CHALLENGER_MIN_DAYS && t >= CHALLENGER_MIN_T;
 }
 
-// Equal-weight daily return series for a list of symbols, from a map of symbol -> bars.
-// Returns null when too few names have usable history to call it a basket.
-function basketDailyReturns(names, barsBySym, weights = null) {
-  const series = [];
-  for (const sym of names) {
-    const b = barsBySym[sym];
-    if (!Array.isArray(b) || b.length < 2) continue;
-    series.push({ sym, closes: b.map(x => x.c).filter(c => Number.isFinite(c) && c > 0) });
+// The session a daily bar belongs to, as 'YYYY-MM-DD'. fetchBars stamps a daily bar in
+// epoch SECONDS at midnight New York time (04:00 or 05:00 UTC), so its UTC date IS the
+// trading date. A bar with no usable stamp, a stamp that is not seconds, or no positive
+// close cannot be placed — and a bar that cannot be placed is left out, never guessed at.
+function barSessionDate(bar) {
+  if (!bar || !Number.isFinite(bar.c) || !(bar.c > 0)) return null;
+  if (!Number.isFinite(bar.t) || !(bar.t > 0) || bar.t > 1e11) return null;
+  return new Date(bar.t * 1000).toISOString().slice(0, 10);
+}
+
+// Daily return series for a basket, ONE ENTRY PER SESSION: [{ date, r }], oldest first.
+// Equal weight unless `weights` are given. Null when no session has enough of the basket
+// to call it one. `everyWeighted` (the challenger's incumbent) replaces the 60% rule with
+// "every name that carries weight", for the reason given at scoreBasketChallenger.
+//
+// MATCHED ON THE BAR'S DATE, NOT ITS POSITION (15.87). This used to throw the dates away
+// and line the names up by counting back from each one's newest bar. One missing bar — a
+// name that did not print on the IEX feed one day, or the daily check landing mid-session
+// before a name's first trade — and that name's whole history slid a session against the
+// others, every return paired with the wrong day. Nothing errored; the numbers were just
+// wrong. Simulated, 1,000 years of a 16-name basket with a real 15%/yr edge against a
+// 40/40/20 QQQ/SPY/BIL core: the edge reaches t >= 3 13.8% of the time with clean data.
+// One QQQ bar missing mid-window cut that to 1.9%; QQQ without a bar for the latest
+// session cut it to 0.0% (beta 1.09 read as 0.94). Matched on dates: 13.5% and 13.9%.
+// The fault mostly blinded the test — but it is a test this project acts on.
+//
+// THE CALENDAR IS EVERY DATE IN barsBySym, not only this basket's. A session on which
+// every one of these names is missing still counts as a session, so the move across it
+// is left out instead of being folded into a two-day return labelled as one day.
+//
+// A NAME THAT MISSES BARS INSIDE ITS OWN HISTORY IS HELD, NOT DROPPED. Between its first
+// and last bar, a session with no bar for it carries its last close: 0% that day, and
+// its whole move lands on the day it trades again — which is what holding it is like.
+// Dropping it instead (the first cut of 15.87) threw that move away for good: a stock
+// halted for news that reopened 60% lower never touched the score, and since stocks
+// halt and index funds do not, the error always flattered the challenger. Before its
+// first bar and after its last, a name is simply absent. A bar merely missing from the
+// feed, for a name that did trade, now reads as a flat day and a two-day move: a small
+// error that leans neither way, where dropping it was a biased one.
+//
+// A SESSION COUNTS ONLY WHEN ENOUGH OF THE BASKET REALLY PRINTED ON IT AND ON THE SESSION
+// BEFORE: 60% of the names, applied PER SESSION — a day too few printed is left out, not
+// estimated from the few that did, and three names of which one has data is not a
+// basket. Requiring the session before as well keeps a day the whole feed missed from
+// coming back as a two-day move booked as one.
+function basketDailyReturns(names, barsBySym, weights = null, { everyWeighted = false } = {}) {
+  const list = [...new Set((Array.isArray(names) ? names : []).filter(Boolean))];
+  if (!list.length || !barsBySym || typeof barsBySym !== 'object') return null;
+  const calendar = new Set();
+  for (const bars of Object.values(barsBySym)) {
+    if (!Array.isArray(bars)) continue;
+    for (const bar of bars) { const d = barSessionDate(bar); if (d) calendar.add(d); }
   }
-  if (!series.length) return null;
-  // Every member must span the same number of sessions or the comparison silently
-  // weights whoever happens to have the longest history.
-  // n is the MINIMUM length, so every series already satisfies `length >= n` — an
-  // explicit filter on that was a no-op dressed as a safety check. What actually
-  // matters is COVERAGE: how many of the names asked for came back with usable
-  // history at all. Three names of which one has data is not a basket.
-  const n = Math.min(...series.map(x => x.closes.length));
-  if (!(n >= 2)) return null;
-  if (series.length < Math.ceil(names.length * 0.6)) return null;   // too thin to trust
-  const out = [];
-  for (let i = 1; i < n; i++) {
-    let r = 0, wsum = 0;
-    for (const x of series) {
-      const a = x.closes[x.closes.length - n + i - 1], c = x.closes[x.closes.length - n + i];
-      if (!(a > 0) || !(c > 0)) continue;
-      const w = weights && Number.isFinite(weights[x.sym]) ? weights[x.sym] : 1;
-      r += w * (c / a - 1); wsum += w;
+  const days = [...calendar].sort();
+  const series = [];
+  for (const sym of list) {
+    const real = new Map();
+    let lastDay = null;
+    for (const bar of (Array.isArray(barsBySym[sym]) ? barsBySym[sym] : [])) {
+      const d = barSessionDate(bar);
+      if (!d) continue;
+      real.set(d, bar.c);
+      if (lastDay === null || d > lastDay) lastDay = d;
     }
-    out.push(wsum > 0 ? r / wsum : 0);
+    const held = new Array(days.length);                  // the close a holder marks to
+    let last;
+    for (let k = 0; k < days.length; k++) {
+      if (real.has(days[k])) last = real.get(days[k]);
+      if (last !== undefined && days[k] <= lastDay) held[k] = last;
+    }
+    const w = weights && Number.isFinite(weights[sym]) ? weights[sym] : 1;
+    series.push({ real, held, w });
+  }
+  const need = Math.ceil(list.length * 0.6);              // too thin to trust below this
+  const enough = days.map(d => everyWeighted
+    ? series.every(s => !(s.w > 0) || s.real.has(d))
+    : series.filter(s => s.real.has(d)).length >= need);
+  const out = [];
+  for (let k = 1; k < days.length; k++) {
+    if (!enough[k] || !enough[k - 1]) continue;
+    let r = 0, wsum = 0;
+    for (const s of series) {
+      const a = s.held[k - 1], c = s.held[k];
+      if (a === undefined || c === undefined) continue;
+      r += s.w * (c / a - 1); wsum += s.w;
+    }
+    if (wsum > 0) out.push({ date: days[k], r: r / wsum });
   }
   return out.length ? out : null;
 }
 
 // Score the OLDEST logged proposal — the longest genuinely out-of-sample record, and
-// the one choice that involves no selection at all.
-async function evaluateBasketChallenger() {
+// the one choice that involves no selection at all. `opts.log` and `opts.bars` stand in
+// for the proposal file and the bar fetch so the test suite can drive the real tick
+// offline; the engine passes neither.
+async function evaluateBasketChallenger(opts = {}) {
   if (!BASKET_CHALLENGER_ON) return null;
   try {
-    let log = [];
-    try { log = JSON.parse(fs.readFileSync(BASKET_LOG, 'utf8')); } catch {}
+    let log = opts.log;
+    if (log === undefined) {
+      log = [];
+      try { log = JSON.parse(fs.readFileSync(BASKET_LOG, 'utf8')); } catch {}
+    }
     if (!Array.isArray(log) || !log.length) return null;
     const first = log.find(isScorableProposal);
     if (!first) return null;
@@ -3452,75 +3522,239 @@ async function evaluateBasketChallenger() {
                 `(${first.at.slice(0, 10)}) — too early to read` };
       return _challengerVerdict;
     }
-    const challenger = [...new Set(first.basket.map(x => String(x || '').toUpperCase()))];
-    const incumbent  = [...new Set(CORE_HOLD_SYMBOLS)];
+    const legs = (xs) => (Array.isArray(xs) ? xs : []).map(x => String(x || '').toUpperCase()).filter(Boolean);
     // The risk-free leg is fetched alongside, because alpha is measured in EXCESS of it.
-    const all = [...new Set([...challenger, ...incumbent, RISK_FREE_PROXY])];
+    const all = [...new Set([...legs(first.basket), ...legs(first.control), RISK_FREE_PROXY])];
     // ADJUSTED prices: a distributing fund in the incumbent (BIL) would otherwise read
     // as losing money every ex-date and earning nothing — see fetchBars.
-    const bars = await fetchBars(all, '1Day', new Date(since).toISOString(), sessions + 10, 'all');
-    const cR = basketDailyReturns(challenger, bars || {});
-    const iR = basketDailyReturns(incumbent,  bars || {}, coreBaseWeightMap());   // structural, not regime-shifted
-    if (!cR || !iR) {
-      _challengerVerdict = { ready: false, sessions,
-        reason: 'not enough daily history for one of the baskets' };
-      return _challengerVerdict;
-    }
-    const rfR = basketDailyReturns([RISK_FREE_PROXY], bars || {});
-    const n = Math.min(cR.length, iR.length, rfR ? rfR.length : Infinity);
-    if (n < CHALLENGER_MIN_DAYS) {
-      _challengerVerdict = { ready: false, sessions: n, need: CHALLENGER_MIN_DAYS,
-        reason: `only ${n} comparable sessions` };
-      return _challengerVerdict;
-    }
-    // JENSEN'S ALPHA, NOT A RAW RETURN DIFFERENCE (Mark 15). The raw test rewards BETA:
-    // a basket with more market exposure out-runs a cautious incumbent in any rising
-    // market without any skill at all. Alpha strips that out — it asks whether the
-    // challenger beat a version of the incumbent levered to the SAME market exposure.
-    //
-    // AND THE RISK-FREE RATE MUST BE THE REAL ONE. The first version of this used a
-    // constant 4%. In 2020-21 T-bills paid ~0%, so a T-bill-heavy incumbent's excess
-    // return carried a fake -4%/yr drift, and a beta of ~11 against it turned that
-    // into enormous spurious alpha: against a 95/5 BIL/QQQ core it called Venus's
-    // stocks the winner in 36 of 96 rolling windows, where the real-T-bill version says
-    // 2 — exactly the false-alarm rate of a zero-skill control. With auto-switch on,
-    // that artifact would have sold the T-bills for sixteen stocks.
-    const rfConst = (1 + RISK_FREE_RATE) ** (1 / 252) - 1;
-    const rfAt = (i) => (rfR ? rfR[rfR.length - n + i] : rfConst);
-    const cx = [], ix = [];
-    for (let i = 0; i < n; i++) {
-      cx.push(cR[cR.length - n + i] - rfAt(i));
-      ix.push(iR[iR.length - n + i] - rfAt(i));
-    }
-    const beta = betaOf(cx, ix);
-    const b = Number.isFinite(beta) ? beta : 1;
-    const d = cx.map((x, i) => x - b * ix[i]);                // daily alpha
-    const mean = d.reduce((a, b) => a + b, 0) / n;
-    let v = 0; for (const x of d) v += (x - mean) ** 2;
-    const sd = n > 1 ? Math.sqrt(v / (n - 1)) : 0;
-    const t = (sd > 0) ? mean / (sd / Math.sqrt(n)) : 0;
-    const compound = (a) => a.reduce((acc, r) => acc * (1 + r), 1) - 1;
-    _challengerVerdict = {
-      ready: true, sessions: n, since: first.at.slice(0, 10),
-      challenger, incumbent,
-      challengerReturn: compound(cR.slice(-n)),
-      incumbentReturn:  compound(iR.slice(-n)),
-      beta: b, dailyEdge: mean, alphaAnnual: mean * 252, t,
-      riskFree: rfR ? `${RISK_FREE_PROXY} daily total return` : `constant ${(RISK_FREE_RATE * 100).toFixed(1)}% (no ${RISK_FREE_PROXY} data)`,
-      wins: challengerWins(t, n),
-      reason: challengerWins(t, n)
-        ? `Venus's stock basket shows ${(mean * 25200).toFixed(1)}%/yr of ALPHA over the core ` +
-          `(beta ${b.toFixed(2)}, so market exposure is already netted out) across ${n} sessions, ` +
-          `t=${t.toFixed(2)} — that clears the ${CHALLENGER_MIN_T} bar`
-        : `Venus's stock basket's alpha over the core is ${(mean * 25200).toFixed(1)}%/yr ` +
-          `(beta ${b.toFixed(2)}) across ${n} sessions, but t=${t.toFixed(2)} is inside the noise ` +
-          `(needs ${CHALLENGER_MIN_T}). Money stays on the core.`
-    };
+    const bars = opts.bars || await fetchBars(all, '1Day', new Date(since).toISOString(), sessions + 10, 'all');
+    // `sessions` here is the calendar estimate; a scored verdict replaces it with the
+    // number of sessions actually compared.
+    _challengerVerdict = { sessions, ...scoreBasketChallenger(first, bars || {}, CORE_HOLD_SYMBOLS) };
     return _challengerVerdict;
   } catch (e) {
     console.warn(`[CHALLENGER] evaluation failed: ${e.message}`);
     return null;
   }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  WHAT THE CHALLENGER IS SCORED AGAINST (15.87): THE CONTROL LOGGED WITH IT
+// ════════════════════════════════════════════════════════════════════════════
+//  Until 15.87 the incumbent was TODAY's core — CORE_HOLD_SYMBOLS at today's weights —
+//  replayed over every session since the proposal. The log has carried the core as it
+//  stood at the time (`control`) from the start, and isScorableProposal refuses an entry
+//  without one; the evaluator then ignored it. That made half of a forward test a
+//  backtest:
+//
+//    - only the challenger was fixed before the data arrived. The incumbent was whatever
+//      core is configured now, scored over sessions already seen — and cores here are
+//      chosen after backtests that cover exactly those sessions (Mark 15, 15.82).
+//    - every core change silently re-ran the whole comparison on old data. The t >= 3
+//      bar was set for ONE test re-read daily, not a fresh test per core change.
+//
+//  A forward test fixes both legs before the data arrives, so the incumbent is the
+//  control logged with the proposal. That is also exactly what edge-register.json claims
+//  ("beats a FIXED ... basket") and what score-basket.js scores offline.
+//
+//  Rejected: today's core (above), and the core actually held day by day — its weights
+//  were never logged, so it cannot be rebuilt, and it answers a different question.
+//
+//  THE CATCH: a win over a core the account no longer holds says nothing about the one
+//  it does. So the verdict always reports, but a win may only SWITCH while the control's
+//  risky sleeve — every name that is not a T-bill fund — is the live core's, in the same
+//  proportions (challengerSwitchBlock, checked by the tick at the moment of switching).
+//  Only that sleeve is compared because only that sleeve is replaced
+//  (challengerNextBasket), and the T-bill SHARE drops out of the score exactly: with BIL
+//  as both the core's T-bill leg and the risk-free leg, the incumbent's excess return is
+//  (risky share) x (sleeve's excess return), beta absorbs the scale, and the daily alpha
+//  is unchanged to the last digit. The split INSIDE the sleeve does not drop out: a
+//  40/40 QQQ/SPY control and a 56/24 live core are different benchmarks, and a basket
+//  that beat one has not beaten the other. Hence the proportions, to within 1 point.
+//
+//  THE WEIGHTS are logged beside the names since 15.87 (controlWeights) and the control
+//  is scored at them. An older entry has the names only, so it is scored at TODAY's
+//  weighting rules (structural, not regime-shifted) — and a core re-weighted since it
+//  was logged cannot be told apart from one that was not. Such an entry REPORTS ONLY.
+//
+//  ALSO REPORT-ONLY: while the growth sleeve is on (the control and its weights include
+//  the growth names, but a switch keeps them and replaces only the rest, so what was
+//  measured and what would change are not the same thing), and under
+//  CORE_BASKET_SOURCE=venus, where the core changes with each adopted proposal and
+//  already holds Venus's picks. To test against a changed core, archive
+//  atlas-basket-proposals.json; the next proposal is scored against the core as it is.
+//
+//  THE INCUMBENT NEEDS EVERY FUND THAT CARRIES WEIGHT on a session, where the challenger
+//  keeps the 60% rule. With 60%, a control of QQQ/SPY/BIL is "covered" by QQQ and BIL
+//  alone, and its weights are re-normalised over them: a bar fetch cut short (fetchBars
+//  keeps what it has when a later page fails) left SPY with only its newest bars, and the
+//  early sessions were silently scored against a QQQ/BIL core. A reviewer's run: 54 false
+//  wins in 200 that way, against 0 for 15.85. Requiring every weighted fund shortens the
+//  window instead, or says "not ready" — it never changes the benchmark.
+//
+//  Pure: the proposal, its bars and the live core in, the verdict out. No file, no
+//  network, no clock — so the suite can put a missing bar exactly where it wants one.
+function scoreBasketChallenger(first, bars, live, liveWeights = null) {
+  const names = (xs) => [...new Set((Array.isArray(xs) ? xs : [])
+    .map(x => String(x || '').toUpperCase()).filter(Boolean))];
+  const challenger = names(first && first.basket);
+  const control    = names(first && first.control);
+  const liveCore   = names(live);
+  if (!challenger.length || !control.length) {
+    return { ready: false, reason: 'the proposal has no basket or no control to score against' };
+  }
+  const cw = controlWeightsOf(first, control);
+  const cR = basketDailyReturns(challenger, bars || {});
+  const iR = basketDailyReturns(control, bars || {}, cw.weights, { everyWeighted: true });
+  if (!cR || !iR) return { ready: false, reason: 'not enough daily history for one of the baskets' };
+  const rfR = basketDailyReturns([RISK_FREE_PROXY], bars || {});
+  const rfConst = (1 + RISK_FREE_RATE) ** (1 / 252) - 1;
+  // ONE ROW PER SESSION, MATCHED ON THE DATE, and kept only when all three legs observed
+  // it. The legs used to be paired by counting back from their ends, which is right only
+  // while every series has every session (see basketDailyReturns). The constant stands
+  // in for the risk-free leg only when there is no T-bill series at all; a series with a
+  // gap loses that session rather than splicing two sources together.
+  const iOn  = new Map(iR.map(x => [x.date, x.r]));
+  const rfOn = rfR ? new Map(rfR.map(x => [x.date, x.r])) : null;
+  const rows = [];
+  for (const x of cR) {
+    const i = iOn.get(x.date), rf = rfOn ? rfOn.get(x.date) : rfConst;
+    if (i === undefined || rf === undefined) continue;
+    rows.push({ date: x.date, c: x.r, i, rf });
+  }
+  const n = rows.length;
+  if (n < CHALLENGER_MIN_DAYS) {
+    return { ready: false, sessions: n, need: CHALLENGER_MIN_DAYS, reason: `only ${n} comparable sessions` };
+  }
+  // JENSEN'S ALPHA, NOT A RAW RETURN DIFFERENCE (Mark 15). The raw test rewards BETA:
+  // a basket with more market exposure out-runs a cautious incumbent in any rising
+  // market without any skill at all. Alpha strips that out — it asks whether the
+  // challenger beat a version of the incumbent levered to the SAME market exposure.
+  //
+  // AND THE RISK-FREE RATE MUST BE THE REAL ONE. The first version of this used a
+  // constant 4%. In 2020-21 T-bills paid ~0%, so a T-bill-heavy incumbent's excess
+  // return carried a fake -4%/yr drift, and a beta of ~11 against it turned that
+  // into enormous spurious alpha: against a 95/5 BIL/QQQ core it called Venus's
+  // stocks the winner in 36 of 96 rolling windows, where the real-T-bill version says
+  // 2 — exactly the false-alarm rate of a zero-skill control. With auto-switch on,
+  // that artifact would have sold the T-bills for sixteen stocks.
+  const cx = rows.map(x => x.c - x.rf), ix = rows.map(x => x.i - x.rf);
+  const beta = betaOf(cx, ix);
+  const b = Number.isFinite(beta) ? beta : 1;
+  const d = cx.map((x, i) => x - b * ix[i]);                // daily alpha
+  const mean = d.reduce((a, b) => a + b, 0) / n;
+  let v = 0; for (const x of d) v += (x - mean) ** 2;
+  const sd = n > 1 ? Math.sqrt(v / (n - 1)) : 0;
+  const t = (sd > 0) ? mean / (sd / Math.sqrt(n)) : 0;
+  const compound = (a) => a.reduce((acc, r) => acc * (1 + r), 1) - 1;
+  let lw = liveWeights;
+  if (!lw) { try { lw = coreBaseWeightMap(liveCore); } catch { lw = {}; } }
+  const over = 'its control (the core when it was proposed)';
+  const verdict = {
+    ready: true, sessions: n, since: String(first.at || '').slice(0, 10),
+    from: rows[0].date, to: rows[n - 1].date,
+    challenger, incumbent: control, controlWeights: cw.weights, weightsLogged: cw.logged, liveCore,
+    controlIsLive: sameRiskySleeve(control, liveCore) && sameSleeveSplit(cw.weights, control, lw, liveCore),
+    challengerReturn: compound(rows.map(x => x.c)),
+    incumbentReturn:  compound(rows.map(x => x.i)),
+    beta: b, dailyEdge: mean, alphaAnnual: mean * 252, t,
+    riskFree: rfR ? `${RISK_FREE_PROXY} daily total return` : `constant ${(RISK_FREE_RATE * 100).toFixed(1)}% (no ${RISK_FREE_PROXY} data)`,
+    wins: challengerWins(t, n),
+  };
+  const block = challengerSwitchBlock(verdict, liveCore, lw);
+  verdict.switchBlocked = block ? block.code : null;
+  verdict.reason = (verdict.wins
+      ? `Venus's stock basket shows ${(mean * 25200).toFixed(1)}%/yr of ALPHA over ${over} ` +
+        `(beta ${b.toFixed(2)}, so market exposure is already netted out) across ${n} sessions, ` +
+        `t=${t.toFixed(2)} — that clears the ${CHALLENGER_MIN_T} bar`
+      : `Venus's stock basket's alpha over ${over} is ${(mean * 25200).toFixed(1)}%/yr ` +
+        `(beta ${b.toFixed(2)}) across ${n} sessions, but t=${t.toFixed(2)} is inside the noise ` +
+        `(needs ${CHALLENGER_MIN_T}). Money stays on the core.`) +
+    (block ? ` It cannot switch the core: ${block.why}.` : '');
+  return verdict;
+}
+
+// The control's weights, and whether they were logged with it. A logged map must give
+// EVERY control name a finite, non-negative weight: half a map would weight the missing
+// names at 1 against shares that sum to 1. Anything less is treated as not logged, and
+// today's rules are applied to the logged names.
+function controlWeightsOf(entry, control) {
+  const w = entry && entry.controlWeights;
+  if (w && typeof w === 'object' && !Array.isArray(w)) {
+    const vals = control.map(s => w[s]);
+    if (vals.every(x => Number.isFinite(x) && x >= 0) && vals.reduce((a, x) => a + x, 0) > 0) {
+      return { weights: Object.fromEntries(control.map(s => [s, w[s]])), logged: true };
+    }
+  }
+  return { weights: coreBaseWeightMap(control), logged: false };
+}
+
+// The part of a core the challenger competes for: every name that is not a T-bill fund,
+// upper-cased, de-duplicated and sorted, so neither order nor a repeat makes two cores
+// look different. challengerNextBasket replaces exactly this and keeps the rest.
+function riskySleeve(list) {
+  return [...new Set((Array.isArray(list) ? list : []).map(x => String(x || '').toUpperCase())
+    .filter(x => x && !CASH_EQUIVALENT_SYMBOLS.has(x)))].sort();
+}
+
+// Whether two cores hold the same risky sleeve. An empty sleeve never matches: a core of
+// T-bills alone has nothing for the challenger to replace, and "switching" it would turn
+// an all-cash core into a basket of stocks.
+function sameRiskySleeve(a, b) {
+  const x = riskySleeve(a), y = riskySleeve(b);
+  return x.length > 0 && x.length === y.length && x.every((s, i) => s === y[i]);
+}
+
+// How a core divides its risky sleeve: each non-T-bill name's share of the sleeve,
+// summing to 1, so the T-bill share (which drops out of the score) cannot register.
+function sleeveSplit(weights, names) {
+  const risky = riskySleeve(names);
+  const share = (s) => (weights && Number.isFinite(weights[s]) && weights[s] > 0) ? weights[s] : 0;
+  const total = risky.reduce((a, s) => a + share(s), 0);
+  return total > 0 ? Object.fromEntries(risky.map(s => [s, share(s) / total])) : null;
+}
+
+// Same names, divided the same way to within 1 point of the sleeve.
+function sameSleeveSplit(wa, na, wb, nb) {
+  const a = sleeveSplit(wa, na), b = sleeveSplit(wb, nb);
+  if (!a || !b) return false;
+  const ka = Object.keys(a);
+  return ka.length === Object.keys(b).length && ka.every(k => k in b && Math.abs(a[k] - b[k]) <= 0.01);
+}
+
+// WHY A WIN MAY NOT SWITCH THE CORE, or null when it may. Pure; the tick asks it at the
+// moment of switching, against the core as it stands then. In the order checked:
+//   already   the core already holds this basket — there is nothing to switch, and
+//             nothing to archive (that advice, the day after a switch, let the next
+//             redeploy undo the switch with no verdict left to redo it)
+//   growth    the growth sleeve is on: measured and replaced are not the same sleeve
+//   names     the control's non-T-bill names are not the live core's
+//   unlogged  logged before 15.87, without weights: a re-weighting cannot be seen
+//   weights   same names, divided differently — more than 1 point of the sleeve
+function challengerSwitchBlock(v, liveCore, liveWeights, growthOn = GROWTH_SLEEVE_ON) {
+  const mine = riskySleeve(v && v.challenger), live = riskySleeve(liveCore);
+  if (live.length && live.length === mine.length && live.every((s, i) => s === mine[i])) {
+    return { code: 'already', why: 'the core already holds this basket' };
+  }
+  if (growthOn) {
+    return { code: 'growth', why: 'the growth sleeve is on, and a switch would keep the growth ' +
+      'names it was scored against and replace only the rest' };
+  }
+  if (!sameRiskySleeve(v && v.incumbent, liveCore)) {
+    return { code: 'names', why: `it was scored against ${riskySleeve(v && v.incumbent).join(',') || 'no risky names'} ` +
+      `and the core's non-T-bill names are now ${live.join(',') || 'none'}` };
+  }
+  if (!(v && v.weightsLogged)) {
+    return { code: 'unlogged', why: 'this proposal was logged before 15.87 without its control\'s ' +
+      'weights, so a core re-weighted since then cannot be told apart, and it reports only' };
+  }
+  if (!sameSleeveSplit(v.controlWeights, v.incumbent, liveWeights, liveCore)) {
+    const fmt = (sp) => sp ? Object.entries(sp).map(([k, x]) => `${k} ${(x * 100).toFixed(0)}%`).join('/') : '?';
+    return { code: 'weights', why: `the core now divides its non-T-bill names ` +
+      `${fmt(sleeveSplit(liveWeights, liveCore))}, and the control it was scored against ` +
+      `divided them ${fmt(sleeveSplit(v.controlWeights, v.incumbent))}` };
+  }
+  return null;
 }
 
 function challengerVerdict() { return _challengerVerdict; }
@@ -3536,16 +3770,31 @@ function challengerNextBasket(current, challenger) {
   return [...new Set([...keepSafe, ...risky])];
 }
 
-// Run the comparison, say what it found, and switch only if asked to AND it won.
-async function basketChallengerTick() {
-  const v = await evaluateBasketChallenger();
+// Run the comparison, say what it found, and switch only if asked to AND it won AND what
+// it beat is still what the account holds. `opts` is passed through for the test suite.
+async function basketChallengerTick(opts = {}) {
+  const v = await evaluateBasketChallenger(opts);
   if (!v) return null;
   console.log(`[CHALLENGER] 🥊 ${v.reason}`);
   if (v.ready && v.wins) {
     console.log(`[CHALLENGER] 🥊 Over ${v.sessions} sessions: stocks ` +
-                `${(v.challengerReturn * 100).toFixed(2)}% vs index ` +
+                `${(v.challengerReturn * 100).toFixed(2)}% vs control ` +
                 `${(v.incumbentReturn * 100).toFixed(2)}%.`);
-    if (!CHALLENGER_AUTO_SWITCH) {
+    // Checked HERE, against the core at the moment of switching — not the verdict's
+    // copy, which is as old as the bar fetch it waited on. Before the auto-switch
+    // setting, so an operator is not told to turn auto-switch on for a win that could
+    // never be acted on.
+    let liveWeights = null;
+    try { liveWeights = coreBaseWeightMap(); } catch {}
+    const block = challengerSwitchBlock(v, CORE_HOLD_SYMBOLS, liveWeights);
+    if (block && block.code === 'already') {
+      console.log(`[CHALLENGER] 🥊 The core already holds Venus's basket — nothing to switch.`);
+    } else if (block) {
+      console.log(`[CHALLENGER] 🥊 NOT switching — ${block.why}. A win over a core the account ` +
+                  `does not hold says nothing about the one it does.` +
+                  (block.code === 'growth' ? '' : ` To test against today's core, archive ` +
+                   `atlas-basket-proposals.json; the next proposal starts a fresh test.`));
+    } else if (!CHALLENGER_AUTO_SWITCH) {
       console.log(`[CHALLENGER] 🥊 NOT switching — set BASKET_CHALLENGER_AUTO=on to let the ` +
                   `engine act on this by itself. Switching sells every ETF held and buys ` +
                   `${v.challenger.length} stocks, paying the spread on both legs.`);
@@ -12757,7 +13006,8 @@ app.get('/api/signal', (req, res) => {
   });
 });
 
-// 🥊 Has Venus's stock basket actually beaten the index core? Read-only.
+// 🥊 Has Venus's stock basket actually beaten its control — the core it was proposed
+// against? Read-only. verdict.controlIsLive says whether that is still the live core.
 app.get('/api/challenger', (req, res) => {
   const v = challengerVerdict();
   res.json({
@@ -13349,8 +13599,9 @@ if (require.main === module) app.listen(PORT, async () => {
                 `Detail: /api/audit. ATLAS_AUDITOR=off disables it.`);
   }
   if (BASKET_CHALLENGER_ON) {
-    console.log(`[CHALLENGER] 🥊 Venus's stock basket is being scored against the index core on ` +
-                `bars that did not exist when it was proposed. It needs ${CHALLENGER_MIN_DAYS}+ ` +
+    console.log(`[CHALLENGER] 🥊 Venus's stock basket is being scored against its control — the core ` +
+                `as it stood when the basket was proposed — on bars that did not exist then, matched ` +
+                `session by session on their dates. It needs ${CHALLENGER_MIN_DAYS}+ ` +
                 `sessions and t>=${CHALLENGER_MIN_T} before the result means anything, and ` +
                 `${CHALLENGER_AUTO_SWITCH ? 'WILL take the account if it wins' : 'will report but NOT act'}` +
                 ` (BASKET_CHALLENGER_AUTO=${CHALLENGER_AUTO_SWITCH ? 'on' : 'off'}). ` +
@@ -13701,6 +13952,7 @@ module.exports = {
     atrPctPerMinute, DECISION_BAR_MINUTES,
     basketDailyReturns, evaluateBasketChallenger, challengerVerdict, basketChallengerTick,
     challengerWins, trimProposalLog, isScorableProposal,
+    scoreBasketChallenger, sameRiskySleeve, challengerSwitchBlock, recordBasketProposal,
     parseLeveragedEtfs, unleveredEquivalent, LEVERAGED_ETFS,
     screenPrint, applyTradePrint, priceReferences, isPlausiblePrice, plausiblePrice, markPrice, lotBasis,
     PRINT_JUMP_MAX, PRINT_CONFIRM_N, PRINT_CONFIRM_MS, PRICE_SANITY_X,
