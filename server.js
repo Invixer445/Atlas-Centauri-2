@@ -3528,6 +3528,16 @@ async function evaluateBasketChallenger(opts = {}) {
     // ADJUSTED prices: a distributing fund in the incumbent (BIL) would otherwise read
     // as losing money every ex-date and earning nothing — see fetchBars.
     const bars = opts.bars || await fetchBars(all, '1Day', new Date(since).toISOString(), sessions + 10, 'all');
+    // A FETCH CUT SHORT IS NOT A SCORE (15.88). See fetchBars. The control already needs
+    // every weighted fund (15.87), but the challenger's own 60% rule would score whatever
+    // part of the basket arrived, so a failed page scored a different basket. The last
+    // verdict stands, and this round decides nothing: null, so the tick neither reports
+    // a new verdict nor switches.
+    if (bars && bars.incomplete) {
+      console.warn(`[CHALLENGER] ⚠️  The bar fetch for ${all.length} names came back incomplete — ` +
+                   `keeping the last verdict; nothing is decided this round.`);
+      return null;
+    }
     // `sessions` here is the calendar estimate; a scored verdict replaces it with the
     // number of sessions actually compared.
     _challengerVerdict = { sessions, ...scoreBasketChallenger(first, bars || {}, CORE_HOLD_SYMBOLS) };
@@ -4942,14 +4952,14 @@ async function fetchBars(symbols, timeframe, startISO, keepPerSymbol, adjustment
     ? Math.min(10000, Math.max(1000, Math.ceil(keepPerSymbol * symbols.length * 1.3)))
     : 10000;
   const out = {};
-  let token = null, pages = 0;
+  let token = null, pages = 0, failedPage = 0, enough = false;
   do {
     const qs = `symbols=${symbols.join(',')}&timeframe=${timeframe}` +
                `&start=${encodeURIComponent(startISO)}&limit=${perPage}` +
                `&adjustment=${ADJ}&feed=${ALPACA_DATA_FEED}&sort=${wantNewestFirst ? 'desc' : 'asc'}` +
                (token ? `&page_token=${encodeURIComponent(token)}` : '');
     const j = await alpacaDataGet(`/v2/stocks/bars?${qs}`);
-    if (!j) break;
+    if (!j) { failedPage = pages + 1; break; }
     const raw = j.bars || {};
     Object.keys(raw).forEach(sym => {
       const arr = Array.isArray(raw[sym]) ? raw[sym] : [];
@@ -4963,10 +4973,21 @@ async function fetchBars(symbols, timeframe, startISO, keepPerSymbol, adjustment
     pages++;
     // Descending: once every symbol has enough, more pages only fetch older bars we
     // would immediately discard. Stop as soon as the requirement is met.
-    if (wantNewestFirst && symbols.every(sym => (out[sym] || []).length >= keepPerSymbol)) break;
+    if (wantNewestFirst && symbols.every(sym => (out[sym] || []).length >= keepPerSymbol)) { enough = true; break; }
   } while (token && pages < MAX_BAR_PAGES);
-  if (token && !wantNewestFirst)
-    console.warn(`[CANDLES] ${timeframe}: stopped at ${MAX_BAR_PAGES} pages with more available — widen the cap or narrow the window.`);
+  // A FETCH CUT SHORT SAYS SO (15.88). A failed page used to end the loop as if the data
+  // had run out, and the page cap did the same while paging newest-first: nothing in the
+  // result said it was partial. Pages fill symbol by symbol, so the name at the boundary
+  // kept only its newest bars and the names after it were missing, and every caller
+  // computed on that. `incomplete` is true when a page failed, or when the cap stopped
+  // the fetch with more to come. Stopping because every symbol has enough is not that.
+  // It is NOT ENUMERABLE, so the result's keys are still exactly its symbols: no
+  // Object.keys, Object.values, JSON or spread sees it, and no caller has to change shape.
+  const incomplete = failedPage > 0 || (!!token && !enough);
+  if (incomplete)
+    console.warn(`[BARS] ⚠️  ${timeframe} bars for ${symbols.length} symbol(s): ` +
+      (failedPage ? `page ${failedPage} failed` : `stopped at ${MAX_BAR_PAGES} pages with more available`) +
+      ` — the result is incomplete, and nothing that decides is computed from it.`);
   if (keepPerSymbol > 0) {
     Object.keys(out).forEach(s => {
       // Descending pages arrive newest-first; restore chronological order, which every
@@ -4975,7 +4996,19 @@ async function fetchBars(symbols, timeframe, startISO, keepPerSymbol, adjustment
       if (out[s].length > keepPerSymbol) out[s] = out[s].slice(-keepPerSymbol);
     });
   }
+  Object.defineProperty(out, 'incomplete', { value: incomplete });
   return out;
+}
+
+// From an INCOMPLETE fetch (see fetchBars), a symbol's series is used only when it already
+// holds the `keep` bars the caller keeps: pages arrive newest-first, so those are exactly
+// the bars a complete fetch would have given. Anything shorter may be a name cut off at a
+// page boundary, and the caller keeps what it had. From a complete fetch every series is
+// taken as it came, short or not, exactly as before. Pure.
+function usableSeries(bars, sym, keep) {
+  const s = bars && bars[sym];
+  if (!Array.isArray(s) || !s.length) return undefined;
+  return (!bars.incomplete || s.length >= keep) ? s : undefined;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -5077,9 +5110,17 @@ async function fetchCandles() {
         : Promise.resolve({})
     ]);
 
+    // A FETCH CUT SHORT (15.88): the name at a page boundary keeps only its newest bars. So
+    // from an incomplete fetch a DECISION series is taken only when it already holds every
+    // bar kept below (60 for .m1, 36 for .m5), and a shorter one leaves the previous bars in
+    // place until the next refresh. Under 1Hour the minute bars feed only .raw1m, whose last
+    // bar is all the price guard reads, and the newest bar is right however many came back.
+    const hourly = DECISION_TIMEFRAME === '1Hour';
+    const cut = [bars1m, bars5m, bars1h].filter(b => b.incomplete).length;
     let updated = 0;
     symbols.forEach(sym => {
-      const c1m = bars1m[sym], c5m = bars5m[sym], c1h = bars1h[sym];
+      const c1m = hourly ? bars1m[sym] : usableSeries(bars1m, sym, 60),
+            c5m = usableSeries(bars5m, sym, 36), c1h = usableSeries(bars1h, sym, 60);
       if (!candleData[sym]) candleData[sym] = {};
       if (DECISION_TIMEFRAME === '1Hour') {
         // DECISION BARS ride in .m1. Every indicator (ATR, ADX, EMA, RSI, RVOL,
@@ -5106,7 +5147,10 @@ async function fetchCandles() {
       }
     });
     console.log(`[CANDLES] Updated ${updated}/${symbols.length} symbols from Alpaca (feed=${ALPACA_DATA_FEED})`);
-    if (updated === 0) {
+    if (cut) {
+      console.warn(`[CANDLES] ⚠️  ${cut} bar fetch(es) came back incomplete: the ${symbols.length - updated} ` +
+                   `symbol(s) not updated keep their previous candles until the next refresh.`);
+    } else if (updated === 0) {
       console.warn('[CANDLES] No bars returned — outside market hours, or check data plan/feed.');
     }
 
@@ -6926,6 +6970,17 @@ async function refreshRegimeShield() {
     const nowMs = Date.now();
     const startISO = new Date(nowMs - Math.ceil(need * 1.55) * 86400000).toISOString();
     const bars = await fetchBars([REGIME_SHIELD_SYMBOL], '1Day', startISO, need);
+    // A FETCH CUT SHORT IS NOT A READING (15.88). See fetchBars. One symbol fits on one page
+    // today, and only the newest closes are read, so a cut-short fetch would give this same
+    // reading or too few bars. The rule is stated anyway, so that it can never depend on
+    // how many symbols share the request. The previous reading stands, and stops counting
+    // once REGIME_SHIELD_MAX_AGE_MS old (fully invested), as before.
+    if (bars && bars.incomplete) {
+      console.warn(`[SHIELD] ⚠️  The ${REGIME_SHIELD_SYMBOL} bar fetch came back incomplete — ` +
+        (_regimeShield.closeDate ? `keeping the reading from the ${_regimeShield.closeDate} close.`
+                                 : `there is no earlier reading, so the shield stays open (fully invested).`));
+      return false;
+    }
     // FINISHED SESSIONS ONLY (15.86). Mid-session the newest bar is today's, still
     // forming: its "close" is the live price, and the rule was never measured on that.
     // See completedDailyBars.
@@ -7080,6 +7135,14 @@ async function refreshRiskProfile() {
     // ADJUSTED, for the reason given at fetchBars: a distributing fund's raw price drops
     // on every ex-date, and a VaR built on that describes an asset that does not exist.
     const bars = await fetchBars(all, '1Day', startISO, RISK_LOOKBACK_DAYS + 15, 'all');
+    // A FETCH CUT SHORT IS NOT A REPORT (15.88). One failed page replaced a five-year report
+    // with one over whatever sessions the cut-off name still had, or with "not ready" when
+    // the first page failed. The previous report stands; it carries its own window and asOf.
+    if (bars && bars.incomplete) {
+      console.warn(`[RISK] ⚠️  The ${all.join(',')} bar fetch came back incomplete — keeping the previous report` +
+        (_riskReport && _riskReport.ready ? ` (${_riskReport.from}..${_riskReport.to}).` : '.'));
+      return null;
+    }
     const close = {};
     for (const k of all) close[k] = new Map(((bars && bars[k]) || []).map(b => [b.t, b.c]));
     let ts = [...close.SPY.keys()];
@@ -7465,6 +7528,17 @@ async function refreshSleeveVol() {
     const nowMs = Date.now();
     const startISO = new Date(nowMs - Math.ceil((CORE_VOL_NORMAL_DAYS + CORE_VOL_LOOKBACK + 20) * 1.55) * 86400000).toISOString();
     const bars = await fetchBars(risky, '1Day', startISO, CORE_VOL_NORMAL_DAYS + CORE_VOL_LOOKBACK + 20, 'all');
+    // A FETCH CUT SHORT IS NOT A READING (15.88). A name cut off at a page boundary keeps only
+    // its newest bars, so the aligned window shrinks: the 20-day "now" is the same, but the
+    // "normal" it is held against is measured over far fewer sessions. On the suite's fixture
+    // a sleeve whose full history says "full weight" is cut to about 81% on the very same
+    // prices. The previous reading stands until CORE_VOL_MAX_AGE_MS, then full weight.
+    if (bars && bars.incomplete) {
+      console.warn(`[VOL] ⚠️  The ${risky.join(',')} bar fetch came back incomplete — ` +
+        (_sleeveVol.asOf > 0 ? `keeping the reading through the ${_sleeveVol.closeDate} close.`
+                             : `there is no earlier reading, so the sleeve stays at full weight.`));
+      return null;
+    }
     // FINISHED SESSIONS ONLY (15.86), as for the shield. Mid-session the newest bar is
     // today's, and its "return" is a few hours of movement counted as a whole day of the
     // 20-day window. See completedDailyBars.
@@ -13898,6 +13972,7 @@ module.exports = {
     releaseExpiredLossHalt, LOSS_HALT_MS, getKillSwitchReason, lossHaltReason, priceFeedHalt, riskSystem, aiSystem,
     institutionalScore, ideaDirection, EFFECTIVE_MIN_DAY_VOL, FEED_VOLUME_FACTOR, DYNAMIC_MIN_DAY_VOL,
     extractJsonArray, extractJsonObject, affordableMaxPrice, MAX_SINGLE_SHARE_FRACTION, fetchBars,
+    usableSeries, fetchCandles,
     FRACTIONAL_ENABLED, MIN_FRACTIONAL_NOTIONAL, isFractionalQty, rungSellQty, rungMinQty,
     CORE_HOLD_ON, CORE_HOLD_SYMBOL, CORE_HOLD_SYMBOLS, CORE_HOLD_FRACTION, mostUnderweightCore,
     CORE_PHASE1_FRACTION, effectiveCoreFraction, rebasePeakForCoreFlow, unlockStepDownIsActionable, tradingFundsAvailable,

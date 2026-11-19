@@ -6961,6 +6961,382 @@ check('volatility scaling measures finished sessions: a forming bar is not a day
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+//  v15.88 — A BAR FETCH CUT SHORT IS FLAGGED, AND NOTHING DECIDES ON IT
+//  fetchBars ended its page loop on a failed page as if the data had run out and returned
+//  what it had, with no sign. Pages fill symbol by symbol, newest first, so the name at
+//  the page boundary kept only its newest bars and the names after it were missing; the
+//  page cap did the same, silently, while paging newest-first. The shield, the volatility
+//  scaling, the risk report, the challenger and the candles all computed on whatever came.
+// ════════════════════════════════════════════════════════════════════════════
+// The bars endpoint, faked the way Alpaca pages it: symbols in alphabetical order (measured
+// live: BAC, BBAI, CIFR), each one's bars in the requested order, `start` honoured, at most
+// PAGE bars a page (a number, or { timeframe: n }; null means the request's own limit).
+// SERIES maps timeframe -> symbol -> [{ t: ISO, c }]; FAIL maps timeframe -> the page
+// numbers answered with HTTP FAIL_CODE. All of it can change between calls, so one child
+// process reads the same market through a whole fetch and through a cut-short one.
+// at(iso) pins the clock for Date.now() AND new Date(), which the candle window reads.
+function pagedBarsProbe(env, body) {
+  return weightProbe(env, `
+    const https = require('https'), { EventEmitter } = require('events');
+    let SERIES = {}, PAGE = null, FAIL = {}, FAIL_CODE = 500;
+    const REQS = [];
+    https.request = (opts, cb) => {
+      const q = new URLSearchParams(String(opts.path).split('?')[1] || '');
+      const tf = q.get('timeframe'), desc = q.get('sort') === 'desc';
+      const size = (PAGE && typeof PAGE === 'object' ? PAGE[tf] : PAGE) || parseInt(q.get('limit'), 10) || 10000;
+      const off = parseInt(q.get('page_token') || '0', 10), page = Math.floor(off / size) + 1;
+      const from = Date.parse(q.get('start') || '1970-01-01T00:00:00Z');
+      const flat = [];
+      for (const s of (q.get('symbols') || '').split(',').filter(Boolean).sort()) {
+        const list = ((SERIES[tf] || {})[s] || []).filter(b => Date.parse(b.t) >= from)
+          .sort((a, b) => Date.parse(a.t) - Date.parse(b.t));
+        if (desc) list.reverse();
+        for (const b of list) flat.push([s, b]);
+      }
+      const bars = {};
+      for (const [s, b] of flat.slice(off, off + size))
+        (bars[s] = bars[s] || []).push({ t: b.t, o: b.c, h: b.c, l: b.c, c: b.c, v: 1000 });
+      const fail = (FAIL[tf] || []).includes(page);
+      REQS.push({ tf, page, fail });
+      const req = new EventEmitter();
+      req.end = () => setImmediate(() => {
+        const res = new EventEmitter(); res.statusCode = fail ? FAIL_CODE : 200; cb(res);
+        res.emit('data', fail ? '{"message":"stub"}'
+          : JSON.stringify({ bars, next_page_token: off + size < flat.length ? String(off + size) : null }));
+        res.emit('end');
+      });
+      req.destroy = () => {};
+      return req;
+    };
+    const LOG = [], WARN = [];
+    console.log = (...a) => { LOG.push(a.join(' ')); };
+    console.warn = (...a) => { WARN.push(a.join(' ')); };
+    const RealDate = Date; let NOW = RealDate.now();
+    global.Date = class extends RealDate {
+      constructor(...a) { if (a.length) super(...a); else super(NOW); }
+      static now() { return NOW; }
+    };
+    const at = (iso) => { NOW = RealDate.parse(iso); };
+    const OUT = (o) => process.stdout.write(JSON.stringify(o) + '\\n', () => process.exit(0));
+    (async () => { ${body} })().catch(e => OUT({ error: String((e && e.stack) || e) }));`);
+}
+// Daily closes on the given New York days, stamped the way Alpaca stamps a daily bar.
+const dailySeries = (days, f) => days.map((d, i) => ({ t: nyMidnightISO(d), c: f(i) }));
+
+check('a bar fetch cut short is flagged, and the result keeps its shape', () => {
+  const days = weekdaysBefore('2026-11-04', 50);
+  const S = { '1Day': { AAA: dailySeries(days, i => 100 + i), BBB: dailySeries(days, i => 200 + i),
+                        CCC: dailySeries(days, i => 300 + i) } };
+  const r = pagedBarsProbe({}, `
+    SERIES = ${JSON.stringify(S)};
+    at('2026-11-04T14:00:00Z');
+    const get = async (syms, keep, page, fail, code = 500) => {
+      PAGE = page; FAIL = { '1Day': fail }; FAIL_CODE = code; REQS.length = 0; WARN.length = 0;
+      const b = await I.fetchBars(syms, '1Day', '2026-01-01T00:00:00Z', keep);
+      return { keys: Object.keys(b), n: Object.fromEntries(Object.entries(b).map(([k, v]) => [k, v.length])),
+               closes: b.AAA ? [b.AAA[0].c, b.AAA[b.AAA.length - 1].c] : null, flag: b.incomplete,
+               enumerable: Object.prototype.propertyIsEnumerable.call(b, 'incomplete'),
+               json: JSON.stringify(b).includes('incomplete'), spread: 'incomplete' in { ...b },
+               reqs: REQS.length, warn: WARN.filter(w => w.startsWith('[BARS]')) };
+    };
+    OUT({ whole:   await get(['AAA','BBB','CCC'], 50, 40, []),
+          page2:   await get(['AAA','BBB','CCC'], 50, 40, [2]),
+          page1:   await get(['AAA','BBB','CCC'], 50, 40, [1]),
+          limited: await get(['AAA','BBB','CCC'], 50, 40, [3], 429),
+          capped:  await get(['AAA'], 50, 3, []),
+          enough:  await get(['AAA'], 30, 20, []),
+          ascCut:  await get(['AAA'], 0, 20, [2]) });`);
+  ok(!r.error, r.error);
+  // Whole, over four pages: every bar, not flagged, and the flag invisible to every reader.
+  eq(r.whole.reqs, 4, 'premise: 150 bars at 40 a page is four pages');
+  eq(JSON.stringify(r.whole.n), '{"AAA":50,"BBB":50,"CCC":50}', 'a whole fetch returns every bar');
+  eq(r.whole.flag, false, 'and is not flagged');
+  eq(r.whole.keys.join(','), 'AAA,BBB,CCC', 'the keys are still exactly the symbols');
+  eq(r.whole.enumerable, false, 'the flag is not enumerable');
+  eq(r.whole.json, false, 'it does not reach the JSON');
+  eq(r.whole.spread, false, 'and a spread copy does not carry it');
+  // Page 2 fails: the fault. AAA keeps only its newest 40, BBB and CCC are gone.
+  eq(JSON.stringify(r.page2.n), '{"AAA":40}', 'premise: a failed page 2 leaves the boundary name short and the rest missing');
+  eq(r.page2.closes.join(','), '110,149', "premise: what is left is AAA's NEWEST 40, in order");
+  eq(r.page2.flag, true, 'a failed page must flag the result');
+  ok(r.page2.warn.some(w => /page 2 failed/.test(w)), `and say which page, got ${JSON.stringify(r.page2.warn)}`);
+  eq(r.page1.keys.length, 0, 'premise: a failed first page returns nothing');
+  eq(r.page1.flag, true, 'which is flagged too: a failed fetch is not an empty market');
+  eq(r.limited.flag, true, 'a rate limit (429) on a later page is a failure like any other');
+  // The newest-first page cap was silent: 12 pages, 36 of the 50 bars, no warning.
+  eq(r.capped.reqs, 12, 'premise: at 3 bars a page the fetch stops at the 12-page cap');
+  eq(r.capped.n.AAA, 36, 'premise: holding 36 of the 50 bars');
+  eq(r.capped.flag, true, 'stopping at the cap with more to come must flag the result');
+  ok(r.capped.warn.some(w => /stopped at 12 pages/.test(w)), `and say so, got ${JSON.stringify(r.capped.warn)}`);
+  // Stopping EARLY because every symbol already has what it keeps is a whole fetch.
+  eq(r.enough.reqs, 2, 'premise: two pages of 20 already cover the 30 kept');
+  eq(r.enough.flag, false, 'stopping once every symbol has enough is not incomplete, though a page token remained');
+  eq(r.ascCut.flag, true, 'an oldest-first fetch is flagged the same way');
+});
+
+check('a cut-short fetch does not move the shield, and the next whole one does', () => {
+  // 230 sessions rising gently to Tuesday: risk-on. Wednesday closes at 80, far below the
+  // average. Read on Thursday through one failed page, the newest 205 bars still hold
+  // Wednesday's close: for the shield's single symbol that is the reading a whole fetch
+  // gives. It is refused anyway, so the rule never depends on how many symbols share a
+  // request, and the next whole fetch acts.
+  const days = weekdaysBefore('2026-11-05', 230);                  // through Wed 2026-11-04
+  const up = dailySeries(days, i => 100 + i * 0.01);
+  const down = up.map((b, i) => (i === up.length - 1 ? { ...b, c: 80 } : b));
+  const r = pagedBarsProbe({ REGIME_SHIELD: 'on', REGIME_SHIELD_SYMBOL: 'SPY', REGIME_SHIELD_DAYS: '200' }, `
+    const st = () => { const s = I.regimeShieldStatus();
+                       return { riskOff: s.riskOff, closeDate: s.closeDate, price: s.price, asOf: s.asOf }; };
+    SERIES = { '1Day': { SPY: ${JSON.stringify(up.slice(0, -1))} } };
+    at('2026-11-04T14:00:00Z');                                    // Wed 09:00 ET
+    const ok1 = await I.refreshRegimeShield(); const s1 = st();
+    SERIES = { '1Day': { SPY: ${JSON.stringify(down)} } };
+    at('2026-11-05T14:00:00Z');                                    // Thu 09:00 ET
+    PAGE = 205; FAIL = { '1Day': [2] }; REQS.length = 0;
+    const ok2 = await I.refreshRegimeShield(); const s2 = st();
+    const reqs2 = REQS.slice(), warn = WARN.filter(w => w.startsWith('[SHIELD]'));
+    PAGE = null; FAIL = {};
+    const ok3 = await I.refreshRegimeShield(); const s3 = st();
+    OUT({ ok1, s1, ok2, s2, reqs2, warn, ok3, s3 });`);
+  ok(!r.error, r.error);
+  ok(r.ok1 && r.s1.riskOff === false && r.s1.closeDate === '2026-11-03',
+     `premise: risk-on through Tuesday, got ${JSON.stringify(r.s1)}`);
+  ok(r.reqs2.length === 2 && r.reqs2[1].fail, `premise: the refresh pages twice and page 2 fails, got ${JSON.stringify(r.reqs2)}`);
+  eq(r.ok2, false, 'a cut-short fetch must not publish a reading');
+  eq(JSON.stringify(r.s2), JSON.stringify(r.s1), "the reading from Tuesday's close must stand, unchanged");
+  ok(r.warn.some(w => /incomplete/.test(w) && /2026-11-03 close/.test(w)),
+     `and the log must say which reading it kept, got ${JSON.stringify(r.warn)}`);
+  ok(r.ok3 && r.s3.riskOff === true && r.s3.closeDate === '2026-11-04',
+     `the next whole fetch must act on Wednesday's close, got ${JSON.stringify(r.s3)}`);
+});
+
+check('a cut-short fetch does not cut the volatility sleeve on unchanged prices', () => {
+  // AAA and BBB move together: +-3% a day for 110 sessions, then +-1%, then +-2% for the last
+  // 20. Read whole, "normal" includes the wild stretch, today's 20 days look calm beside it,
+  // and the sleeve keeps full weight. Through one failed page BBB keeps only its newest 100
+  // bars, the aligned window shrinks to them, "normal" falls, and the SAME prices would cut
+  // the sleeve.
+  const days = weekdaysBefore('2026-11-04', 175);
+  let px = 100;
+  const path = days.map((d, i) => {
+    if (i) { const amp = i < 110 ? 0.03 : (i >= days.length - 20 ? 0.02 : 0.01); px *= (i % 2 ? 1 + amp : 1 - amp); }
+    return px;
+  });
+  const whole = { AAA: days.map((d, i) => ({ t: nyMidnightISO(d), c: path[i] })),
+                  BBB: days.map((d, i) => ({ t: nyMidnightISO(d), c: path[i] * 2 })) };
+  const env = { CORE_VOL_SCALING: 'on', CORE_BASKET_SOURCE: 'fixed', CORE_HOLD_SYMBOLS: 'AAA,BBB,BIL',
+                CORE_WEIGHTS: 'AAA:0.4,BBB:0.4,BIL:0.2', CORE_HOLD_FRACTION: '0.9',
+                CORE_VOL_NORMAL_DAYS: '120', CORE_VOL_LOOKBACK: '20' };
+  const r = pagedBarsProbe(env, `
+    const whole = ${JSON.stringify(whole)};
+    at('2026-11-04T14:00:00Z');                                    // Wed 09:00 ET: through Tuesday
+    SERIES = { '1Day': whole };
+    const v1 = await I.refreshSleeveVol(); const m1 = I.sleeveVolMultiplier();
+    // page 1: all of AAA inside the window, and BBB's newest 100; then page 2 fails
+    const inWindow = whole.AAA.filter(b => Date.parse(b.t) >= Date.now() - Math.ceil(160 * 1.55) * 86400000).length;
+    PAGE = inWindow + 100; FAIL = { '1Day': [2] }; REQS.length = 0;
+    const v2 = await I.refreshSleeveVol(); const m2 = I.sleeveVolMultiplier();
+    const reqs2 = REQS.slice(), warn = WARN.filter(w => w.startsWith('[VOL]'));
+    // THE WITNESS: those same 100 BBB bars, served as if they were all there is
+    PAGE = null; FAIL = {};
+    SERIES = { '1Day': { AAA: whole.AAA, BBB: whole.BBB.slice(-100) } };
+    await I.refreshSleeveVol(); const m3 = I.sleeveVolMultiplier();
+    OUT({ v1, m1, v2, m2, reqs2, warn, m3 });`);
+  ok(!r.error, r.error);
+  ok(r.v1 && r.m1 === 1, `premise: read whole, the sleeve keeps full weight, got ${r.m1}`);
+  ok(r.m3 < 0.9, `premise (the witness): the cut-short window cuts the sleeve on the same prices, got ${r.m3}`);
+  ok(r.reqs2.length === 2 && r.reqs2[1].fail, `premise: page 2 fails, got ${JSON.stringify(r.reqs2)}`);
+  eq(r.v2, null, 'a cut-short fetch must not produce a reading');
+  eq(r.m2, 1, 'so the sleeve keeps the full weight of the reading it had');
+  ok(r.warn.some(w => /incomplete/.test(w) && /2026-11-03 close/.test(w)),
+     `and the log must say which reading it kept, got ${JSON.stringify(r.warn)}`);
+});
+
+check('a cut-short fetch neither shrinks nor wipes the risk report', () => {
+  const days = weekdaysBefore('2026-11-04', 240);
+  let px = 100;
+  const p = days.map((d, i) => { if (i) px *= 1 + (((i * 7919) % 13) - 6) / 600; return px; });
+  const whole = { QQQ: days.map((d, i) => ({ t: nyMidnightISO(d), c: p[i] * 3 })),
+                  SPY: days.map((d, i) => ({ t: nyMidnightISO(d), c: p[i] * 4 })),
+                  BIL: days.map((d, i) => ({ t: nyMidnightISO(d), c: 90 + i * 0.01 })) };
+  const env = { CORE_BASKET_SOURCE: 'fixed', CORE_HOLD_SYMBOLS: 'QQQ,SPY,BIL', CORE_WEIGHTS: 'QQQ:0.4,SPY:0.4,BIL:0.2',
+                CORE_HOLD_FRACTION: '0.9', RISK_LOOKBACK_DAYS: '200', CORE_VOL_SCALING: 'off', REGIME_SHIELD: 'off' };
+  const r = pagedBarsProbe(env, `
+    const whole = ${JSON.stringify(whole)};
+    const sum = x => x && ({ ready: x.ready, sessions: x.sessions, from: x.from, to: x.to, asOf: x.asOf, reason: x.reason });
+    at('2026-11-04T14:00:00Z');
+    SERIES = { '1Day': whole };
+    const r1 = sum(await I.refreshRiskProfile());
+    // page 1: BIL and QQQ whole and SPY's newest 100; then page 2 fails
+    const inWindow = whole.SPY.filter(b => Date.parse(b.t) >= Date.now() - Math.ceil(215 * 1.55) * 86400000).length;
+    PAGE = inWindow * 2 + 100; FAIL = { '1Day': [2] };
+    const ret2 = await I.refreshRiskProfile(); const r2 = sum(I.riskReport());
+    PAGE = null; FAIL = { '1Day': [1] };
+    const ret3 = await I.refreshRiskProfile(); const r3 = sum(I.riskReport());
+    const warn = WARN.filter(w => w.startsWith('[RISK]'));
+    // THE WITNESS: SPY's newest 100, served as if they were all there is
+    FAIL = {}; SERIES = { '1Day': { ...whole, SPY: whole.SPY.slice(-100) } };
+    const r4 = sum(await I.refreshRiskProfile());
+    OUT({ r1, ret2, r2, ret3, r3, warn, r4 });`);
+  ok(!r.error, r.error);
+  ok(r.r1 && r.r1.ready && r.r1.sessions > 200, `premise: a whole fetch reports over 200+ sessions, got ${JSON.stringify(r.r1)}`);
+  ok(r.r4 && r.r4.ready && r.r4.sessions < 100,
+     `premise (the witness): the cut-short window would report under 100 sessions, got ${JSON.stringify(r.r4)}`);
+  eq(r.ret2, null, 'a cut-short fetch must not produce a report');
+  eq(JSON.stringify(r.r2), JSON.stringify(r.r1), 'the whole-window report must stand, unchanged');
+  eq(r.ret3, null, 'nor may a failed first page');
+  eq(JSON.stringify(r.r3), JSON.stringify(r.r1), 'which used to replace the report with "not ready" for a day');
+  ok(r.warn.length === 2 && r.warn.every(w => /incomplete/.test(w)), `and each refusal must be logged, got ${JSON.stringify(r.warn)}`);
+});
+
+// The watchlist fetchCandles reads, in its own order (alphabetical paging puts BAC, BBAI,
+// CIFR and then F first).
+const CANDLE_SYMS = ['PLTR','SOFI','MARA','HOOD','SOUN','IONQ','RKLB','BBAI','HIMS','CIFR',
+                     'F','BAC','JPM','WFC','GE','XOM','MRK','JNJ','PFE','KO'];
+// n bars a `stepMin` apart, ending at `endIso`, closing at base, base+1, ... (oldest first).
+const candleSeries = (base, n, stepMin, endIso) => Array.from({ length: n }, (_, k) =>
+  ({ t: new Date(Date.parse(endIso) - (n - 1 - k) * stepMin * 60000).toISOString(), c: base + k }));
+
+check('candles: a name cut off at a page boundary keeps its bars, and whole names are updated', () => {
+  // The live configuration: hourly decision bars in .m1, 60 kept. 70 bars per name. The cut
+  // refreshes' page 1 holds BAC, BBAI and CIFR whole and F's newest 30 (then 60); page 2
+  // fails. Before 15.88 F's .m1 became those 30 bars.
+  const end = '2026-11-03T15:00:00Z';                              // Tue 10:00 ET
+  const set = (h, m) => {
+    const s = { '1Hour': {}, '1Min': {} };
+    CANDLE_SYMS.forEach((x, j) => { s['1Hour'][x] = candleSeries(h + j, 70, 60, end);
+                                    s['1Min'][x]  = candleSeries(m + j, 30, 1, '2026-11-03T15:50:00Z'); });
+    return s;
+  };
+  const r = pagedBarsProbe({ DECISION_TIMEFRAME: '1Hour' }, `
+    const last = (a) => (a && a.length) ? a.length + '@' + a[a.length - 1].c : 'none';
+    const look = () => Object.fromEntries(['BAC','BBAI','CIFR','F','GE'].map(s => [s, last(I.candleData[s].m1)]));
+    const run = async (series, page, fail) => {
+      SERIES = series; PAGE = page; FAIL = fail; WARN.length = 0;
+      await I.fetchCandles();
+      return { m1: look(), rawF: last(I.candleData.F.raw1m), warn: WARN.filter(w => w.startsWith('[CANDLES]')) };
+    };
+    at('2026-11-03T16:00:00Z');                                    // Tue 11:00 ET, inside the candle window
+    const first = await run(${JSON.stringify(set(100, 1000))}, null, {});
+    const cut30 = await run(${JSON.stringify(set(500, 5000))}, { '1Hour': 70 * 3 + 30, '1Min': 30 * 3 + 10 },
+                            { '1Hour': [2], '1Min': [2] });
+    const cut60 = await run(${JSON.stringify(set(900, 9000))}, { '1Hour': 70 * 3 + 60 }, { '1Hour': [2] });
+    // a WHOLE fetch in which F simply has 30 bars: taken as it comes, exactly as before
+    const thin = ${JSON.stringify(set(300, 3000))};
+    thin['1Hour'].F = thin['1Hour'].F.slice(-30);
+    const whole = await run(thin, null, {});
+    OUT({ first, cut30, cut60, whole });`);
+  ok(!r.error, r.error);
+  eq(JSON.stringify(r.first.m1), '{"BAC":"60@180","BBAI":"60@176","CIFR":"60@178","F":"60@179","GE":"60@183"}',
+     'premise: a whole first refresh fills every name with its newest 60 hourly bars');
+  // Cut after F's newest 30: the whole names move on, F and the missing names keep theirs.
+  eq(r.cut30.m1.BAC, '60@580', 'a name that arrived whole is updated');
+  eq(r.cut30.m1.CIFR, '60@578', 'every one of them');
+  eq(r.cut30.m1.F, '60@179', 'the name cut off at the page boundary must keep its previous 60 bars, not take 30');
+  eq(r.cut30.m1.GE, '60@183', 'a name that never arrived keeps its bars, as before');
+  ok(r.cut30.warn.some(w => /incomplete/.test(w) && /17 symbol/.test(w)),
+     `the refresh must say it was cut short and how many names kept their candles, got ${JSON.stringify(r.cut30.warn)}`);
+  // .raw1m is only read for its LAST bar (the price guard), and newest-first paging gets
+  // that bar right however few came back, so it is taken from a cut-short fetch.
+  eq(r.cut30.rawF, '10@5039', "a cut-short minute fetch still gives F's newest minute bar to .raw1m");
+  // Cut after F's newest 60: that IS what a whole fetch keeps, so it is used.
+  eq(r.cut60.m1.F, '60@979', 'a boundary name that already holds all 60 kept bars is updated');
+  eq(r.whole.m1.F, '30@379', 'from a WHOLE fetch a short series is taken as it comes, exactly as before');
+});
+
+check('candles under a minute timeframe: the same rule for .m1 and .m5', () => {
+  // DECISION_TIMEFRAME=5Min: one-minute bars ride in .m1 (60 kept) and five-minute bars in
+  // .m5 (36 kept), and both come from the paged fetch.
+  const s = (base) => {
+    const o = { '1Min': {}, '5Min': {} };
+    CANDLE_SYMS.forEach((x, j) => { o['1Min'][x] = candleSeries(base + j, 70, 1, '2026-11-03T15:50:00Z');
+                                    o['5Min'][x] = candleSeries(base + 100 + j, 40, 5, '2026-11-03T15:50:00Z'); });
+    return o;
+  };
+  const r = pagedBarsProbe({ DECISION_TIMEFRAME: '5Min' }, `
+    const last = (a) => (a && a.length) ? a.length + '@' + a[a.length - 1].c : 'none';
+    at('2026-11-03T16:00:00Z');
+    SERIES = ${JSON.stringify(s(100))};
+    await I.fetchCandles();
+    const before = { m1: last(I.candleData.F.m1), m5: last(I.candleData.F.m5), bacM5: last(I.candleData.BAC.m5) };
+    SERIES = ${JSON.stringify(s(500))};
+    PAGE = { '1Min': 70 * 3 + 30, '5Min': 40 * 3 + 20 }; FAIL = { '1Min': [2], '5Min': [2] };
+    await I.fetchCandles();
+    OUT({ before, after: { m1: last(I.candleData.F.m1), m5: last(I.candleData.F.m5), bacM5: last(I.candleData.BAC.m5) } });`);
+  ok(!r.error, r.error);
+  eq(JSON.stringify(r.before), '{"m1":"60@179","m5":"36@249","bacM5":"36@250"}', 'premise: a whole refresh fills .m1 and .m5');
+  eq(r.after.m1, '60@179', "a cut-short minute fetch must leave F's .m1 as it was");
+  eq(r.after.m5, '36@249', "and a cut-short five-minute fetch F's .m5");
+  eq(r.after.bacM5, '36@650', 'while a name that arrived whole is updated');
+});
+
+check('a cut-short fetch scores nothing and switches nothing in the challenger', () => {
+  // The dangerous case. Five names, each the control levered 2x: A1-A3 earn 0.4%/day of
+  // alpha and Z1-Z2 lose 0.6%/day, so the basket as a whole has none and does not win.
+  // Paged alphabetically the Z names come last, so one failed page leaves A1-A3 whole, Z1
+  // short and Z2 missing, and the challenger's 60% rule scores what arrived: a basket of
+  // winners. With auto-switch on, that read would sell the core for the basket.
+  const fs = require('fs'), os = require('os'), path = require('path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-cutshort-'));
+  let r;
+  try {
+    r = pagedBarsProbe({ ATLAS_DATA_DIR: dir, BASKET_CHALLENGER: 'on', BASKET_CHALLENGER_AUTO: 'on',
+                         CHALLENGER_MIN_DAYS: '60', CHALLENGER_MIN_T: '3', RISK_FREE_PROXY: 'BIL',
+                         CASH_EQUIVALENTS: 'BIL,SGOV', CORE_WEIGHTS: '', GROWTH_SLEEVE_FRACTION: '0',
+                         CORE_BASKET_SOURCE: 'fixed' }, `
+      ${mulberry}
+      ${weekdays}
+      const rnd = mulberry(7), t = weekdays(91);
+      const px = { AAA: [100], BBB: [80], BIL: [91.5], A1: [50], A2: [40], A3: [30], Z1: [20], Z2: [10] };
+      for (let k = 1; k <= 90; k++) {
+        const m = (rnd() - 0.5) * 0.04, rf = 0.00015, lev = rf + 2 * (m - rf);
+        for (const s of ['AAA', 'BBB']) px[s].push(px[s][k - 1] * (1 + m));
+        px.BIL.push(px.BIL[k - 1] * (1 + rf));
+        for (const s of ['A1', 'A2', 'A3']) px[s].push(px[s][k - 1] * (1 + lev + 0.004 + 0.004 * (rnd() - 0.5)));
+        for (const s of ['Z1', 'Z2']) px[s].push(px[s][k - 1] * (1 + lev - 0.006 + 0.004 * (rnd() - 0.5)));
+      }
+      // fetchBars' own shape (epoch seconds) for opts.bars, ISO stamps for the paged endpoint
+      const bars = {}, iso = {};
+      for (const s of Object.keys(px)) {
+        bars[s] = px[s].map((c, k) => ({ t: t[k], c }));
+        iso[s] = bars[s].map(b => ({ t: new RealDate(b.t * 1000).toISOString(), c: b.c }));
+      }
+      at('2026-05-20T14:00:00Z');
+      const control = ['AAA', 'BBB', 'BIL'];
+      I.CORE_HOLD_SYMBOLS.length = 0; I.CORE_HOLD_SYMBOLS.push(...control);
+      for (const s of ['A1', 'A2', 'A3', 'Z1', 'Z2']) I.marketData[s] = { price: 100, prevClose: 100, lastUpdate: Date.now() };
+      const entry = { at: '2025-12-31T15:00:00.000Z', basket: ['A1', 'A2', 'A3', 'Z1', 'Z2'], control,
+                      controlWeights: I.coreBaseWeightMap(control) };
+      const pick = v => v && { ready: v.ready, wins: v.wins, sessions: v.sessions, t: v.t };
+      SERIES = { '1Day': iso };
+      const v1 = await I.basketChallengerTick({ log: [entry] });
+      const core1 = [...I.CORE_HOLD_SYMBOLS];
+      // page 1: A1-A3, AAA, BBB and BIL whole and Z1's newest 30; then page 2 fails
+      PAGE = 91 * 6 + 30; FAIL = { '1Day': [2] }; LOG.length = 0; WARN.length = 0;
+      const v2 = await I.basketChallengerTick({ log: [entry] });
+      const kept = pick(I.challengerVerdict()), core2 = [...I.CORE_HOLD_SYMBOLS];
+      const said = LOG.filter(l => l.startsWith('[CHALLENGER]')), warn = WARN.filter(w => w.startsWith('[CHALLENGER]'));
+      // THE WITNESS: exactly the bars that arrived, handed over as if they were all there is
+      const cut = {};
+      for (const s of ['A1', 'A2', 'A3', 'AAA', 'BBB', 'BIL']) cut[s] = bars[s];
+      cut.Z1 = bars.Z1.slice(-30);
+      const v3 = await I.basketChallengerTick({ log: [entry], bars: cut });
+      const core3 = [...I.CORE_HOLD_SYMBOLS];
+      I.cancelPendingSave();
+      OUT({ v1: pick(v1), core1, v2, kept, core2, said, warn, v3: pick(v3), core3 });`);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  ok(!r.error, r.error);
+  ok(r.v1 && r.v1.ready && !r.v1.wins, `premise: the whole basket is scored and does not win, got ${JSON.stringify(r.v1)}`);
+  eq(r.core1.join(','), 'AAA,BBB,BIL', 'premise: so the core is untouched');
+  ok(r.v3 && r.v3.wins, `premise (the witness): the cut-short bars, taken as whole, WIN, got ${JSON.stringify(r.v3)}`);
+  ok(r.core3.join(',') !== 'AAA,BBB,BIL', `premise (the witness): and with auto-switch on that sells the core, got ${r.core3}`);
+  eq(r.v2, null, 'a cut-short fetch must decide nothing');
+  eq(JSON.stringify(r.kept), JSON.stringify(r.v1), 'the last verdict must stand, unchanged');
+  eq(r.core2.join(','), 'AAA,BBB,BIL', 'and the core must not be switched');
+  eq(r.said.length, 0, `nor reported as a new verdict, got ${JSON.stringify(r.said)}`);
+  ok(r.warn.some(w => /incomplete/.test(w)), `the refusal must be logged, got ${JSON.stringify(r.warn)}`);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 //  v13.70 — THE TRADING SLEEVE MUST PAY FOR ITS OWN CAPITAL
 //  The ramp asked only "can Mercury forecast?" and never "does this layer keep money
 //  after costs?". Measured: -2.8% pooled across seven independent 60-day windows,

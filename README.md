@@ -26,6 +26,11 @@ experiment, and it stays locked until the core has earned the money to fund it.
 | **Auditor, risk profile** | Idle cash, cost drift, unreachable gates, a leveraged fund held beside T-bills (every 15 min); Sharpe, Sortino, Calmar, VaR, CVaR, worst 12 months and time below a high, against the real T-bill rate (daily) | — |
 | **Price screen** | A trade print more than 25% from the last accepted price is held back until 3 prints in a row confirm the move over 5 seconds. Nothing is bought, sold or booked at a price more than 3× from the symbol's own references, and valuation then uses a reference that agrees with what was paid (15.83, 15.85) | every print |
 
+A bar fetch cut short (a failed page, or the page cap) is flagged, and none of the parts
+above computes from it: the shield, the volatility scaling, the risk profile and the
+challenger keep their previous result, and a candle series is updated only if it arrived
+whole (15.88).
+
 Nothing closes at the bell, on purpose. On SPY from 2003 to 2026, $10,000 held only from
 each open to each close grew to about $20,000 before costs. Held through the nights as
 well, it grew to about $128,000. The configuration is in `RAILWAY_DEPLOY_GUIDE.md` §10.
